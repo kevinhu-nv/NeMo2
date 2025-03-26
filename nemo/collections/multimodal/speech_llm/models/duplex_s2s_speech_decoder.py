@@ -434,6 +434,7 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
             return loss
         
         else:
+            # breakpoint()
             # if speech batch
             # generate speech logits
             audio_logits, audio_logits_tensor = self.speech_decoder(hidden_states, speech_mask, input_audio_tokens=input_audio_tokens)
@@ -666,11 +667,22 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 )
             else:
                 # peft_eval.py
+                if self.cfg.get('use_gt', False):
+                    gt_tokens = batch['target_texts_merge'].clone()
+                    # for i in range(len(batch['source_texts_merge'])):
+                    #     source_text_channel = batch['source_texts_merge'][i]
+                    #     src_bos_pos = torch.where(source_text_channel == self.tokenizer.bos_id)[0].tolist()
+                    #     src_eos_pos = torch.where(source_text_channel == self.tokenizer.eos_id)[0].tolist()
+                    #     for start_idx, end_idx in zip(src_bos_pos, src_eos_pos):
+                    #         gt_tokens[i][start_idx:end_idx+1] = source_text_channel[start_idx:end_idx+1]
+
+                # breakpoint()
                 inference_config['inputs'] = (
                     batch['contexts'].cuda(),
                     batch['context_lengths'].cuda(),
                     batch['audio_signal'].cuda(),
                     batch['audio_signal_length'].cuda(),
+                    gt_tokens.cuda() if self.cfg.get('use_gt', False) else None,
                 )
 
             response = generate(self, **inference_config)
@@ -787,6 +799,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             else [""] * len(batch['target_texts'])
         )
         labels_text = [self.tokenizer.ids_to_text(a.tolist()) for a in batch['target_texts']]
+        source_text = [self.tokenizer.ids_to_text(a.tolist()) for a in batch['source_texts']]
         # only do ids_to_text on the first channel which is text
         output['token_ids_text'] = (np.array(output['token_ids'])[:, :, 0]).tolist()
         preds_text = [
@@ -816,6 +829,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         if data_cfg.get("remove_text_pc", False):
             preds_text = [remove_punctuations(p.lower(), data_cfg.get("punctuations", None)) for p in preds_text]
             labels_text = [remove_punctuations(l.lower(), data_cfg.get("punctuations", None)) for l in labels_text]
+            source_text = [remove_punctuations(s.lower(), data_cfg.get("punctuations", None)) for s in source_text]
 
         # if loss is nan, print the input, label and pred
         if loss.isnan():
@@ -824,6 +838,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 logging.info(f"Input: `{inputs_text[i]}`")
                 logging.info(f"Label: `{labels_text[i]}`")
                 logging.info(f"Pred: `{preds_text[i]}`")
+                logging.info(f"Source: `{source_text[i]}`")
             logging.info("++++++++++++++++++++++++++++++++++++++++++++++++")
 
         outputs = {
@@ -832,6 +847,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             'context_lengths': batch['context_lengths'],
             'labels': batch['answers'],  # [str]
             'labels_text': labels_text,  # [str]
+            'source_text': source_text,  # [str]
             'inputs': inputs_text,  # [str]
             'metadata': metadata,  # [dict]
             'batch_idx': batch_idx,
@@ -863,26 +879,29 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
 
         deduplicated_outputs = {
             'preds': [],
+            'text_src_preds': [],
             'labels': [],
             'inputs': [],
             'metadata': [],
             'speech_preds': [],
             'speech_answers': [],
             'text_answers': [],
+            'text_srcs': [],
             'batch_idx': [],
         }
         for outputs in list_outputs:
-            for answer, pred, input, metadata, labels_text, pred_context_length in zip(
+            for answer, pred, input, metadata, labels_text, pred_context_length, source_text in zip(
                 outputs['labels'],
                 outputs['preds'],
                 outputs['inputs'],
                 outputs['metadata'],
                 outputs['labels_text'],
                 outputs['context_lengths'],
+                outputs['source_text'],
             ):
                 context_length = 0
                 batch_idx = outputs['batch_idx']
-                text_answer, speech_answer = self.parse_decoder_outputs(
+                text_answer, speech_answer, _ = self.parse_decoder_outputs(
                     answer,
                     self.tokenizer.eos_id,
                     context_length,
@@ -891,12 +910,13 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 )
                 key = input + self.tokenizer.ids_to_text(text_answer) + str(metadata)
 
-                text_pred, speech_pred = self.parse_decoder_outputs(
+                text_pred, speech_pred, src_text_pred = self.parse_decoder_outputs(
                     torch.Tensor(pred),
                     self.tokenizer.eos_id,
                     pred_context_length,
                     self.cfg.data.train_ds.speech_pad_id,
                     self.cfg.data.train_ds.speech_eos_id,
+                    gt_answer=text_answer,
                 )
 
                 def normalize_text(text):
@@ -907,9 +927,12 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                     speech_answer = torch.zeros_like(speech_pred)
                 text_pred_text = self.tokenizer.ids_to_text(text_pred)
                 deduplicated_outputs['preds'].append(normalize_text(text_pred_text))
+                src_text_pred_text = self.tokenizer.ids_to_text(src_text_pred)
+                deduplicated_outputs['text_src_preds'].append(normalize_text(src_text_pred_text))
                 deduplicated_outputs['labels'].append(normalize_text(labels_text))
                 text_answer_text = self.tokenizer.ids_to_text(text_answer)
                 deduplicated_outputs['text_answers'].append(normalize_text(text_answer_text))
+                deduplicated_outputs['text_srcs'].append(normalize_text(source_text))
                 deduplicated_outputs['speech_preds'].append(speech_pred.cpu().numpy())
                 deduplicated_outputs['speech_answers'].append(speech_answer.cpu().numpy())
 
@@ -1049,12 +1072,12 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         return deduplicated_outputs
 
     def parse_decoder_outputs(
-        self, input_decoder_output, text_separator, context_length, speech_pad_id=1001, speech_eos_id=1004
+        self, input_decoder_output, text_separator, context_length, speech_pad_id=1001, speech_eos_id=1004, gt_answer=None
     ):
         # remove text context
         max_len = input_decoder_output.shape[0]
         if len(input_decoder_output.shape) == 1:
-            return input_decoder_output, None
+            return input_decoder_output, None, None
         decoder_output = input_decoder_output[-1:].tile([max_len, 1])
         decoder_output[: max_len - context_length] = input_decoder_output[context_length:]
 
@@ -1069,10 +1092,30 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         #     text_tokens = decoder_output[:, 0]
         #     speech_tokens = decoder_output[:, 1:]
         text_tokens = decoder_output[:, 0]
-        if self.cfg.get('predict_source_text', False):
-            speech_tokens = decoder_output[:, 1:-1]
-        else:
-            speech_tokens = decoder_output[:, 1:]
+        user_text_tokens = torch.zeros_like(text_tokens)
+        agent_text_tokens = torch.zeros_like(text_tokens)
+
+        # breakpoint()
+        # Assume user talks first
+        assign_to_user = True
+        for i in range(len(text_tokens)):
+            if i < len(gt_answer):
+                token = gt_answer[i]
+                if token == self.tokenizer.bos_id:
+                    assign_to_user = False
+                    continue
+                elif token == self.tokenizer.eos_id:
+                    assign_to_user = True
+                    continue
+            else:
+                assign_to_user = False
+            if assign_to_user:
+                user_text_tokens[i] = text_tokens[i]
+            else:
+                agent_text_tokens[i] = text_tokens[i]
+
+        # breakpoint()
+        speech_tokens = decoder_output[:, 1:]
         # Get speech token ids
         if self.cfg.get('megatron_amp_O2', False):
             n_speech_codebooks = self.model.module.n_proj_heads - 1
@@ -1092,7 +1135,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         speech_tokens = speech_tokens.reshape(new_shape)
         if speech_tokens.shape[0] == 0:
             speech_tokens = torch.zeros([1, new_shape[1]]).long().cuda()
-        return text_tokens.long(), speech_tokens.long()
+        return agent_text_tokens.long(), speech_tokens.long(), user_text_tokens.long()
 
     def decode_and_save_wavs(self, codec_model, codes_list, wav_dir, metadata_list):
         sample_rate = self.codec_sample_rate
@@ -1228,7 +1271,9 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 for (
                     labels,
                     text_answer_text,
+                    text_src_text,
                     preds,
+                    text_src_preds,
                     speech_preds_transcribed,
                     speech_answer,
                     speech_pred,
@@ -1238,7 +1283,9 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 ) in zip(
                     deduplicated_outputs['labels'],
                     deduplicated_outputs['text_answers'],
+                    deduplicated_outputs['text_srcs'],
                     deduplicated_outputs['preds'],
+                    deduplicated_outputs['text_src_preds'],
                     deduplicated_outputs['speech_preds_transcribed'],
                     deduplicated_outputs['speech_answers'],
                     deduplicated_outputs['speech_preds'],
@@ -1250,9 +1297,10 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                         data_cfg.get("log_every_n_steps", None) is not None
                         and batch_idx % data_cfg.log_every_n_steps == 0
                     ):
-                        logging.info(f"Input: `{inputs}`")
+                        logging.info(f"Input: `{inputs}`  text_source_text: `{text_src_text}`")
                         logging.info(f"Label: `{labels}` text_answer_text: `{text_answer_text}`")
                         logging.info(f"Pred: `{preds}`")
+                        logging.info(f"Src_pred: `{text_src_preds}`")
                         logging.info(f"speech_preds_transcribed: `{speech_preds_transcribed}`")
                         logging.info(f"speech_answers_transcribed: `{speech_answers_transcribed}`")
                         logging.info(f"Speech out len: pred {speech_pred.shape} label {speech_answer.shape}")
@@ -1268,8 +1316,16 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                     if "asr-" in metric_name:
                         text_preds = deduplicated_outputs['speech_preds_transcribed']
 
-                    text_metric_name = metric_name.replace("asr-", "")
+                    # Compute bleu for source text
+                    if "src-" in metric_name:
+                        labels = deduplicated_outputs['text_srcs']
+                        text_preds = deduplicated_outputs['text_src_preds']
+                        labels = [' '.join(label.split()) for label in labels]
+                        text_preds = [' '.join(pred.split()) for pred in text_preds]
 
+                    text_metric_name = metric_name.replace("asr-", "").replace("src-", "")
+
+                    # breakpoint()
                     def get_turn_split(input_preds, num_turn):
                         if all([t > num_turn for t in get_num_turn(input_preds)]):
                             return [re.split('   *', pred)[num_turn] for pred in input_preds]
@@ -1279,7 +1335,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                     def get_num_turn(input_preds):
                         return [len(re.split('   *', pred)) for pred in input_preds]
 
-                    if text_metric_name == 'bleu':  # asr-bleu, bleu
+                    if text_metric_name == 'bleu':  # asr-bleu, bleu, src-bleu
                         if self.cfg.get('norm_val_metrics', False):
                             # normalize texts
                             metric_text_preds = []
@@ -1432,13 +1488,15 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             assert (
                 len(outputs['inputs']) == len(outputs['preds']) == len(outputs['labels']) == len(outputs['metadata'])
             )
-            for i, p, l, m, speech_preds_transcribed, speech_answers_transcribed in zip(
+            for i, p, l, m, speech_preds_transcribed, speech_answers_transcribed, text_src_preds, text_src in zip(
                 outputs['inputs'],
                 outputs['preds'],
                 outputs['labels'],
                 outputs['metadata'],
                 outputs['speech_preds_transcribed'],
                 outputs['speech_answers_transcribed'],
+                outputs['text_src_preds'],
+                outputs['text_srcs'],
             ):
                 json_string = {
                     'input': i,
@@ -1446,6 +1504,8 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                     'text': l,
                     'speech_preds_transcribed': speech_preds_transcribed,
                     'speech_answers_transcribed': speech_answers_transcribed,
+                    'pred_src_text': text_src_preds,
+                    'src_text': text_src,
                 }
                 for k, v in m.items():
                     if k not in json_string:
@@ -1477,7 +1537,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             for metric in data_cfg.metrics:
                 if not hasattr(metric, "name"):
                     raise ValueError("Metric name is not provided in the metric config.")
-                base_metric_name = metric.name.replace("asr-", "").replace("tts-", "")
+                base_metric_name = metric.name.replace("asr-", "").replace("tts-", "").replace("src-", "")
                 if metric.name == "loss" or metric.name == "mos":
                     metrics.append((None, metric.name))
                     continue
@@ -1623,38 +1683,42 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             answer_codec = torch.where(
                 sliced_text_channel == self.tokenizer.eos_id, self.cfg.data.train_ds.speech_eos_id, answer_codec
             )
+            
+            logging.info(f"sliced_text_channel: {sliced_text_channel.squeeze(-1)}")
             if getattr(self.cfg, 'predict_source_text', False):
-                # Also use source_text
                 source_text_channel = audio_batch['source_texts_merge'][i]
                 sliced_source_text_channel = source_text_channel[: answer_codec.shape[0]].unsqueeze(-1)
+                logging.info(f"sliced_source_text_channel: {sliced_source_text_channel.squeeze(-1)}")
+                # breakpoint()
+                src_bos_pos = torch.where(sliced_source_text_channel == self.tokenizer.bos_id)[0].tolist()
+                src_eos_pos = torch.where(sliced_source_text_channel == self.tokenizer.eos_id)[0].tolist()
+                for start_idx, end_idx in zip(src_bos_pos, src_eos_pos):
+                    sliced_text_channel[start_idx:end_idx+1] = sliced_source_text_channel[start_idx:end_idx+1]
 
-            if getattr(self.cfg, 'predict_source_text', False):
-                # TODO(kevinhu): Add delay to better predict user text.
-                # Predict user text when the agent turn starts.
-                all_channels.append(torch.cat([sliced_text_channel, answer_codec, sliced_source_text_channel], dim=-1))
+            logging.info(f"merged sliced_text_channel: {sliced_text_channel.squeeze(-1)}")
+            # breakpoint()
+            if getattr(self.cfg, 'speech_delay', False):
+                # TODO(kevinhu): Implement cascaded delays across all channels.
+                text_len, text_vocab = sliced_text_channel.shape
+                speech_len, speech_vocab = answer_codec.shape
+                assert text_len == speech_len
+                speech_pad_id = self.cfg.data.train_ds.speech_unk_id
+                text_pad_id = self.tokenizer.eos_id
+                answer_codec_padded = torch.full(
+                    (self.cfg.speech_delay, speech_vocab), speech_pad_id, device=answer_codec.device
+                )
+                answer_codec_shifted = torch.cat([answer_codec_padded, answer_codec], dim=0)[:speech_len, :]
+                sliced_text_channel_padded = torch.full(
+                    (self.cfg.speech_delay, text_vocab), text_pad_id, device=sliced_text_channel.device
+                )
+                sliced_text_channel_extended = torch.cat([sliced_text_channel, sliced_text_channel_padded], dim=0)[
+                    :speech_len, :
+                ]
+                combined_channels = torch.cat([sliced_text_channel_extended, answer_codec_shifted], dim=-1)
+                all_channels.append(combined_channels)
             else:
-                if getattr(self.cfg, 'speech_delay', False):
-                    # TODO(kevinhu): Implement cascaded delays across all channels.
-                    text_len, text_vocab = sliced_text_channel.shape
-                    speech_len, speech_vocab = answer_codec.shape
-                    assert text_len == speech_len
-                    speech_pad_id = self.cfg.data.train_ds.speech_unk_id
-                    text_pad_id = self.tokenizer.eos_id
-                    answer_codec_padded = torch.full(
-                        (self.cfg.speech_delay, speech_vocab), speech_pad_id, device=answer_codec.device
-                    )
-                    answer_codec_shifted = torch.cat([answer_codec_padded, answer_codec], dim=0)[:speech_len, :]
-                    sliced_text_channel_padded = torch.full(
-                        (self.cfg.speech_delay, text_vocab), text_pad_id, device=sliced_text_channel.device
-                    )
-                    sliced_text_channel_extended = torch.cat([sliced_text_channel, sliced_text_channel_padded], dim=0)[
-                        :speech_len, :
-                    ]
-                    combined_channels = torch.cat([sliced_text_channel_extended, answer_codec_shifted], dim=-1)
-                    all_channels.append(combined_channels)
-                else:
-                    # checked text_channel, loss_mask;  checked injecting bos and eos properly to control turn taking in inference
-                    all_channels.append(torch.cat([sliced_text_channel, answer_codec], dim=-1))
+                # checked text_channel, loss_mask;  checked injecting bos and eos properly to control turn taking in inference
+                all_channels.append(torch.cat([sliced_text_channel, answer_codec], dim=-1))
 
         all_channels = pad_sequence(all_channels, batch_first=True)
 
@@ -1670,6 +1734,8 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         encoded = encoded[:, : input_ids.shape[1]]
         encoder_length = encoded_len - 1
         labels = all_channels[:, 1:]
+
+        # breakpoint()
 
         # assert labels.shape[1] == encoded.shape[1]
         # make sure that all inputs have the same number of frame as something it might deviate in 1 frame

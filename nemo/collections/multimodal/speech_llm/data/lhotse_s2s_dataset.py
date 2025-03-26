@@ -71,6 +71,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         t5_style: bool = False,
         load_answer_audio: bool = False,
         codec_model_downsampling_factor: float = 1023.5,
+        word_align_source_text: str = 'right',
     ):
         super().__init__()
         self.text_processor = text_processor
@@ -98,6 +99,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         self.sample_rate = sample_rate
         self.load_answer_audio = load_answer_audio
         self.codec_model_downsampling_factor = codec_model_downsampling_factor
+        self.word_align_source_text = word_align_source_text
 
         # To be consistent with SALM text processor
         self.text_processor.add_sep = False
@@ -109,12 +111,14 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
             logging.info(f'{self.codec_sample_rate} {self.sample_rate} are different')
 
     def _extract_text_and_time_tokens(self, input_sequence):
-        # Regular expression to match time tokens (e.g., <|x|> where x is an integer)
+         # Regular expression to match time tokens (e.g., <|x|> where x is an integer)
         time_token_pattern = r"<\|(\d+)\|>"
         # Find all time tokens
         time_tokens = re.findall(time_token_pattern, input_sequence)
         # Only keep the first token of every pair (i.e., start time tokens)
         start_time_token = [int(time_tokens[i]) for i in range(0, len(time_tokens), 2)]
+        # end time tokens
+        end_time_token = [int(time_tokens[i]) for i in range(1, len(time_tokens), 2)]
         # Remove all time tokens to isolate words
         words = re.sub(time_token_pattern, '', input_sequence).split()
         # Process each word, tokenize it, and calculate token lengths
@@ -133,11 +137,12 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         return (
             torch.as_tensor(tokenized_words),
             torch.as_tensor(start_time_token),
+            torch.as_tensor(end_time_token),
             torch.as_tensor(word_length),
         )
 
     def _expand_text_with_timestamps_and_word_lengths(
-        self, word_tokens, word_lengths, start_time_tokens, features_lens, frame_rate=0.08, pad_id=None
+        self, word_tokens, word_lengths, start_time_tokens, end_time_tokens, features_lens, frame_rate=0.08, pad_id=None, align_position='left'
     ):
         """
         Expand word tokens according to start time tokens and word lengths for a batch of sequences.
@@ -175,24 +180,26 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
 
             for word_idx, word_length in enumerate(word_lengths[batch_idx]):
                 start_token = start_time_tokens[batch_idx][word_idx]
-
-                # Convert the start time token into a time index based on frame rate
                 start_time_index = discretize_time(start_token, frame_rate)
-
-                # Reduction of start time index due to stacking of frames
                 start_time_index = int(start_time_index / self.decoder_reduction_factor)
-
-                end_time_index = start_time_index + word_length
-                end_time_index = min(end_time_index, max_length)
+                end_token = end_time_tokens[batch_idx][word_idx]
+                end_time_index = discretize_time(end_token, frame_rate)
+                end_time_index = int(end_time_index / self.decoder_reduction_factor)
+                if align_position == 'left':
+                    end_time_index = min(start_time_index + word_length, end_time_index)
+                elif align_position == 'right':
+                    start_time_index = max(start_time_index, end_time_index - word_length)
+                else:
+                    raise ValueError(f"Unknown align_position: {align_position}")
 
                 # Get the word tokens for the current word
                 word_token_ids = word_tokens[batch_idx][word_start_idx : word_start_idx + word_length]
 
                 # Populate the tokens in the expanded tensor at the correct positions
-                for t_idx in range(start_time_index, end_time_index):
-                    if t_idx - start_time_index < len(word_token_ids):  # Ensure tokens are within bounds
-                        token_id = word_token_ids[t_idx - start_time_index]  # Get token for this time step
-                        texts_expanded[batch_idx][t_idx] = token_id  # Directly assign the token ID
+                for t_idx in range(start_time_index, end_time_index + 1):  # End inclusive at word level
+                    if t_idx - start_time_index < len(word_token_ids) and t_idx < max_length:
+                        token_id = word_token_ids[t_idx - start_time_index]
+                        texts_expanded[batch_idx][t_idx] = token_id
 
                 # Move to the next word in the concatenated word tokens
                 word_start_idx += word_length
@@ -209,11 +216,15 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         metadata = []
         instructions, instruction_lengths = [], []
         target_texts, target_text_lengths = [], []
-        source_texts, source_text_lengths = [], []
         start_time_tokens, word_lengths = [], []
+        source_texts, source_text_lengths = [], []
+        src_start_time_tokens, src_end_time_tokens, src_word_lengths = [], [], []
+        user_src_word_alignment = []
         num_turns = []
         text_start_time = []
         text_end_time = []
+        srctext_start_time = []
+        srctext_end_time = []
         skipped_source = 0
         processed_cuts = []
         for cut in cuts:
@@ -240,6 +251,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                 processed_cuts.append(cut)
             else:
                 logging.info(f"Skipping cut {cut}")
+
         cuts = CutSet(cuts=processed_cuts)
         for id, cut in enumerate(cuts):
 
@@ -252,6 +264,8 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
             metadata.append({'audio_filepath': cut.id + '.wav'})
             text_start_time.append([])
             text_end_time.append([])
+            srctext_start_time.append([])
+            srctext_end_time.append([])
             # treat multiturn data as multiple batch each with 2-turn conversation
             for i in range(0, len(cut.supervisions), 2):
                 supervisions = cut.supervisions[i : i + 2]
@@ -262,15 +276,24 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                 instruction, instruction_length = torch.as_tensor(instruction["input_ids"][:-1]), torch.as_tensor(
                     len(instruction["input_ids"]) - 1
                 )
+
                 # Extract user text
                 pattern = r"<\|\d+\|>"
-                output_text = re.sub(pattern, "", supervisions[0].text)
-                output_text = re.sub(r'\s+', ' ', output_text).strip()
-                source_text = self.text_processor._process_example(context="", output=output_text)
-                # -1 to remove the eos token added by the text processor
-                source_text, source_text_length = torch.as_tensor(source_text["answer_ids"][:-1]), torch.as_tensor(
-                    len(source_text["answer_ids"]) - 1
-                )
+                src_text = supervisions[0].text
+                cur_user_src_word_alignment = bool(re.search(pattern, src_text))
+                if i == 0:
+                    user_src_word_alignment.append(cur_user_src_word_alignment)
+                if not cur_user_src_word_alignment:
+                    output_text = re.sub(pattern, "", src_text)
+                    output_text = re.sub(r'\s+', ' ', output_text).strip()
+                    source_text = self.text_processor._process_example(context="", output=output_text)
+                    # -1 to remove the eos token added by the text processor
+                    source_text, source_text_length = torch.as_tensor(
+                        source_text["answer_ids"][:-1]
+                    ), torch.as_tensor(len(source_text["answer_ids"]) - 1)
+                else:
+                    source_text, src_start_time_token, src_end_time_token, src_word_length = self._extract_text_and_time_tokens(src_text)
+                    source_text_length = len(source_text)
 
                 if len(supervisions) <= 1:
                     instructions.append(instruction)
@@ -310,9 +333,17 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                 text_end_time[-1].append(supervisions[1].start + supervisions[1].duration)
                 text_start_time[-1][-1] = validate_time(text_start_time[-1][-1])
                 text_end_time[-1][-1] = validate_time(text_end_time[-1][-1])
+                srctext_start_time[-1].append(supervisions[0].start)
+                srctext_end_time[-1].append(supervisions[0].start + supervisions[0].duration)
+                srctext_start_time[-1][-1] = validate_time(srctext_start_time[-1][-1])
+                srctext_end_time[-1][-1] = validate_time(srctext_end_time[-1][-1])
                 if use_word_alignment:
                     word_lengths.append(word_length)
                     start_time_tokens.append(start_time_token)
+                if cur_user_src_word_alignment:
+                    src_word_lengths.append(src_word_length)
+                    src_start_time_tokens.append(src_start_time_token)
+                    src_end_time_tokens.append(src_end_time_token)
 
         answer_audios, answer_audio_lens = None, None
         assert self.load_answer_audio
@@ -448,20 +479,19 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                     skipped += 1
                     continue  # the case of the last turn is user
 
+                ############################
+                # Process agent text
                 cur_target_text[text_start_step] = self.text_processor.bos_id
-                cur_source_text[text_start_step] = self.text_processor.bos_id
-
                 if getattr(cut, "s2s_duplex", False):
                     # Note: text can be truncated
                     text_len = min(text_end_step - text_start_step - 1, target_texts[cnt].shape[0])
                     cur_target_text[(text_start_step + 1) : (text_start_step + 1 + text_len)] = target_texts[cnt][
                         :text_len
                     ]
-                    src_text_len = min(text_end_step - text_start_step - 1, source_texts[cnt].shape[0])
-                    cur_source_text[(text_start_step + 1) : (text_start_step + 1 + src_text_len)] = source_texts[cnt][
-                        :src_text_len
-                    ]
-
+                    # src_text_len = min(text_end_step - text_start_step - 1, source_texts[cnt].shape[0])
+                    # cur_source_text[(text_start_step + 1) : (text_start_step + 1 + src_text_len)] = source_texts[cnt][
+                    #     :src_text_len
+                    # ]
                 elif getattr(cut, "s2s_duplex_align", False):
                     text_len_plus_eos = torch.tensor(text_end_step - text_start_step)
                     target_texts_expanded = self._expand_text_with_timestamps_and_word_lengths(
@@ -477,9 +507,77 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                     )
                 else:
                     raise Exception("Undefined assistant channel text format.")
-
                 cur_target_text[text_end_step] = self.text_processor.eos_id
-                cur_source_text[text_end_step] = self.text_processor.eos_id
+
+                ############################
+                # Process user text
+                # 1) Word-level alignment for source text
+                if self.word_align_source_text == 'left':
+                    # Right shift to make ASR easier
+                    srctext_right_shift = 5
+                else:
+                    srctext_right_shift = 0
+                # breakpoint()
+                if user_src_word_alignment[i] and (self.word_align_source_text == 'left' or self.word_align_source_text == 'right'):
+                    src_text_start_step = max(get_step_by_time(srctext_start_time[i][j]), 0) + 2 + srctext_right_shift
+                    src_text_end_step = get_step_by_time(srctext_end_time[i][j]) + srctext_right_shift - 1
+                    srctext_len_plus_eos = torch.tensor(src_text_end_step - src_text_start_step)
+                    try:
+                        logging.info(f"num_turns: {num_turns}")
+                        logging.info(f"srctext_len_plus_eos: {srctext_len_plus_eos}")
+                        logging.info(f"src_start_time_tokens[{cnt}]: {src_start_time_tokens[cnt]}")
+                        logging.info(f"src_end_time_tokens[{cnt}]: {src_end_time_tokens[cnt]}")
+                    except:
+                        import pdb; pdb.set_trace()
+                    # import pdb; pdb.set_trace()
+                    src_texts_expanded = self._expand_text_with_timestamps_and_word_lengths(
+                        [source_texts[cnt]],
+                        [src_word_lengths[cnt]],
+                        [src_start_time_tokens[cnt]],
+                        [src_end_time_tokens[cnt]],
+                        [srctext_len_plus_eos],
+                        self.codec_model_downsampling_factor / self.codec_sample_rate,
+                        pad_id=self.text_processor.unk_id,
+                        align_position=self.word_align_source_text,
+                    )
+                    try:
+                        cur_source_text[(src_text_start_step + 1) : (src_text_start_step + 1 + srctext_len_plus_eos)] = (
+                            src_texts_expanded[0]
+                        )
+                    except:
+                        print(f'src_text_start_step: {src_text_start_step}')
+                        print(f'srctext_len_plus_eos: {srctext_len_plus_eos}')
+                        import pdb; pdb.set_trace()
+                    cur_source_text[src_text_start_step] = self.text_processor.bos_id
+                    # import pdb; pdb.set_trace()
+                    src_text_end_step = src_text_start_step + srctext_len_plus_eos
+                else:
+                    # 2) Segment-level alignment for source text
+                    # if self.right_align_source_text:
+                        # Push the src text to be close to the target text
+                    src_text_end_step = get_step_by_time(text_start_time[i][j]) - 1
+                    src_text_start_step = max(src_text_end_step - source_texts[cnt].shape[0] - 1, 0)
+                    # else:
+                        # Add 10 tokens fixed delay by default
+                        # srctext_fixed_delay = 2
+                        # src_text_start_step = max(get_step_by_time(srctext_start_time[i][j]) - 1, 0) + srctext_fixed_delay
+                        # src_text_end_step = min(src_text_start_step + source_texts[cnt].shape[0] - 1, get_step_by_time(srctext_end_time[i][j]))
+                    cur_source_text[src_text_start_step] = self.text_processor.bos_id
+                    src_text_len = min(src_text_end_step - src_text_start_step - 1, source_texts[cnt].shape[0])
+                    logging.debug(f'src_text_start_step: {src_text_start_step}')
+                    logging.debug(f'src_text_len: {src_text_len}')
+                    try:
+                        cur_source_text[(src_text_start_step + 1) : (src_text_start_step + 1 + src_text_len)] = source_texts[cnt][
+                            :src_text_len
+                        ]
+                    except:
+                        print(f'src_text_start_step: {src_text_start_step}')
+                        print(f'src_text_len: {src_text_len}')
+                        import pdb; pdb.set_trace()
+                cur_source_text[src_text_end_step] = self.text_processor.eos_id
+                
+                logging.info(f'cur_source_text: {cur_source_text}')
+                logging.info(f'source_texts[cnt]: {source_texts[cnt]}')
                 cnt += 1
 
             new_target_texts.append(cur_target_text)
@@ -494,8 +592,10 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         assert len(target_texts) + len(source_texts) == sum(num_turns)
         assert source_texts_merge.shape[0] == len(num_turns)
 
+        logging.info(f'user_src_word_alignment: {user_src_word_alignment}')
         # note: the codec id in labels and contexts and others do not consider the offset e.g. speech_eos is 1002
         # the offset is all considered by SumVocabParallelEmbedding
+        # breakpoint()
         return_batch = {
             "sample_ids": list(cuts.ids),
             "audio_signal": audio,
@@ -510,11 +610,13 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
             "context_lengths": torch.ones_like(target_text_lengths),  # placeholder
             "target_texts": target_texts_merge,
             "target_text_lengths": target_text_lengths,
+            "source_texts": source_texts_merge,
             "answers": target_texts_merge,
             "answer_audio": answer_audios,
             "answer_audio_lens": answer_audio_lens,
             "num_turns": torch.Tensor(num_turns).long(),
             "speaker_ids": self.get_speaker_id(cuts),
+            "user_src_word_alignment": torch.Tensor(user_src_word_alignment),
         }
 
         if hasattr(cut, "include_sys"):  # assume no within batch mixing

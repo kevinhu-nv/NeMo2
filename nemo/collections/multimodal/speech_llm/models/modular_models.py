@@ -1407,6 +1407,8 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                     batch['context_lengths'].cuda(),
                     batch['audio_signal'].cuda(),
                     batch['audio_signal_length'].cuda(),
+                    batch['target_texts'].cuda() if self.cfg.get('use_gt', False) else None,
+                    batch['source_texts_merge'].cuda() if self.cfg.get('use_gt_source', False) else None,
                 )
             response = generate(self, **inference_config)
 

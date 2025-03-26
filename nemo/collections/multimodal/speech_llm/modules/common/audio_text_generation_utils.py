@@ -355,16 +355,20 @@ def generate(
         context_tokens_tensor, context_length_tensor = inputs
     elif isinstance(inputs, tuple) and len(inputs) == 4:
         context_tokens_tensor, context_length_tensor, audio_signal, audio_signal_length = inputs
-    elif isinstance(inputs, tuple) and len(inputs) == 6:  # multi-audio
-        has_multi_audios = True
-        (
-            context_tokens_tensor,
-            context_length_tensor,
-            audio_signal,
-            audio_signal_length,
-            num_audios,
-            context_start_idx,
-        ) = inputs
+    elif isinstance(inputs, tuple) and len(inputs) == 5:
+        context_tokens_tensor, context_length_tensor, audio_signal, audio_signal_length, gt_tokens = inputs
+    elif isinstance(inputs, tuple) and len(inputs) == 6:
+        context_tokens_tensor, context_length_tensor, audio_signal, audio_signal_length, gt_tokens, gt_source_tokens = inputs
+    # elif isinstance(inputs, tuple) and len(inputs) == 6:  # multi-audio
+    #     has_multi_audios = True
+    #     (
+    #         context_tokens_tensor,
+    #         context_length_tensor,
+    #         audio_signal,
+    #         audio_signal_length,
+    #         num_audios,
+    #         context_start_idx,
+    #     ) = inputs
     else:
         context_tokens_tensor, context_length_tensor = inference_strategy.tokenize_batch(
             inputs, tokens_to_generate, add_BOS
@@ -454,6 +458,7 @@ def generate(
         min_tokens_to_generate=min_tokens_to_generate,
         num_audios=num_audios,
         context_start_idx=context_start_idx,
+        gt_tokens=gt_tokens,
     )
     special_tokens = set()
     if hasattr(tokenizer, 'pad_token') and tokenizer.pad_token is not None:
@@ -813,9 +818,16 @@ def s2s_sample_sequence_batch(
                         prev = torch.multinomial(probs, num_samples=1).view(-1)
                     return prev
 
-                # import pdb; pdb.set_trace()
-
                 prev = [get_prev(logits_i, started, temperature, extra) for logits_i in logits]
+
+                # Inject ground truth target or source text
+                if "gt_tokens" in extra and extra["gt_tokens"] is not None:
+                    gt_tokens = extra["gt_tokens"]
+                    prev[0] = gt_tokens[:, min(context_length, gt_tokens.shape[1] - 1)]
+                if "gt_source_tokens" in extra and extra["gt_source_tokens"] is not None:
+                    gt_source_tokens = extra["gt_source_tokens"]
+                    prev[-1] = gt_source_tokens[:, min(context_length, gt_source_tokens.shape[1] - 1)]
+
                 prev = torch.stack(prev, dim=1)
                 started_expand = started.unsqueeze(1).expand(-1, prev.size(1))
                 new_tokens = switch(tokens[:, context_length], prev, started_expand)
@@ -921,6 +933,8 @@ def s2s_synced_generate(
     min_tokens_to_generate=0,
     num_audios: Optional[torch.Tensor] = None,
     context_start_idx: Optional[List[List[int]]] = None,
+    gt_tokens: Optional[torch.Tensor] = None,
+    gt_source_tokens: Optional[torch.Tensor] = None,
 ):
     context_length = context_length_tensor.min().item()
     tokenizer = model.tokenizer
@@ -946,6 +960,8 @@ def s2s_synced_generate(
                 "greedy": greedy,
                 "repetition_penalty": repetition_penalty,
                 "min_tokens_to_generate": min_tokens_to_generate,
+                "gt_tokens": gt_tokens,
+                "gt_source_tokens": gt_source_tokens,
             },
             num_audios=num_audios,
             context_start_idx=context_start_idx,
