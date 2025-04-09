@@ -16,6 +16,7 @@ import soundfile as sf
 import string
 import torch
 import torchaudio
+import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from omegaconf.omegaconf import OmegaConf, open_dict
 from pytorch_lightning.trainer.trainer import Trainer
@@ -914,14 +915,29 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 )
                 key = input + self.tokenizer.ids_to_text(text_answer) + str(metadata)
 
+                # Special handling for ASR data
+                if getattr(data_cfg.input_cfg[0].input_cfg[0].tags, 's2s_duplex_asr', False):
+                    src_text_pred = torch.Tensor(pred).squeeze(-1).int()[:,0]
+                    eos_pos = (src_text_pred == self.tokenizer.eos_id).nonzero()
+                    if len(eos_pos) > 0:
+                        src_text_pred[eos_pos[0] + 1:] = 0
+                    pred_t = torch.Tensor(pred)
+                    pred_t[:,0] = src_text_pred
+                else:
+                    pred_t = torch.Tensor(pred)
+
+                # breakpoint()                  
+
                 text_pred, speech_pred, src_text_pred, all_pred = self.parse_decoder_outputs(
-                    torch.Tensor(pred),
+                    pred_t,
                     self.tokenizer.eos_id,
                     pred_context_length,
                     self.cfg.data.train_ds.speech_pad_id,
                     self.cfg.data.train_ds.speech_eos_id,
-                    gt_answer=text_answer,
+                    gt_answer=text_answer
                 )
+
+                # breakpoint()
 
                 def normalize_text(text):
                     return text.strip().replace('⁇', '')
@@ -1077,7 +1093,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         return deduplicated_outputs
 
     def parse_decoder_outputs(
-        self, input_decoder_output, text_separator, context_length, speech_pad_id=1001, speech_eos_id=1004, gt_answer=None
+        self, input_decoder_output, text_separator, context_length, speech_pad_id=1001, speech_eos_id=1004, gt_answer=None, use_pred_eou=False,
     ):
         # remove text context
         max_len = input_decoder_output.shape[0]
@@ -1100,7 +1116,9 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         user_text_tokens = torch.zeros_like(text_tokens)
         agent_text_tokens = torch.zeros_like(text_tokens)
 
-        # breakpoint()
+        if use_pred_eou:
+            gt_answer = text_tokens
+
         # Assume user talks first and assign odd segments to user
         assign_to_user = True
         for i in range(len(text_tokens)):
@@ -1712,9 +1730,16 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         encoded_len = torch.minimum(answer_codecs_lens, encoded_len)
         answer_codecs_lens = encoded_len
         all_channels = []
+        source_channel_loss_mask = []
         for i, answer_codec in enumerate(answer_codecs):
             text_channel = audio_batch['target_texts_merge'][i]
             sliced_text_channel = text_channel[: answer_codec.shape[0]].unsqueeze(-1)
+            if audio_batch['source_texts_loss_mask'] is not None:
+                loss_mask = audio_batch['source_texts_loss_mask'][i]
+                logging.info(f'loss_mask: {loss_mask}')
+                loss_mask = loss_mask[: answer_codec.shape[0]].unsqueeze(-1)
+            else:
+                loss_mask = None
             answer_codec = torch.where(
                 sliced_text_channel == self.tokenizer.bos_id, self.cfg.data.train_ds.speech_bos_id, answer_codec
             )
@@ -1729,7 +1754,11 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 logging.info(f"sliced_source_text_channel: {sliced_source_text_channel.squeeze(-1)}")
                 src_bos_pos = torch.where(sliced_source_text_channel == self.tokenizer.bos_id)[0].tolist()
                 src_eos_pos = torch.where(sliced_source_text_channel == self.tokenizer.eos_id)[0].tolist()
-                for start_idx, end_idx in zip(src_bos_pos, src_eos_pos):
+                for i, (start_idx, end_idx) in enumerate(zip(src_bos_pos, src_eos_pos)):
+                    # breakpoint()
+                    if i > 0:
+                        # explicity assign for barge-in
+                        sliced_text_channel[start_idx - 1] = self.tokenizer.eos_id  
                     sliced_text_channel[start_idx:end_idx+1] = sliced_source_text_channel[start_idx:end_idx+1]
 
             logging.info(f"merged sliced_text_channel: {sliced_text_channel.squeeze(-1)}")
@@ -1752,11 +1781,17 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 ]
                 combined_channels = torch.cat([sliced_text_channel_extended, answer_codec_shifted], dim=-1)
                 all_channels.append(combined_channels)
+                if loss_mask is not None:
+                    source_channel_loss_mask.append(loss_mask)
             else:
                 # checked text_channel, loss_mask;  checked injecting bos and eos properly to control turn taking in inference
                 all_channels.append(torch.cat([sliced_text_channel, answer_codec], dim=-1))
+                if loss_mask is not None:   
+                    source_channel_loss_mask.append(loss_mask)
 
         all_channels = pad_sequence(all_channels, batch_first=True)
+        if loss_mask is not None:
+            source_channel_loss_mask = pad_sequence(source_channel_loss_mask, batch_first=True)
 
         # inputs ids keep just the first channel (text channel)
         if not getattr(self.cfg, 'cond_llm_backbone_on_speech_tokens', True):
@@ -1770,6 +1805,10 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         encoded = encoded[:, : input_ids.shape[1]]
         encoder_length = encoded_len - 1
         labels = all_channels[:, 1:]
+        if loss_mask is not None:
+            label_mask = source_channel_loss_mask[:, 1:]
+        else:
+            label_mask = None
 
         # breakpoint()
 
@@ -1780,6 +1819,14 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         input_audio_tokens = input_audio_tokens[:, : encoded.shape[1]]
 
         loss_mask = torch.ones_like(labels)
+        try:
+            # TODO(kevinhu): Make sure the two has the same time dimension
+            if label_mask is not None:
+                T = loss_mask.shape[1]
+                label_mask = F.pad(label_mask[:, :T], (0, max(0, T - label_mask.shape[1])), value=0)
+                loss_mask[..., 0:1] = label_mask
+        except:
+            breakpoint()
         assert self.cfg.get(
             'duplex_loss_on_all_steps', False
         ), "only support duplex_loss_on_all_steps in real duplex data read from dataloader"
@@ -2203,7 +2250,12 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         # TODO(kevinhu): For now only evaluate the first user EOU
         user_eos_positions = [all_eos_positions[0]]
         # EOU in ground truth
-        gt_eos_positions = [torch.where(gt_ids == self.tokenizer.eos_id)[0][0]]
+        # Find EOS positions
+        eos_indices = torch.where(gt_ids == self.tokenizer.eos_id)[0]
+        if len(eos_indices) > 0:
+            gt_eos_positions = [eos_indices[0]]
+        else:
+            gt_eos_positions = [len(gt_ids) - 1]
         
         latencies = []
         cutoffs = []

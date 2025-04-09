@@ -399,6 +399,10 @@ class AudioToAudioGenerationStrategy(AudioToTextGenerationStrategy):
                 'answer_audio_lens': all_lens_answer_rate,
                 'answer_audio': torch.zeros([audio_signal.shape[0], all_lens_answer_rate.max()]).cuda(),
                 'loss_mask': None,
+                'source_texts_loss_mask': None,
+                # 'source_texts_loss_mask': torch.full(
+                #     [audio_signal.shape[0], self.model.get_step_from_audio_len(all_lens_answer_rate).max() + 1], 1,
+                # ).cuda(),
                 'speaker_ids': speaker_ids,
             }
             if all(context_lengths != 1):  # has include_sys tag
@@ -413,6 +417,10 @@ class AudioToAudioGenerationStrategy(AudioToTextGenerationStrategy):
                 'answer_audio_lens': torch.full([audio_signal.shape[0]], answer_audio_lens).cuda(),
                 'answer_audio': torch.zeros([audio_signal.shape[0], answer_audio_lens]).cuda(),
                 'loss_mask': None,
+                'source_texts_loss_mask': None,
+                # 'source_texts_loss_mask': torch.full(
+                #     [audio_signal.shape[0], self.model.get_step_from_audio_len(all_lens_answer_rate).max() + 1], 1,
+                # ).cuda(),
                 'speaker_ids': speaker_ids,
             }
             # pad user signal with silence of the length of answer_audio_lens and store the encoded for prepare_batch_at_step
