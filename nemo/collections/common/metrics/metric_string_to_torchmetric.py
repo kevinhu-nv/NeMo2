@@ -37,8 +37,10 @@ MetricStringToTorchMetric = {
     'bleu': SacreBLEUScore,
     'bleu2': SacreBLEUScore,
     'turndiff': SacreBLEUScore,  # tmp
+    'ep_latency': ExactStringMatchMetric,
+    'ep_cutoff': WordErrorRate,
 }
 
-TextMetricsSet = set(['rouge', 'wer', 'bleu', 'bleu2', 'turndiff'])
+TextMetricsSet = set(['rouge', 'wer', 'bleu', 'bleu2', 'turndiff', 'ep_latency', 'ep_cutoff'])
 
 ClassificationMetricsSet = set(['accuracy', 'average_precision', 'f1', 'exact_string_match'])
