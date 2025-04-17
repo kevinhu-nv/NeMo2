@@ -670,12 +670,14 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 # peft_eval.py
                 if self.cfg.get('use_gt', False):
                     gt_tokens = batch['target_texts_merge'].clone()
-                    # for i in range(len(batch['source_texts_merge'])):
-                    #     source_text_channel = batch['source_texts_merge'][i]
-                    #     src_bos_pos = torch.where(source_text_channel == self.tokenizer.bos_id)[0].tolist()
-                    #     src_eos_pos = torch.where(source_text_channel == self.tokenizer.eos_id)[0].tolist()
-                    #     for start_idx, end_idx in zip(src_bos_pos, src_eos_pos):
-                    #         gt_tokens[i][start_idx:end_idx+1] = source_text_channel[start_idx:end_idx+1]
+                    for i in range(len(batch['source_texts_merge'])):
+                        source_text_channel = batch['source_texts_merge'][i]
+                        src_bos_pos = torch.where(source_text_channel == self.tokenizer.bos_id)[0].tolist()
+                        src_eos_pos = torch.where(source_text_channel == self.tokenizer.eos_id)[0].tolist()
+                        for start_idx, end_idx in zip(src_bos_pos, src_eos_pos):
+                            gt_tokens[i][start_idx:end_idx+1] = source_text_channel[start_idx:end_idx+1]
+                    # gt_tokens = gt_tokens[:,1:]
+                    print(f'gt_tokens: {gt_tokens[-1,:]}')
 
                 # breakpoint()
                 inference_config['inputs'] = (
@@ -2253,9 +2255,9 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         # Find EOS positions
         eos_indices = torch.where(gt_ids == self.tokenizer.eos_id)[0]
         if len(eos_indices) > 0:
-            gt_eos_positions = [eos_indices[0]]
+            gt_eos_positions = eos_indices[0:1]
         else:
-            gt_eos_positions = [len(gt_ids) - 1]
+            gt_eos_positions = torch.tensor([len(gt_ids) - 1], device=gt_ids.device)
         
         latencies = []
         cutoffs = []

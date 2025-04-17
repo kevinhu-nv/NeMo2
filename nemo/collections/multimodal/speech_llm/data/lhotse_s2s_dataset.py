@@ -72,6 +72,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         load_answer_audio: bool = False,
         codec_model_downsampling_factor: float = 1023.5,
         word_align_source_text: str = 'right',
+        injection_text_field: str = 'text',
     ):
         super().__init__()
         self.text_processor = text_processor
@@ -100,6 +101,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         self.load_answer_audio = load_answer_audio
         self.codec_model_downsampling_factor = codec_model_downsampling_factor
         self.word_align_source_text = word_align_source_text
+        self.injection_text_field = injection_text_field
 
         # To be consistent with SALM text processor
         self.text_processor.add_sep = False
@@ -324,10 +326,12 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                         continue
                     elif supervisions[1].speaker.lower() == "agent" or supervisions[1].speaker.lower() == "assistant":
                         use_word_alignment = getattr(cut, "s2s_duplex_align", False)
-                        text = supervisions[1].text
+                        # breakpoint()
+                        text = getattr(supervisions[1], self.injection_text_field)
                         logging.info(f'batch_i: {batch_i}, id: {id}, target_text: {text}')
                         if not use_word_alignment:
-                            output_text = re.sub(pattern, "", supervisions[1].text)
+                            output_text = re.sub(pattern, "", text)
+                            # breakpoint()
                             output_text = re.sub(r'\s+', ' ', output_text).strip()
                             target_text = self.text_processor._process_example(context="", output=output_text)
                             # -1 to remove the eos token added by the text processor
@@ -785,6 +789,18 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                 text_end_time[-1].append(supervisions[0].start + supervisions[0].duration)
                 text_start_time[-1][-1] = validate_time(text_start_time[-1][-1])
                 text_end_time[-1][-1] = validate_time(text_end_time[-1][-1])
+                srctext_start_time[-1].append(supervisions[0].start)
+                srctext_end_time[-1].append(supervisions[0].start + supervisions[0].duration)
+                srctext_start_time[-1][-1] = validate_time(srctext_start_time[-1][-1])
+                srctext_end_time[-1][-1] = validate_time(srctext_end_time[-1][-1])
+                if cur_user_src_word_alignment:
+                    src_word_lengths.append(src_word_length)
+                    src_start_time_tokens.append(src_start_time_token)
+                    src_end_time_tokens.append(src_end_time_token)
+                else:
+                    src_word_lengths.append(-1)
+                    src_start_time_tokens.append(-1)
+                    src_end_time_tokens.append(-1)
             batch_i += 1
 
         answer_audios, answer_audio_lens = None, None
@@ -952,7 +968,6 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                         logging.info(f"src_end_time_tokens[{cnt}]: {src_end_time_tokens[cnt]}")
                     except:
                         import pdb; pdb.set_trace()
-                    # import pdb; pdb.set_trace()
                     src_texts_expanded = self._expand_text_with_timestamps_and_word_lengths(
                         [source_texts[cnt]],
                         [src_word_lengths[cnt]],
@@ -970,7 +985,8 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                     except:
                         print(f'src_text_start_step: {src_text_start_step}')
                         print(f'srctext_len_plus_eos: {srctext_len_plus_eos}')
-                        import pdb; pdb.set_trace()
+                        breakpoint()
+                    # breakpoint()
                     cur_source_text[src_text_start_step] = self.text_processor.bos_id
                     src_text_end_step = src_text_start_step + srctext_len_plus_eos
                     cur_source_text_loss_mask = torch.ones_like(cur_source_text)
@@ -998,7 +1014,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                     except:
                         print(f'src_text_start_step: {src_text_start_step}')
                         print(f'src_text_len: {src_text_len}')
-                        import pdb; pdb.set_trace()
+                        breakpoint()
                     cur_source_text_loss_mask[src_text_start_step : src_text_end_step + 1] = 0
                 cur_source_text[src_text_end_step] = self.text_processor.eos_id
                 if j == range(num_turns[i])[-1]:

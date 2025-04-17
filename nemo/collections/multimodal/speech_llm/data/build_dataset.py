@@ -105,6 +105,7 @@ def build_speechllm_dataset(model_instance, data_cfg, is_train):
             load_answer_audio=data_cfg.get('load_answer_audio', False),
             codec_model_downsampling_factor=data_cfg.get('codec_model_downsampling_factor', 1024),
             word_align_source_text=data_cfg.get('word_align_source_text', 'right'),
+            injection_text_field=data_cfg.get('injection_text_field', 'text'),
         )
 
     # Notably, the data weights are controlled by either bucketing_weights
