@@ -756,6 +756,7 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
                 position_ids,
                 set_inference_key_value_memory,
                 inference_max_sequence_len,
+                _, # ignore input_text_token
             ) = batch
             tokens = tokens.cuda()
 
