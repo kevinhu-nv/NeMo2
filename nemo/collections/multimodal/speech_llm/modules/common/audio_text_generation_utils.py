@@ -825,7 +825,7 @@ def s2s_sample_sequence_batch(
                 # Inject ground truth target or source text
                 if "gt_tokens" in extra and extra["gt_tokens"] is not None:
                     gt_tokens = extra["gt_tokens"]
-                    prev[0] = gt_tokens[:, min(context_length, gt_tokens.shape[1] - 1)]
+                    prev[0] = torch.where(prev[0] == 2, prev[0], gt_tokens[:, min(context_length, gt_tokens.shape[1] - 1)])
                 if "gt_source_tokens" in extra and extra["gt_source_tokens"] is not None:
                     gt_source_tokens = extra["gt_source_tokens"]
                     prev[-1] = gt_source_tokens[:, min(context_length, gt_source_tokens.shape[1] - 1)]

@@ -75,6 +75,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         word_align_source_text: str = 'right',
         injection_text_field: str = 'text',
         prompt_audio_path: str = None,
+        tgt_text_eos_no_padding: bool = False,
     ):
         super().__init__()
         self.text_processor = text_processor
@@ -104,7 +105,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         self.codec_model_downsampling_factor = codec_model_downsampling_factor
         self.word_align_source_text = word_align_source_text
         self.injection_text_field = injection_text_field
-
+        self.tgt_text_eos_no_padding = tgt_text_eos_no_padding
         # To be consistent with SALM text processor
         self.text_processor.add_sep = False
         self.text_processor.max_seq_length = (
@@ -331,12 +332,10 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                         continue
                     elif supervisions[1].speaker.lower() == "agent" or supervisions[1].speaker.lower() == "assistant":
                         use_word_alignment = getattr(cut, "s2s_duplex_align", False)
-                        # breakpoint()
                         text = getattr(supervisions[1], self.injection_text_field)
                         logging.info(f'batch_i: {batch_i}, id: {id}, target_text: {text}')
                         if not use_word_alignment:
                             output_text = re.sub(pattern, "", text)
-                            # breakpoint()
                             output_text = re.sub(r'\s+', ' ', output_text).strip()
                             target_text = self.text_processor._process_example(context="", output=output_text)
                             # -1 to remove the eos token added by the text processor
@@ -474,6 +473,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         cnt = 0
         skipped = 0
         new_target_texts = []
+        new_target_texts_end = []
         new_source_texts = []
         new_source_texts_loss_mask = []
         for i in range(len(num_turns)):
@@ -485,6 +485,14 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                 + 1
             )
             cur_target_text = torch.full(
+                [total_steps],
+                (
+                    self.text_processor.tokenizer.pad_id
+                    if hasattr(self.text_processor.tokenizer, 'pad_id') and self.text_processor.tokenizer.pad_id >= 0
+                    else self.text_processor.tokenizer.unk_id
+                ),
+            )
+            cur_target_text_end = torch.full(
                 [total_steps],
                 (
                     self.text_processor.tokenizer.pad_id
@@ -506,10 +514,20 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
             for j in range(num_turns[i] // 2):
                 text_start_step = get_step_by_time(text_start_time[i][j])
                 text_end_step = get_step_by_time(text_end_time[i][j]) + 1
+                if self.tgt_text_eos_no_padding:
+                    # Put EOS at the end of the text
+                    text_end_step_no_padding = min(text_end_step, text_start_step + target_text_lengths[cnt] + 1)
+                else:
+                    text_end_step_no_padding = text_end_step
                 if text_end_step == total_steps:
                     text_end_step = total_steps - 1  # boundary case
                 elif text_end_step > total_steps:
                     raise Exception("text_end_step too long")
+                
+                if text_end_step_no_padding == total_steps:
+                    text_end_step_no_padding = total_steps - 1  # boundary case
+                elif text_end_step_no_padding > total_steps:
+                    raise Exception("text_end_step_no_padding too long")
 
                 if text_start_step + 1 >= cur_target_text.shape[0] or text_end_step == text_start_step:
                     skipped += 1
@@ -522,8 +540,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                     # Note: text can be truncated
                     text_len = min(text_end_step - text_start_step - 1, target_texts[cnt].shape[0])
                     cur_target_text[(text_start_step + 1) : (text_start_step + 1 + text_len)] = target_texts[cnt][
-                        :text_len
-                    ]
+                            :text_len]
                     # src_text_len = min(text_end_step - text_start_step - 1, source_texts[cnt].shape[0])
                     # cur_source_text[(text_start_step + 1) : (text_start_step + 1 + src_text_len)] = source_texts[cnt][
                     #     :src_text_len
@@ -544,7 +561,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                 else:
                     raise Exception("Undefined assistant channel text format.")
                 cur_target_text[text_end_step] = self.text_processor.eos_id
-                
+                cur_target_text_end[text_end_step_no_padding] = self.text_processor.eos_id
                 if j == range(num_turns[i] // 2)[-1]:
                     logging.info(f'cur_target_text: {cur_target_text}')
 
@@ -556,7 +573,6 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                     srctext_right_shift = 5
                 else:
                     srctext_right_shift = 0
-                # breakpoint()
                 logging.info(f'user_src_word_alignment[{i}]: {user_src_word_alignment[i]}')
                 if user_src_word_alignment[i] and (self.word_align_source_text == 'left' or self.word_align_source_text == 'right'):
                     src_text_start_step = max(get_step_by_time(srctext_start_time[i][j]), 0) + 2 + srctext_right_shift  # +2 to skip agent turn eos
@@ -624,15 +640,15 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                 cnt += 1
 
             new_target_texts.append(cur_target_text)
+            new_target_texts_end.append(cur_target_text_end)
             new_source_texts.append(cur_source_text)
             new_source_texts_loss_mask.append(cur_source_text_loss_mask)
 
         target_texts_merge, target_text_lengths = collate_and_pad(new_target_texts)
+        target_texts_merge_end, _ = collate_and_pad(new_target_texts_end)
         source_texts_merge, source_text_lengths = collate_and_pad(new_source_texts)
         source_texts_loss_mask, _ = collate_and_pad(new_source_texts_loss_mask)
         source_texts_loss_mask = (source_texts_loss_mask > 0).to(dtype=source_texts_loss_mask.dtype)
-
-        # breakpoint()
 
         assert cnt + skipped == len(target_texts)
         assert target_texts_merge.shape[0] == len(num_turns)
@@ -643,7 +659,6 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         logging.info(f'user_src_word_alignment: {user_src_word_alignment}')
         # note: the codec id in labels and contexts and others do not consider the offset e.g. speech_eos is 1002
         # the offset is all considered by SumVocabParallelEmbedding
-        # breakpoint()
         return_batch = {
             "sample_ids": list(cuts.ids),
             "audio_signal": audio,
@@ -653,6 +668,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
             "instructions": None,
             "tokens": target_texts_merge,  # used in _reconfigure_and_process_inference_batch
             "target_texts_merge": target_texts_merge,  # used in prepare_llm_input
+            "target_texts_merge_end": target_texts_merge_end,
             "source_texts_merge": source_texts_merge,  # used in prepare_llm_input
             "source_texts_loss_mask": source_texts_loss_mask,
             "contexts": target_texts_merge[:, :1],  # used in inference
@@ -848,7 +864,6 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         # may not be necessary in future
         if hasattr(cuts[0], "target_audio"):
             # 22k target audio
-            # breakpoint()
             answer_audios, answer_audio_lens, features_lens = load_audio_from_cut(
                 cuts, "target_audio", self.codec_sample_rate
             )
@@ -960,7 +975,6 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                     srctext_right_shift = 5
                 else:
                     srctext_right_shift = 0
-                # breakpoint()
                 logging.info(f'user_src_word_alignment[{i}]: {user_src_word_alignment[i]}')
                 if user_src_word_alignment[i] and (self.word_align_source_text == 'left' or self.word_align_source_text == 'right'):
                     src_text_start_step = max(get_step_by_time(srctext_start_time[i][j]), 0) + 2 + srctext_right_shift  # +2 to skip agent turn eos
@@ -991,7 +1005,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
                         print(f'src_text_start_step: {src_text_start_step}')
                         print(f'srctext_len_plus_eos: {srctext_len_plus_eos}')
                         breakpoint()
-                    # breakpoint()
+                    
                     cur_source_text[src_text_start_step] = self.text_processor.bos_id
                     src_text_end_step = src_text_start_step + srctext_len_plus_eos
                     cur_source_text_loss_mask = torch.ones_like(cur_source_text)
@@ -1036,7 +1050,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         source_texts_loss_mask, _ = collate_and_pad(new_source_texts_loss_mask)
         source_texts_loss_mask = (source_texts_loss_mask > 0).to(dtype=source_texts_loss_mask.dtype)
 
-        # breakpoint()
+        
 
         assert target_texts_merge.shape[0] == len(num_turns)
         assert cnt + skipped + skipped_source == len(source_texts)
@@ -1046,7 +1060,7 @@ class LhotseAudioQuestionAnswerDataset(torch.utils.data.Dataset):
         logging.info(f'user_src_word_alignment: {user_src_word_alignment}')
         # note: the codec id in labels and contexts and others do not consider the offset e.g. speech_eos is 1002
         # the offset is all considered by SumVocabParallelEmbedding
-        # breakpoint()
+        
         return_batch = {
             "sample_ids": list(cuts.ids),
             "audio_signal": audio,

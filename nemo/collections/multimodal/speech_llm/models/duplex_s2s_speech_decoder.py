@@ -1855,6 +1855,11 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         for i, answer_codec in enumerate(answer_codecs):
             text_channel = audio_batch['target_texts_merge'][i]
             sliced_text_channel = text_channel[: answer_codec.shape[0]].unsqueeze(-1)
+            try:
+                text_channel_end = audio_batch['target_texts_merge_end'][i]
+            except:
+                breakpoint()
+            sliced_text_channel_end = text_channel_end[: answer_codec.shape[0]].unsqueeze(-1)
             if 'source_texts_loss_mask' in audio_batch and audio_batch['source_texts_loss_mask'] is not None:
                 loss_mask = audio_batch['source_texts_loss_mask'][i]
                 logging.info(f'loss_mask: {loss_mask}')
@@ -1867,6 +1872,14 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             answer_codec = torch.where(
                 sliced_text_channel == self.tokenizer.eos_id, self.cfg.data.train_ds.speech_eos_id, answer_codec
             )
+
+            if self.cfg.get('tgt_text_eos_no_padding', False):
+                sliced_text_channel = torch.where(
+                    sliced_text_channel == self.tokenizer.eos_id, self.tokenizer.unk_id, sliced_text_channel
+                )
+                sliced_text_channel = torch.where(
+                    sliced_text_channel_end == self.tokenizer.eos_id, self.tokenizer.eos_id, sliced_text_channel
+                )
             
             logging.info(f"sliced_text_channel: {sliced_text_channel.squeeze(-1)}")
             if getattr(self.cfg, 'predict_source_text', False):
@@ -1878,7 +1891,8 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 for i, (start_idx, end_idx) in enumerate(zip(src_bos_pos, src_eos_pos)):
                     if i > 0:
                         # explicity assign for barge-in
-                        sliced_text_channel[start_idx - 1] = self.tokenizer.eos_id  
+                        if not self.cfg.tgt_text_eos_no_padding:
+                            sliced_text_channel[start_idx - 1] = self.tokenizer.eos_id  
                     sliced_text_channel[start_idx:end_idx+1] = sliced_source_text_channel[start_idx:end_idx+1]
 
             logging.info(f"merged sliced_text_channel: {sliced_text_channel.squeeze(-1)}")
