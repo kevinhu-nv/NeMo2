@@ -16,6 +16,7 @@ import soundfile as sf
 import string
 import torch
 import torchaudio
+import librosa
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from omegaconf.omegaconf import OmegaConf, open_dict
@@ -1822,7 +1823,14 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
 
     def prepare_llm_input_duplex_from_multiturn(self, audio_batch):
         if self.cfg.get('noise_prob', 0.0) and random.random() < self.cfg.get('noise_prob', 0.0):
-            self.add_noise_to_batch(audio_batch, os.path.join(self.cfg.noise_path, 'train'), random.randint(10, 40))
+            if not (
+                self.cfg.get("exclude_noise_on_s2s_duplex_overlap", False) and 's2s_duplex_overlap' in audio_batch
+            ):
+                self.add_noise_to_batch(
+                    audio_batch,
+                    os.path.join(self.cfg.noise_path, self.cfg.get('noise_path_name', 'train')),
+                    random.randint(self.cfg.get('noise_min_snr', 10), self.cfg.get('noise_max_snr', 40)),
+                )
         # real duplex data read from dataloader
         new_user_signal = audio_batch['audio_signal']
         new_user_signal_length = audio_batch['audio_signal_length']
@@ -2067,17 +2075,27 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
 
     # TODO: move the following to dataloader
     def add_noise_to_batch(self, batch, noise_folder, snr_db=20):
+        if self.cfg.get('debug_noise_audio', False):
+            self.write_wave(
+                batch['audio_signal'][0],
+                "/lustre/fsw/portfolios/llmservice/users/zhehuaic/works/mod_speech_llm/tmp/dbg0.wav",
+            )
         batch_audio = batch['audio_signal']  #  torch tensor，Shape: (batch_size, length)
         batch_size, audio_length = batch_audio.shape
 
-        noise_files = [f for f in os.listdir(noise_folder) if f.endswith('.wav')]
+        import glob
+
+        noise_files = [f for f in glob.glob(noise_folder + "/*.wav")]
         if not noise_files:
             raise ValueError(f"No noise files found in {noise_folder}")
 
         for i in range(batch_size):
 
-            noise_path = os.path.join(noise_folder, random.choice(noise_files))
+            noise_path = random.choice(noise_files)
             noise, sr = sf.read(noise_path, dtype='float32')
+            # resample noise from sr to self.cfg.data.train_ds.sample_rate
+            if self.cfg.get('noise_resample', False) and sr != self.cfg.data.train_ds.sample_rate:
+                noise = librosa.resample(noise, orig_sr=sr, target_sr=self.cfg.data.train_ds.sample_rate)
 
             if len(noise.shape) > 1:
                 noise = np.mean(noise, axis=1)
@@ -2102,7 +2120,23 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
 
             batch_audio[i] = batch_audio[i] + noise_tensor
 
+        if self.cfg.get('debug_noise_audio', False):
+            self.write_wave(
+                batch_audio[0], "/lustre/fsw/portfolios/llmservice/users/zhehuaic/works/mod_speech_llm/tmp/dbg1.wav"
+            )
+            self.write_wave(
+                noise_tensor, "/lustre/fsw/portfolios/llmservice/users/zhehuaic/works/mod_speech_llm/tmp/dbg2.wav"
+            )
         batch['audio_signal'] = batch_audio
+
+    def write_wave(self, one_audio_signal, file_name, sr=None):
+        one_audio_signal = one_audio_signal.cpu().numpy()
+        one_audio_signal = one_audio_signal.astype(np.float32)
+        if sr is None:
+            sr = self.cfg.data.train_ds.sample_rate
+        # one_audio_signal = np.clip(one_audio_signal, -1.0, 1.0)
+        sf.write(file_name, one_audio_signal, sr)
+
 
     def prepare_llm_input(self, audio_batch):
         # handle duplex and singleturn s2s
