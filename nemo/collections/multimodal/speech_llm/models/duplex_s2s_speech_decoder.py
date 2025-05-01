@@ -1005,7 +1005,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         self.train()
         return outputs
 
-    def post_inference_step(self, list_outputs, mode, data_cfg):
+    def post_inference_step(self, list_outputs, mode, data_cfg, dataloader_idx=None):
         # inference is done so make sure that input and KV cache is disabled
         self.model.speech_decoder.reset_input_and_kv_cache(use_cache=False)
 
@@ -1046,7 +1046,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 key = input + self.tokenizer.ids_to_text(text_answer) + str(metadata)
 
                 # Special handling for ASR data
-                if getattr(data_cfg.input_cfg[0].input_cfg[0].tags, 's2s_duplex_asr', False):
+                if getattr(data_cfg.input_cfg[0].input_cfg[dataloader_idx].tags, 's2s_duplex_asr', False):
                     src_text_pred = torch.Tensor(pred).squeeze(-1).int()[:,0]
                     eos_pos = (src_text_pred == self.tokenizer.eos_id).nonzero()
                     if len(eos_pos) > 0:
@@ -1388,7 +1388,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             self.log(loss_log_key, loss, batch_size=1)
             averaged_loss.append(loss)
 
-            output = self.post_inference_step(output, mode, data_cfg)
+            output = self.post_inference_step(output, mode, data_cfg, dataloader_idx)
 
             # Gather the outputs object from all data parallel ranks since we are using the DistributedSampler which splits data across DDP ranks.
             gathered_outputs = [None for _ in range(parallel_state.get_data_parallel_world_size())]
