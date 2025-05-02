@@ -793,14 +793,34 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 # peft_eval.py
                 if self.cfg.get('use_gt', False):
                     gt_tokens = batch['target_texts_merge'].clone()
+                    if self.cfg.get('tgt_text_eos_no_padding', False):
+                        gt_tokens_end = batch['target_texts_merge_end'].clone()
                     for i in range(len(batch['source_texts_merge'])):
+                        cur_tokens = gt_tokens[i]
+                        # eos_pos = torch.where(cur_tokens == self.tokenizer.eos_id)[0]
+                        # if len(eos_pos) > 0:
+                        #     pad_mask = torch.arange(len(cur_tokens), device=cur_tokens.device) > eos_pos[0]
+                        #     cur_tokens = torch.where(pad_mask, self.tokenizer.unk_id, cur_tokens)
+
+                        if self.cfg.get('tgt_text_eos_no_padding', False):
+                            cur_tokens = gt_tokens[i]
+                            cur_tokens_end = gt_tokens_end[i]
+                            cur_tokens = torch.where(
+                                cur_tokens == self.tokenizer.eos_id, self.tokenizer.unk_id, cur_tokens
+                            )
+                            cur_tokens = torch.where(
+                                cur_tokens_end == self.tokenizer.eos_id, self.tokenizer.eos_id, cur_tokens
+                            )
+
+                        gt_tokens[i] = cur_tokens
                         source_text_channel = batch['source_texts_merge'][i]
                         src_bos_pos = torch.where(source_text_channel == self.tokenizer.bos_id)[0].tolist()
                         src_eos_pos = torch.where(source_text_channel == self.tokenizer.eos_id)[0].tolist()
                         for start_idx, end_idx in zip(src_bos_pos, src_eos_pos):
                             gt_tokens[i][start_idx:end_idx+1] = source_text_channel[start_idx:end_idx+1]
-                    # gt_tokens = gt_tokens[:,1:]
-                    print(f'gt_tokens: {gt_tokens[-1,:]}')
+                        print(f'gt_tokens: {gt_tokens[-1,:]}')
+                    
+                    gt_tokens = gt_tokens[:,1:]
 
                 inference_config['inputs'] = (
                     batch['contexts'].cuda(),
