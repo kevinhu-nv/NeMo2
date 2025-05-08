@@ -813,14 +813,15 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                             )
 
                         gt_tokens[i] = cur_tokens
-                        source_text_channel = batch['source_texts_merge'][i]
-                        src_bos_pos = torch.where(source_text_channel == self.tokenizer.bos_id)[0].tolist()
-                        src_eos_pos = torch.where(source_text_channel == self.tokenizer.eos_id)[0].tolist()
-                        for start_idx, end_idx in zip(src_bos_pos, src_eos_pos):
-                            gt_tokens[i][start_idx:end_idx+1] = source_text_channel[start_idx:end_idx+1]
+                        if self.cfg.get('predict_source_text', False):
+                            source_text_channel = batch['source_texts_merge'][i]
+                            src_bos_pos = torch.where(source_text_channel == self.tokenizer.bos_id)[0].tolist()
+                            src_eos_pos = torch.where(source_text_channel == self.tokenizer.eos_id)[0].tolist()
+                            for start_idx, end_idx in zip(src_bos_pos, src_eos_pos):
+                                gt_tokens[i][start_idx:end_idx+1] = source_text_channel[start_idx:end_idx+1]
                         print(f'gt_tokens: {gt_tokens[-1,:]}')
                     
-                    gt_tokens = gt_tokens[:,1:]
+                    # gt_tokens = gt_tokens[:,1:]
 
                 inference_config['inputs'] = (
                     batch['contexts'].cuda(),
