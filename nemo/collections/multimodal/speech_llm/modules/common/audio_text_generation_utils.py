@@ -751,6 +751,7 @@ def s2s_sample_sequence_batch(
         # eos_id as an argument and needs termination when that id id found.
         # TODO:
         eod_id = tokenizer.eos_id
+        sod_id = tokenizer.bos_id
         counter = 0
         batch_size = context_tokens.size(0)
         is_done = torch.zeros([batch_size]).byte().cuda()
@@ -764,6 +765,10 @@ def s2s_sample_sequence_batch(
             maxlen = context_tokens.shape[1]
         maxlen = inference_strategy.clip_max_len(maxlen)
         lengths = torch.ones([batch_size]).long().cuda() * maxlen
+        is_agent_turn = torch.zeros([batch_size]).byte().cuda()
+        gt_tokens = extra["gt_tokens"]
+        # [B,T]
+        gt_start_pos = torch.where(gt_tokens == 1)[1].reshape(batch_size, -1)[:, 0]
         while context_length < maxlen:
             batch, tensor_shape = inference_strategy.prepare_batch_at_step(
                 tokens,
@@ -822,13 +827,16 @@ def s2s_sample_sequence_batch(
 
                 prev = [get_prev(logits_i, started, temperature, extra) for logits_i in logits]
 
-                # Inject ground truth target or source text
+                # Inject ground truth agent text
                 if "gt_tokens" in extra and extra["gt_tokens"] is not None:
-                    gt_tokens = extra["gt_tokens"]
-                    prev[0] = torch.where(prev[0] == 2, prev[0], gt_tokens[:, min(context_length, gt_tokens.shape[1] - 1)])
-                if "gt_source_tokens" in extra and extra["gt_source_tokens"] is not None:
-                    gt_source_tokens = extra["gt_source_tokens"]
-                    prev[-1] = gt_source_tokens[:, min(context_length, gt_source_tokens.shape[1] - 1)]
+                    prev[0] = torch.where(is_agent_turn == 1, gt_tokens[torch.arange(gt_tokens.shape[0]), gt_start_pos], prev[0])
+                    gt_start_pos = torch.where(
+                        (is_agent_turn == 1) & (gt_start_pos < gt_tokens.shape[1] - 1),
+                        gt_start_pos + 1,
+                        gt_start_pos
+                    )
+                    # Assuming only single user turn and user talks first
+                    is_agent_turn = torch.where(prev[0] == eod_id, 1, is_agent_turn)
 
                 prev = torch.stack(prev, dim=1)
                 started_expand = started.unsqueeze(1).expand(-1, prev.size(1))

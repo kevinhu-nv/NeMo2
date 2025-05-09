@@ -324,7 +324,6 @@ class AudioToAudioGenerationStrategy(AudioToTextGenerationStrategy):
             positions2use = self.position_ids[:, :curr_context_length]
             embeddings2use = input_embeddings[:curr_context_length]
             encoded = self.encoded[:, :curr_context_length].view(micro_batch_size, 1, -1)
-            input_text_token = self.input_text_tokens[:, curr_context_length - 1].view(micro_batch_size, 1)
             # create a dummy tensor with unk id that is used during the training for pad the first step
             if getattr(self.model.cfg, 'speech_delay', False):
                 # input_embeddings.size(1) because embeddings2use initially is T, B, F and audiotokens2use need to be B, T, F
@@ -354,15 +353,16 @@ class AudioToAudioGenerationStrategy(AudioToTextGenerationStrategy):
             elif duplex_method == "from_multiturn" or duplex_method == "from_duplex":
                 encoded = self.encoded[:, curr_context_length - 1].view(micro_batch_size, 1, -1)
                 embeddings2use = embeddings2use + encoded.transpose(0, 1).contiguous()
-                input_text_token = self.input_text_tokens[:, curr_context_length - 1].view(micro_batch_size, 1)
             else:
                 raise ValueError(f"duplex_method {duplex_method} not supported")
+
+        input_text_token = self.input_text_tokens
 
         setkey_value_array = torch.tensor(
             [set_inference_key_value_memory] * micro_batch_size, device=torch.cuda.current_device()
         )
         len_array = torch.tensor([maxlen] * micro_batch_size, device=torch.cuda.current_device())
-        batch = [tokens2use, audiotokens2use, encoded, embeddings2use, self.attention_mask, positions2use, setkey_value_array, len_array, input_text_token]
+        batch = [tokens2use, audiotokens2use, encoded, embeddings2use, self.attention_mask, positions2use, setkey_value_array, len_array, input_text_token, self.gt_start_pos]
         tensor_shape = [tokens2use.shape[1], micro_batch_size, self.model.cfg.hidden_size]
         return batch, tensor_shape
 
@@ -389,8 +389,10 @@ class AudioToAudioGenerationStrategy(AudioToTextGenerationStrategy):
                 padded_input_text_tokens = torch.cat(
                     [gt_tokens, torch.zeros([gt_tokens.shape[0], answer_audio_lens], dtype=torch.int64).cuda()], axis=1
                 )
+                batch_size = padded_input_text_tokens.shape[0]
             else:
                 padded_input_text_tokens = gt_tokens
+            gt_start_pos = torch.where(padded_input_text_tokens == 1)[1].reshape(batch_size, -1)[:, 0] if padded_input_text_tokens is not None else None
 
             all_lens_answer_rate = (
                 (audio_length + answer_audio_lens)
@@ -418,6 +420,7 @@ class AudioToAudioGenerationStrategy(AudioToTextGenerationStrategy):
                 'loss_mask': None,
                 'source_texts_loss_mask': None,
                 'input_text_tokens': padded_input_text_tokens,
+                'gt_start_pos': gt_start_pos,
                 # 'source_texts_loss_mask': torch.full(
                 #     [audio_signal.shape[0], self.model.get_step_from_audio_len(all_lens_answer_rate).max() + 1], 1,
                 # ).cuda(),
@@ -449,6 +452,7 @@ class AudioToAudioGenerationStrategy(AudioToTextGenerationStrategy):
         encoder_input, _, labels, _, extra_outputs = self.model.prepare_llm_input_duplex_from_multiturn(batch)
         self.encoded = extra_outputs[0]
         self.input_text_tokens = extra_outputs[3]
+        self.gt_start_pos = batch['gt_start_pos']
 
         self.attention_mask = self.model._create_attention_mask(encoder_input.transpose(0, 1))
         self.position_ids = build_position_ids(encoder_input.transpose(0, 1)[:, :, 0])

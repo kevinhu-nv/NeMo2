@@ -383,6 +383,7 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
         proj_head_loss_weights: List[float],
         vocab_size: int,
         speech_decoder_parms: DictConfig = None,
+        text_eos_id: int = None,
         *args,
         **kwargs,
     ) -> None:
@@ -391,6 +392,8 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
         self.proj_head_dims = proj_head_dims
         self.proj_head_loss_weights = proj_head_loss_weights
         self.speech_decoder_parms = dict(speech_decoder_parms) if speech_decoder_parms is not None else None
+        self.is_agent_turn = None
+        self.text_eos_id = text_eos_id
         
         num_audio_codebooks = len(self.proj_head_dims) - 1 # -1 to not consider the text channel
         num_audio_tokens_per_codebook = self.proj_head_dims[-1] # the first in the list is the vocab size of llm and the rest is the codec vocab, so get the last one for simplicity
@@ -439,6 +442,7 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
         speech_mask: Tensor = None,
         input_audio_tokens: Tensor = None,
         input_text_tokens: Tensor = None,
+        gt_start_pos: Tensor = None,
         speech_encoder_emb: Tensor = None,
         inference_config: dict = None,
     ) -> Tensor:
@@ -514,8 +518,12 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
             text_logits, _ = self.output_layer(
                 hidden_states, weight=output_weight[: self.vocab_size] if output_weight is not None else None
             )
+
+            if self.speech_decoder.use_gt_text:
+                gt_tokens = input_text_tokens
+
             # sample text logits to get input_text_tokens in inference time
-            if self.speech_decoder.use_input_cache and not self.training and not self.speech_decoder.use_gt_text:
+            if self.speech_decoder.use_input_cache and not self.training:
                 B, T = text_logits.size(1), text_logits.size(0)
                 if greedy_on_text or greedy:
                     input_text_tokens = torch.argmax(text_logits, dim=-1).view(B, T).contiguous()
@@ -525,6 +533,24 @@ class S2sMCoreGPTModelSpeechDecoder(MCoreGPTModel):
                     input_text_tokens = torch.multinomial(probs, 1) # (B, 1)
 
                 input_text_tokens = input_text_tokens.long()
+
+            if self.speech_decoder.use_input_cache and not self.training and self.speech_decoder.use_gt_text:
+                if self.is_agent_turn is None or self.is_agent_turn.shape[0] != input_text_tokens.shape[0]:
+                    self.is_agent_turn = torch.zeros(input_text_tokens.shape[0], device=input_text_tokens.device)
+                    self.gt_start_pos = gt_start_pos
+                # Assume user talks first and there is a single user turn
+                self.is_agent_turn = torch.where((input_text_tokens == self.text_eos_id).any(dim=1), 1, self.is_agent_turn)
+                gt_token = gt_tokens[torch.arange(gt_tokens.size(0)), self.gt_start_pos].unsqueeze(-1)
+                input_text_tokens = torch.where(
+                    self.is_agent_turn.unsqueeze(-1) == 1,
+                    gt_token,
+                    input_text_tokens
+                )
+                self.gt_start_pos = torch.where(
+                    self.is_agent_turn == 1,
+                    self.gt_start_pos + 1,
+                    self.gt_start_pos
+                )
             
             if self.speech_decoder.use_llm_text_emb:
                 input_text_tokens = self.embedding.word_embeddings(input_text_tokens)
@@ -608,6 +634,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 proj_head_dims=self.proj_head_dims,
                 proj_head_loss_weights=self.proj_head_loss_weights,
                 speech_decoder_parms=self.cfg.get('speech_decoder_parms', None),
+                text_eos_id=self.tokenizer.eos_id,
             )
 
             if self.cfg.get('scale_positional_embedding', False):
@@ -797,11 +824,6 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                         gt_tokens_end = batch['target_texts_merge_end'].clone()
                     for i in range(len(batch['source_texts_merge'])):
                         cur_tokens = gt_tokens[i]
-                        # eos_pos = torch.where(cur_tokens == self.tokenizer.eos_id)[0]
-                        # if len(eos_pos) > 0:
-                        #     pad_mask = torch.arange(len(cur_tokens), device=cur_tokens.device) > eos_pos[0]
-                        #     cur_tokens = torch.where(pad_mask, self.tokenizer.unk_id, cur_tokens)
-
                         if self.cfg.get('tgt_text_eos_no_padding', False):
                             cur_tokens = gt_tokens[i]
                             cur_tokens_end = gt_tokens_end[i]
@@ -813,7 +835,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                             )
 
                         gt_tokens[i] = cur_tokens
-                        if self.cfg.get('predict_source_text', False):
+                        if self.cfg.get('inject_source_text', False):
                             source_text_channel = batch['source_texts_merge'][i]
                             src_bos_pos = torch.where(source_text_channel == self.tokenizer.bos_id)[0].tolist()
                             src_eos_pos = torch.where(source_text_channel == self.tokenizer.eos_id)[0].tolist()
@@ -864,6 +886,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 set_inference_key_value_memory,
                 inference_max_sequence_len,
                 input_text_token,
+                gt_start_pos,
             ) = batch
             tokens = tokens.cuda()
 
@@ -899,6 +922,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 attention_mask=attention_mask,
                 input_audio_tokens=audiotokens2use,
                 input_text_tokens=input_text_token,
+                gt_start_pos=gt_start_pos,
                 speech_encoder_emb=speech_encoder_emb,
                 inference_config=self.get_inference_config() if not self.training else {},
                 **extra_arg,
@@ -1042,6 +1066,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             'text_srcs': [],
             'text_src_ids': [],
             'text_src_ids_preds': [],
+            'text_src_end_preds': [],
             'batch_idx': [],
         }
         for outputs in list_outputs:
@@ -1097,6 +1122,10 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 src_text_pred_text = self.tokenizer.ids_to_text(src_text_pred)
                 deduplicated_outputs['text_src_preds'].append(normalize_text(src_text_pred_text))
                 deduplicated_outputs['text_src_ids_preds'].append(all_pred)
+                
+                # Assuming only single user turn and user talks first
+                deduplicated_outputs['text_src_end_preds'].append(torch.where(all_pred == self.tokenizer.eos_id)[0][::2][0])
+                
                 deduplicated_outputs['labels'].append(normalize_text(labels_text))
                 text_answer_text = self.tokenizer.ids_to_text(text_answer)
                 deduplicated_outputs['text_answers'].append(normalize_text(text_answer_text))
@@ -1687,7 +1716,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             assert (
                 len(outputs['inputs']) == len(outputs['preds']) == len(outputs['labels']) == len(outputs['metadata'])
             )
-            for i, p, l, m, speech_preds_transcribed, speech_answers_transcribed, text_src_preds, text_src in zip(
+            for i, p, l, m, speech_preds_transcribed, speech_answers_transcribed, text_src_preds, text_src_end, text_src in zip(
                 outputs['inputs'],
                 outputs['preds'],
                 outputs['labels'],
@@ -1695,6 +1724,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 outputs['speech_preds_transcribed'],
                 outputs['speech_answers_transcribed'],
                 outputs['text_src_preds'],
+                outputs['text_src_end_preds'],
                 outputs['text_srcs'],
             ):
                 json_string = {
@@ -1704,6 +1734,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                     'speech_preds_transcribed': speech_preds_transcribed,
                     'speech_answers_transcribed': speech_answers_transcribed,
                     'pred_src_text': text_src_preds,
+                    'src_text_end': text_src_end.tolist(),
                     'src_text': text_src,
                 }
                 for k, v in m.items():
@@ -1920,7 +1951,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
                 for i, (start_idx, end_idx) in enumerate(zip(src_bos_pos, src_eos_pos)):
                     if i > 0:
                         # explicity assign for barge-in
-                        if not self.cfg.tgt_text_eos_no_padding:
+                        if not self.cfg.get('tgt_text_eos_no_padding', False):
                             sliced_text_channel[start_idx - 1] = self.tokenizer.eos_id  
                     sliced_text_channel[start_idx:end_idx+1] = sliced_source_text_channel[start_idx:end_idx+1]
 
@@ -2099,7 +2130,7 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
         if self.cfg.get('debug_noise_audio', False):
             self.write_wave(
                 batch['audio_signal'][0],
-                "/lustre/fsw/portfolios/llmservice/users/zhehuaic/works/mod_speech_llm/tmp/dbg0.wav",
+                "/lustre/fsw/portfolios/llmservice/users/kevinhu/works/mod_speech_llm/tmp/dbg0.wav",
             )
         batch_audio = batch['audio_signal']  #  torch tensor，Shape: (batch_size, length)
         batch_size, audio_length = batch_audio.shape
@@ -2143,10 +2174,10 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
 
         if self.cfg.get('debug_noise_audio', False):
             self.write_wave(
-                batch_audio[0], "/lustre/fsw/portfolios/llmservice/users/zhehuaic/works/mod_speech_llm/tmp/dbg1.wav"
+                batch_audio[0], "/lustre/fsw/portfolios/llmservice/users/kevinhu/works/mod_speech_llm/tmp/dbg1.wav"
             )
             self.write_wave(
-                noise_tensor, "/lustre/fsw/portfolios/llmservice/users/zhehuaic/works/mod_speech_llm/tmp/dbg2.wav"
+                noise_tensor, "/lustre/fsw/portfolios/llmservice/users/kevinhu/works/mod_speech_llm/tmp/dbg2.wav"
             )
         batch['audio_signal'] = batch_audio
 
@@ -2477,4 +2508,3 @@ class S2sModularAudioGPTModelSpeechDecoder(ModularAudioGPTModel):
             'num_latency_samples': len(latencies),
             'num_cutoff_samples': len(cutoffs)
         }
-
