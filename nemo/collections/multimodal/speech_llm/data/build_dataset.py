@@ -105,7 +105,14 @@ def build_speechllm_dataset(model_instance, data_cfg, is_train):
             load_answer_audio=data_cfg.get('load_answer_audio', False),
             codec_model_downsampling_factor=data_cfg.get('codec_model_downsampling_factor', 1024),
             word_align_source_text=data_cfg.get('word_align_source_text', 'right'),
+            word_align_source_text_right_shift=data_cfg.get('word_align_source_text_right_shift', 0),
             injection_text_field=data_cfg.get('injection_text_field', 'text'),
+            use_last_word_end_time_for_user_eos=data_cfg.get('use_last_word_end_time_for_user_eos', False),
+            user_eos_delay=data_cfg.get('user_eos_delay', 0),
+            zero_out_user_speech=data_cfg.get('zero_out_user_speech', False),
+            tgt_text_eos_no_padding=data_cfg.get('tgt_text_eos_no_padding', False),
+            separate_user_bos_eos=data_cfg.get('separate_user_bos_eos', False),
+            text_prepone=data_cfg.get('text_prepone', 0),
         )
 
     # Notably, the data weights are controlled by either bucketing_weights

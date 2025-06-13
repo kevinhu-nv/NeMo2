@@ -749,6 +749,7 @@ def s2s_sample_sequence_batch(
         # eos_id as an argument and needs termination when that id id found.
         # TODO:
         eod_id = tokenizer.eos_id
+        sod_id = tokenizer.bos_id
         counter = 0
         batch_size = context_tokens.size(0)
         is_done = torch.zeros([batch_size]).byte().cuda()
@@ -762,6 +763,11 @@ def s2s_sample_sequence_batch(
             maxlen = context_tokens.shape[1]
         maxlen = inference_strategy.clip_max_len(maxlen)
         lengths = torch.ones([batch_size]).long().cuda() * maxlen
+        is_agent_turn = torch.zeros([batch_size]).byte().cuda()
+        # [B, T]
+        if "gt_tokens" in extra and extra["gt_tokens"] is not None:
+            gt_tokens = extra["gt_tokens"]
+            gt_start_pos = torch.where(gt_tokens == 1)[1].reshape(batch_size, -1)[:, 0]
         while context_length < maxlen:
             batch, tensor_shape = inference_strategy.prepare_batch_at_step(
                 tokens,
@@ -821,12 +827,72 @@ def s2s_sample_sequence_batch(
                 prev = [get_prev(logits_i, started, temperature, extra) for logits_i in logits]
 
                 # Inject ground truth target or source text
-                if "gt_tokens" in extra and extra["gt_tokens"] is not None:
-                    gt_tokens = extra["gt_tokens"]
-                    prev[0] = gt_tokens[:, min(context_length, gt_tokens.shape[1] - 1)]
-                if "gt_source_tokens" in extra and extra["gt_source_tokens"] is not None:
-                    gt_source_tokens = extra["gt_source_tokens"]
-                    prev[-1] = gt_source_tokens[:, min(context_length, gt_source_tokens.shape[1] - 1)]
+                # if "gt_tokens" in extra and extra["gt_tokens"] is not None:
+                #     gt_tokens = extra["gt_tokens"]
+                #     prev[0] = gt_tokens[:, min(context_length, gt_tokens.shape[1] - 1)]
+                # if "gt_source_tokens" in extra and extra["gt_source_tokens"] is not None:
+                #     gt_source_tokens = extra["gt_source_tokens"]
+                #     prev[-1] = gt_source_tokens[:, min(context_length, gt_source_tokens.shape[1] - 1)]
+
+                # if (prev[0] == eod_id).any():
+                #     print(f"eod detected, prev[0]: {prev[0].tolist()}, step: {context_length*0.08}")
+                #     eod_batch_indices = (prev[0] == eod_id).nonzero().squeeze(-1)
+                #     print(f"eod detected at batch indices {eod_batch_indices.tolist()}, step: {context_length*0.08}")
+                #     for batch_idx in eod_batch_indices:
+                #         print(f"text for batch {batch_idx}: {tokenizer.ids_to_text(tokens[batch_idx,:,0])}")
+                    # breakpoint()
+
+                # Inject ground truth agent text
+                if model.cfg.get("use_gt_eou", False):
+                    if "gt_tokens" in extra and extra["gt_tokens"] is not None:
+                        gt_tokens = extra["gt_tokens"]
+                        prev[0] = gt_tokens[:, min(context_length, gt_tokens.shape[1] - 1)]
+                else:
+                    if "gt_tokens" in extra and extra["gt_tokens"] is not None:
+                        prev[0] = torch.where(is_agent_turn == 1, gt_tokens[torch.arange(gt_tokens.shape[0]), gt_start_pos], prev[0])
+                        gt_start_pos = torch.where(
+                            (is_agent_turn == 1) & (gt_start_pos < gt_tokens.shape[1] - 1),
+                            gt_start_pos + 1,
+                            gt_start_pos
+                        )
+                        # Assuming only single user turn and user talks first
+                        is_agent_turn = torch.where(prev[0] == eod_id, 1, is_agent_turn)
+
+                # Experiment with multi-turn text injection
+                # if "gt_tokens" in extra and extra["gt_tokens"] is not None:
+
+                #     # if (prev[0] == sod_id).any():
+                #     #     print(f"sod detected, prev[0]: {prev[0].tolist()}, step: {context_length*0.08}")
+                #     #     print(f'tokens[0] text: {tokenizer.ids_to_text(tokens[0,:,0])}')
+                #     #     breakpoint()
+                    
+                #     prev[0] = torch.where(is_agent_turn == 1, gt_tokens[torch.arange(gt_tokens.shape[0]), gt_start_pos], prev[0])
+                #     gt_start_pos = torch.where(
+                #         (is_agent_turn == 1) & (gt_start_pos < gt_tokens.shape[1] - 1),
+                #         gt_start_pos + 1,
+                #         gt_start_pos
+                #     )
+                #     # Assuming only single user turn and user talks first
+                #     # Find batches where eod_id appears for the first time in text channel
+                #     eod_mask = (prev[0] == eod_id) & (is_agent_turn == 0)
+                #     # For agent turns, if eod_id appears in text channel, set speech channels to 4036
+                #     eod_mask_agent = (prev[0] == eod_id) & (is_agent_turn == 1)
+                    
+                #     # Start talking
+                #     is_agent_turn = torch.where(eod_mask, 1, is_agent_turn)
+                #     for i in range(1, len(prev)):  # For each speech channel
+                #         prev[i] = torch.where(eod_mask, 4035, prev[i])
+                    
+                #     # Stop talking
+                #     # if any(eod_mask_agent.tolist()):
+                #     #     breakpoint()
+                #     for i in range(1, len(prev)):  # For each speech channel
+                #         prev[i] = torch.where(eod_mask_agent, 4036, prev[i])
+                #     is_agent_turn = torch.where(eod_mask_agent, 0, is_agent_turn)
+                        
+                #     # print(f"prev[0]: {prev[0].tolist()}, is_agent_turn: {is_agent_turn.tolist()}, step: {context_length*0.08}")
+                #     # if any(is_agent_turn.tolist()):
+                #     #     breakpoint()
 
                 prev = torch.stack(prev, dim=1)
                 started_expand = started.unsqueeze(1).expand(-1, prev.size(1))

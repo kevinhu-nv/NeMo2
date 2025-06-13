@@ -303,6 +303,32 @@ class AudioToAudioGenerationStrategy(AudioToTextGenerationStrategy):
             duplex_method == 'from_duplex'
         ):  # in this case, the audio generation should always continue until the max_steps or the end of user channel
             speech_done_token = torch.zeros_like(speech_done_token)
+        if (
+            self.model.get_inference_config().get('force_speech_bos', None)
+            and self.model.cfg.speech_delay < tokens.shape[1]
+        ):
+            tokens[:, -1, 1:] = torch.where(
+                (tokens[:, -1 - self.model.cfg.speech_delay, :1] == self.model.tokenizer.bos_id)
+                * (
+                    torch.sum(tokens[:, -1 - self.model.cfg.speech_delay :, 1:] == self.model.cfg.speech_bos_id, 1)
+                    == 0
+                ),
+                self.model.cfg.speech_bos_id,
+                tokens[:, -1, 1:],
+            )
+            # if ((tokens[:, -1 - self.model.cfg.speech_delay, :1] == self.model.tokenizer.bos_id)
+            #     * (
+            #         torch.sum(tokens[:, -1 - self.model.cfg.speech_delay :, 1:] == self.model.cfg.speech_bos_id, 1)
+            #         == 0
+            #     )).any():
+            #     breakpoint()
+        if self.model.get_inference_config().get('force_speech_eos', None):
+            # tmp solution: force to stop talking if user interruption is detected
+            tokens[:, -1, 1:] = torch.where(
+                ((tokens[:, -1, :1] == self.model.tokenizer.eos_id)),
+                self.model.cfg.speech_eos_id,
+                tokens[:, -1, 1:],
+            )
         return speech_done_token
 
     def prepare_batch_at_step(
@@ -389,6 +415,10 @@ class AudioToAudioGenerationStrategy(AudioToTextGenerationStrategy):
                 'audio_signal_length': audio_length + answer_audio_lens,
                 'context_lengths': context_lengths,
                 'target_texts_merge': torch.full(
+                    [audio_signal.shape[0], self.model.get_step_from_audio_len(all_lens_answer_rate).max() + 1],
+                    self.model.tokenizer.unk_id,
+                ).cuda(),
+                'target_texts_merge_end': torch.full(
                     [audio_signal.shape[0], self.model.get_step_from_audio_len(all_lens_answer_rate).max() + 1],
                     self.model.tokenizer.unk_id,
                 ).cuda(),
