@@ -16,6 +16,7 @@ import logging
 import random
 import re
 import tarfile
+import numpy as np
 from collections.abc import Mapping, Sequence
 from io import BytesIO
 from pathlib import Path
@@ -240,6 +241,7 @@ class LazyNeMoTarredIterator:
         shard_seed: int | Literal["trng", "randomized"] = "trng",
         text_field: str = "text",
         lang_field: str = "lang",
+        speaker: str = "speaker",
         extra_fields: list[dict[str, str]] | None = None,
     ) -> None:
         self.shard_id_to_manifest: dict[int, Iterable[dict]]
@@ -282,6 +284,7 @@ class LazyNeMoTarredIterator:
         self.shard_seed = shard_seed
         self.text_field = text_field
         self.lang_field = lang_field
+        self.speaker = speaker
         self.extra_fields = extra_fields
         self._validate()
 
@@ -300,6 +303,7 @@ class LazyNeMoTarredIterator:
                     shard_seed=self.shard_seed,
                     text_field=self.text_field,
                     lang_field=self.lang_field,
+                    speaker=self.speaker,
                 )
                 for path, tarpath in zip(self.paths, self.shard_id_to_tar_path.values())
             ]
@@ -377,13 +381,17 @@ class LazyNeMoTarredIterator:
                                 recording_id=cut.recording_id,
                                 start=0,
                                 duration=cut.duration,
-                                text=data.get(self.text_field),
+                                text=data.get("answer"),
                                 language=data.get(self.lang_field),
+                                speaker="user",
                             )
                         )
                         cut.custom = _to_custom_attr_dict(data)
                         cut.manifest_origin = manifest_path
                         cut.tar_origin = tar_path
+                        # Create a new Recording with zero audio data
+                        import copy
+                        cut.target_audio = copy.deepcopy(cut.recording)
                         for extra_field in extra_fields:
                             extra_field.attach_to(cut)
                         cuts_for_recording.append(cut)

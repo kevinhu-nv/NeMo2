@@ -526,7 +526,6 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
                 LazyNeMoTarredIterator(
                     config.manifest_filepath,
                     tar_paths=config.tarred_audio_filepaths,
-                    skip_missing_manifest_entries=config.skip_missing_manifest_entries,
                     **common_kwargs,
                 )
             )
@@ -568,7 +567,6 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
                 nemo_iter = LazyNeMoTarredIterator(
                     manifest_path=manifest_path,
                     tar_paths=tar_path,
-                    skip_missing_manifest_entries=config.skip_missing_manifest_entries,
                     **common_kwargs,
                 )
             else:
