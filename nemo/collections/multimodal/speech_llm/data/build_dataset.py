@@ -113,6 +113,7 @@ def build_speechllm_dataset(model_instance, data_cfg, is_train):
             tgt_text_eos_no_padding=data_cfg.get('tgt_text_eos_no_padding', False),
             separate_user_bos_eos=data_cfg.get('separate_user_bos_eos', False),
             text_prepone=data_cfg.get('text_prepone', 0),
+            prompt_audio_path=data_cfg.get('prompt_audio_path', None),
         )
 
     # Notably, the data weights are controlled by either bucketing_weights
