@@ -35,8 +35,6 @@ from nemo.collections.common.data.prompt_fn import apply_prompt_format_fn, regis
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 from nemo.collections.common.tokenizers.aggregate_tokenizer import TokenizerWrapper
 
-import copy
-
 """
 Formattable: mixin class with data fields for prompt formatter outputs and method for 
 applying prompt formatters to derived data types. 
@@ -491,14 +489,6 @@ class NeMoMultimodalConversationJsonlAdapter:
                     assert (
                         cut.duration == turn["duration"]
                     ), f"Mismatch between JSONL and tar. JSONL defines audio duration={turn['duration']} but we got the following from tar {cut.duration=}"
-                    cut.custom = _to_custom_attr_dict(data)
-                    cut.manifest_origin = jsonl_path
-                    cut.tar_origin = tar_path
-                    # Create a new Recording with zero audio data
-                    cut.target_audio = copy.deepcopy(cut.recording)
-                    cut.target_audio.sources[0].source = np.zeros_like(cut.load_audio())
-                    for extra_field in extra_fields:
-                        extra_field.attach_to(cut)
                     cuts.append(cut)
                 cuts = deque(cuts)
                 yield NeMoMultimodalConversation(
