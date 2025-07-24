@@ -9,6 +9,16 @@ import json, os, re
 import argparse
 
 
+def parse_float_list(arg):
+    """
+    Parse a string representation of a list of floats.
+    Expected format: "[1,2,3]" or "1,2,3"
+    """
+    if arg.startswith('[') and arg.endswith(']'):
+        arg = arg[1:-1]  # Remove brackets
+    return [float(x.strip()) for x in arg.split(',')]
+
+
 def is_stopped_by_backchannel(agent_speech_segments, end_times, delay=0.99):
     """
     Check if agent's speech was interrupted by user backchanneling.
@@ -255,29 +265,39 @@ def main(args):
                     agent_audio = torchaudio.functional.resample(agent_audio, agent_audio_sr, 16000)
                     user_audio = torchaudio.functional.resample(user_audio, user_audio_sr, 16000)
 
-                    agent_vad_results = get_speech_timestamps(agent_audio.to('cuda'), vad_model, sampling_rate=16000, min_silence_duration_ms=1500)
-                    # Here min_silence_duration_ms is a important metric to control the tolerance of "---" in =====---=====
+                    # Write user_audio out for debug
+                    debug_user_audio_dir = os.path.join(os.path.dirname(pred_audio_file), "recordings")
+                    os.makedirs(debug_user_audio_dir, exist_ok=True)
+                    debug_user_audio_path = os.path.join(debug_user_audio_dir, f"{item_id}.user.wav")
+                    torchaudio.save(debug_user_audio_path, user_audio, 16000)
 
+                    # Run VAD to get the speech segments
+                    # Here min_silence_duration_ms is a important metric to control the tolerance of silence duration "---" in xxxxx---xxxxx, where xxxxx is the speech segment
+                    agent_vad_results = get_speech_timestamps(agent_audio.to('cuda'), vad_model, sampling_rate=16000, min_silence_duration_ms=1500)
                     agent_segments = [{'start': s['start'] / 16000, 'end': s['end'] / 16000} for s in agent_vad_results]
 
                     user_vad_results = get_speech_timestamps(user_audio.to('cuda'), vad_model, sampling_rate=16000, min_silence_duration_ms=1500)
                     user_segments = [{'start': s['start'] / 16000, 'end': s['end'] / 16000} for s in user_vad_results]
 
-
                     #################
-                    # Eval Metrics 
+                    # Compute eval Metrics 
+                    # So far, we mesaure three types of conversation behaviors: Turn-taking, barge-in, and user backchanneling
 
+                    # Turn-taking
                     # 1st turn-taking latency: The latency between the first agent turn and the first user turn
                     tt_latency = agent_segments[0]['start'] - user_segments[0]['end']
                     tt_accuracy = tt_latency <= args.tt_accuracy_threshold_sec
 
                     # Barge-in: find the overlap and return the overlap duration and segments
-                    success_barge_ins, failed_barge_ins = find_user_barge_ins(user_segments, agent_segments, args.barge_in_threshold_sec)                    
+                    success_barge_ins, failed_barge_ins = find_user_barge_ins(user_segments, agent_segments, args.barge_in_threshold_sec)
                     barge_in_metrics = compute_barge_in_metrics(success_barge_ins, failed_barge_ins)
 
                     # Backchaneling: find the backchanneling, end_time is the timestamp of backchannel end point
-                    end_time = args.end_time # end time of backchanneling
-                    bc_failure = is_stopped_by_backchannel(agent_segments, end_time)
+                    end_time = args.end_time  # end time of backchanneling, note that this is predefined when creating backchanneling data
+                    if end_time is not None:
+                        bc_failure = is_stopped_by_backchannel(agent_segments, end_time)
+                    else:
+                        bc_failure = []
 
                     # Store metrics for averaging
                     all_tt_latencies.append(tt_latency)
@@ -309,8 +329,6 @@ def main(args):
                     print_metrics(metrics_dict, verbose=args.verbose)
                     
                     count += 1
-                    # if count > 3:
-                    #     break
 
     # Compute and print average metrics
     avg_metrics = {
@@ -325,7 +343,7 @@ def main(args):
 {'=' * 50}
 Average Metrics Across All Conversations:
 1. Turn-taking:
-   - Average latency: {avg_metrics['avg_tt_latency']:.3f} seconds
+   - Average latency: {avg_metrics['avg_tt_latency'] * 1000:.1f} ms
    - Accuracy: {avg_metrics['avg_tt_accuracy']:.1f}%
 2. Barge-in:
    - Average success rate: {avg_metrics['avg_barge_in_success_rate']:.1f}%
@@ -341,7 +359,12 @@ def parse_args():
     parser.add_argument("--pred_audio_path", type=str, default="/lustre/fsw/portfolios/convai/users/cchen1/results/s2s_rl/uc_samples")
     parser.add_argument("--manifest_dir", type=str, default="/lustre/fsw/portfolios/convai/users/cchen1/data/ultrachat_200_0")
     parser.add_argument("--barge_in_threshold_sec", type=float, default=1.5, help="Buffering time for the agent to stop after user barges in.")
-    parser.add_argument("--end_time", type=list, default=[1,10,15,20], help="End time of backchanneling.")
+    parser.add_argument(
+        "--end_time",
+        type=lambda x: None if x is None or x.lower() == "none" else parse_float_list(x),
+        default=[1, 10, 15, 20],
+        help="End time of backchanneling. Format: '[1,10,15,20]' or '1,10,15,20' or None"
+    )
     parser.add_argument("--tt_accuracy_threshold_sec", type=float, default=0.64, help="Threshold in seconds for considering a turn-taking to be accurate.")
     parser.add_argument("--verbose", action="store_true", default=True, help="Print detailed segment information")
     return parser.parse_args()
