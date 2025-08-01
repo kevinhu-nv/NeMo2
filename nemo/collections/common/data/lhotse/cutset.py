@@ -1159,3 +1159,75 @@ def guess_parse_cutset(inp: Union[str, dict, omegaconf.DictConfig]) -> CutSet:
         return cuts
     else:
         raise RuntimeError(f'Unsupported input type: {type(inp)} (expected a dict or a string)')
+
+
+@data_type_parser(["nemo_tarred_to_duplex"])
+def read_nemo_tarred_to_duplex(config) -> tuple[CutSet, bool]:
+    """Convert single supervision NeMo data to duplex format with user speech and agent silence."""
+    
+    def convert_tarred_to_duplex(cut):
+        if len(cut.supervisions) != 1:
+            # Skip cuts that don't have exactly one supervision
+            return cut
+            
+        original_sup = cut.supervisions[0]
+        duration = cut.duration
+
+        # Note here we use the last part of the audio as agent silence, which may cut user text, but this avoid using synthetic silence
+        # TODO(kevinhu): Evaluate how this impacts user EOU
+        
+        # Create user supervision (original speech)
+        user_sup = SupervisionSegment(
+            id=f"{cut.id}_user",
+            recording_id=cut.recording_id,
+            start=0.0,
+            duration=duration - agent_silence_duration,
+            text=original_sup.text,
+            language=original_sup.language,
+            speaker="user",
+        )
+        
+        # Create agent supervision (silence with configurable duration)
+        agent_sup = SupervisionSegment(
+            id=f"{cut.id}_agent", 
+            recording_id=cut.recording_id,
+            start=duration - agent_silence_duration,
+            duration=agent_silence_duration,
+            text="",  # Empty text for silence
+            language=original_sup.language,
+            speaker="agent",
+        )
+        
+        # Create target_audio with all zeros (silence)
+        sr = cut.recording.sampling_rate
+        num_samples = int(duration * sr)
+        silence_audio = np.zeros((1, num_samples), dtype=np.float32)
+        
+        # Create a Recording from the silence audio
+        silence_recording = create_recording_from_array(silence_audio, sr, f"{cut.id}_target")
+        
+        # Replace the single supervision with user and agent supervisions
+        cut.supervisions = [user_sup, agent_sup]
+        cut.formatter = "nemo_tarred_to_duplex"
+        
+        # Add target_audio to cut.custom
+        if cut.custom is None:
+            cut.custom = {}
+        cut.custom["target_audio"] = silence_recording
+        
+        return cut
+
+    # Get agent silence duration from config with default value
+    agent_silence_duration = config.get("agent_silence_duration", 0.08)
+
+    # Reuse the existing nemo_tarred parser by creating a config with type: nemo_tarred
+    nemo_config = DictConfig(config)
+    nemo_config.type = "nemo_tarred"
+    
+    # Load the cuts using the original parser
+    cuts, is_tarred = read_nemo_manifest(nemo_config)
+    
+    # Apply the conversion
+    cuts = cuts.map(convert_tarred_to_duplex)
+    
+    return cuts, is_tarred
