@@ -48,29 +48,39 @@ def resolve_pretrained_models():
 @pytest.fixture(scope="session")
 def model():
     cfg = {
-        **resolve_pretrained_models(),
-        "pretrained_weights": False,
-        "freeze_params": ["^audio_codec\\..+$"],
-        "audio_loss_weight": 1,
-        "text_loss_weight": 3,
-        "perception": {
-            "_target_": "nemo.collections.speechlm2.modules.perception.AudioPerceptionModule",
-            "modality_adapter": {
-                "_target_": "nemo.collections.asr.modules.ConformerEncoder",
-                "feat_in": 512,
-                "feat_out": -1,
+        "model": {
+            **resolve_pretrained_models(),
+            "pretrained_weights": False,
+            "freeze_params": ["^audio_codec\\..+$"],
+            "audio_loss_weight": 1,
+            "text_loss_weight": 3,
+            "perception": {
+                "_target_": "nemo.collections.speechlm2.modules.perception.AudioPerceptionModule",
+                "modality_adapter": {
+                    "_target_": "nemo.collections.asr.modules.ConformerEncoder",
+                    "feat_in": 512,
+                    "feat_out": -1,
+                    "n_layers": 1,
+                    "d_model": 512,
+                    "subsampling_factor": 1,
+                },
+            },
+            "speech_decoder": {
                 "n_layers": 1,
-                "d_model": 512,
-                "subsampling_factor": 1,
+                "d_model": 768,
+                "d_ffn": 3072,
+                "sa_n_heads": 12,
+                "kernel_size": 3,
+                "is_causal": True,
             },
         },
-        "speech_decoder": {
-            "n_layers": 1,
-            "d_model": 768,
-            "d_ffn": 3072,
-            "sa_n_heads": 12,
-            "kernel_size": 3,
-            "is_causal": True,
+        "data": {
+            "target_sample_rate": 22050,
+            "source_sample_rate": 16000,
+            "frame_length": 0.08,
+        },
+        "exp_manager": {
+            "explicit_log_dir": "/home/",
         },
         "optimizer": {"_target_": "torch.optim.AdamW"},
     }
