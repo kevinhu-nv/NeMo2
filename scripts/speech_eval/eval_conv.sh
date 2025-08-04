@@ -31,6 +31,15 @@ end_time=None  # Note that this comes from predefined values when creating backc
 tt_accuracy_threshold_sec=0.64
 verbose=True
 validation_set_name="mistral_511,voicebench_alpaca,voicebench_openbook,voicebench_commoneval"
-eval_conv
+# eval_conv
 # validation_set_name="mistral_511"
 # eval_conv "--verbose"
+
+# Eval demo audios
+# copied from https://docs.google.com/document/d/1lLKhXoPiBbYBZefT5IJq9nko00ckpR42byoi_PL74SA/edit?tab=t.0#bookmark=id.de8rk7ofhy4b
+pred_audio_dir="/lustre/fsw/portfolios/convai/users/kevinhu/S2S-Duplex-new-codebase/results/inferences/1.78kbps/demo_model_no_aug_chen_chen_only_demo_1demo_model_no_aug_chen_chen_4nodes_nonsil10.0_zhehuai_01_jul_g_baseline_no_davidai_qwen_no_lat_with_bos_eos_dp_sd_with_bos_eos_dp_sd_sd_state/validation_logs/pred_wavs"
+barge_in_threshold_sec=1.5
+end_time=None  # Note that this comes from predefined values when creating backchanneling data
+tt_accuracy_threshold_sec=0.64
+validation_set_name="demo"
+eval_conv "--verbose"
