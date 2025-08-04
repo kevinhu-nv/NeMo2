@@ -76,6 +76,8 @@ class ResultsLogger:
         name: str,
         refs: list[str],
         hyps: list[str],
+        src_refs: list[str],
+        src_hyps: list[str],
         asr_hyps: list[str],
         samples_id: list[str],
         pred_audio: torch.Tensor,
@@ -109,7 +111,9 @@ class ResultsLogger:
             # cache metadata
             out_dict = {
                 "target_text": refs[i],
+                "src_text": src_refs[i],
                 "pred_text": hyps[i],
+                "pred_src_text": src_hyps[i],
                 "speech_pred_transcribed": asr_hyps[i],
                 "audio_path": os.path.relpath(out_audio_path, self.save_path),
             }

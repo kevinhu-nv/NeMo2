@@ -457,6 +457,8 @@ class DuplexS2SModel(LightningModule, HFHubMixin):
             gen_text = gen_text[:, :T_local]
             gen_audio = gen_audio[:, :T_local]
 
+        import pdb; pdb.set_trace()
+
         ans = {
             "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
             "tokens_text": gen_text,
@@ -616,10 +618,19 @@ def replace_control_speech_codes(speech_codes: torch.Tensor, control_codes: torc
     return torch.where(torch.isin(speech_codes, control_codes), speech_codes[:, :1], speech_codes)
 
 
-def tokens_to_str(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer: AutoTokenizer, pad_id: int) -> list[str]:
+def tokens_to_str(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer: AutoTokenizer, pad_id: int, insert_spaces: bool = True) -> list[str]:
     ans = []
-    for hyp_ids, hyp_len in zip(tokens.cpu(), lengths.cpu()):
+    for token_ids, hyp_ids, hyp_len in zip(tokens.cpu(), tokens.cpu(), lengths.cpu()):
         hyp_ids = hyp_ids[:hyp_len]
         hyp_ids = hyp_ids[hyp_ids != pad_id]
-        ans.append(tokenizer.ids_to_text(hyp_ids))
+        if insert_spaces:
+            # Convert IDs to tokens and manually add spaces
+            tokens_list = tokenizer.tokenizer.convert_ids_to_tokens(token_ids)
+            # Remove special tokens and join with spaces
+            clean_tokens = [t for t in tokens_list if not t.startswith('<|') and not t.startswith('|>')]
+            text = ' '.join(clean_tokens)
+            ans.append(text)
+        else:
+            # Use the original method
+            ans.append(tokenizer.ids_to_text(hyp_ids))
     return ans

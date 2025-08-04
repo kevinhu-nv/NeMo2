@@ -918,6 +918,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 * inputs["loss_scale"][:, :, 1:].flatten(0, 2)
             ).sum(-1) / (num_frames * self._num_codebooks)
 
+        import pdb; pdb.set_trace()
+
         loss = self.cfg.text_loss_weight * text_loss + self.cfg.audio_loss_weight * audio_loss
 
         B, T = inputs["input_embeds"].shape[:2]
@@ -944,13 +946,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.speech_generation.setup_speaker_encoder()  # potentially reloads the speaker encoder to make sure it's in fp32
 
     def on_validation_epoch_start(self) -> None:
-        import pdb; pdb.set_trace()
-
         self.on_train_epoch_start()
         self.results_logger = ResultsLogger(self.validation_save_path).reset()
 
         self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
         self.bleu = BLEU().reset()
+        self.src_bleu = BLEU().reset()
         tolerance = int(
             self.cfg.get("val_acc_tolerance", 160) / (1000 / self.target_fps)
         )  # 160 ms as default tolerance --> 2 tokens for 12.5FPS and 1 for 25FPS
@@ -968,6 +969,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         bleu = self.bleu.compute()
         for k, m in bleu.items():
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+        src_bleu = self.src_bleu.compute()
+        for k, m in src_bleu.items():
+            self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
         text_bos_acc = self.text_bos_acc.compute()
         for k, m in text_bos_acc.items():
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
@@ -1004,6 +1008,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     name=name,
                     refs=dataset_batch["target_texts"],
                     hyps=results["text"],
+                    src_refs=dataset_batch["source_texts"],
+                    src_hyps=results["src_text"],
                     asr_hyps=asr_hyps,
                     samples_id=dataset_batch['sample_id'],
                     pred_audio=results["audio"],
@@ -1016,6 +1022,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 )
 
             self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
+            self.src_bleu.update(name=name, refs=dataset_batch["source_texts"], hyps=results["src_text"])
             self.text_bos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
             self.text_eos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
 
@@ -1185,8 +1192,32 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             gen_text = gen_text[:, :T_local]
             gen_audio = gen_audio[:, :T_local]
 
+        # Split into source and target texts
+        if self.predict_user_text:
+            # Split gen_text into gen_text_src and gen_text_tgt based on self.text_bos_id
+            agent_bos_mask = (gen_text == self.text_bos_id)
+            # Default to last index if not found
+            agent_bos_pos = torch.full((gen_text.size(0),), gen_text.size(1), dtype=torch.long, device=gen_text.device)
+            any_agent_bos = agent_bos_mask.any(dim=1)
+            if any_agent_bos.any():
+                agent_bos_indices = agent_bos_mask.float().argmax(dim=1)
+                agent_bos_pos = torch.where(any_agent_bos, agent_bos_indices, agent_bos_pos)
+            # Create masks for src and tgt
+            row_idx = torch.arange(gen_text.size(1), device=gen_text.device).unsqueeze(0).expand(gen_text.size(0), -1)
+            # src: keep tokens before agent_bos_pos, pad from agent_bos_pos onwards
+            src_mask = row_idx < agent_bos_pos.unsqueeze(1)
+            gen_text_src = gen_text.clone()
+            gen_text_src[~src_mask] = self.text_pad_id
+            # tgt: keep tokens from agent_bos_pos onwards, pad before agent_bos_pos
+            tgt_mask = row_idx >= agent_bos_pos.unsqueeze(1)
+            gen_text_tgt = gen_text.clone()
+            gen_text_tgt[~tgt_mask] = self.text_pad_id
+
+            gen_text = gen_text_tgt
+
         ans = {
             "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
+            "src_text": tokens_to_str(gen_text_src, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id) if self.predict_user_text else None,
             "tokens_text": gen_text,
             "tokens_audio": gen_audio,
             "tokens_len": lengths,
