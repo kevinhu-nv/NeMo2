@@ -671,6 +671,17 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 source_encoded = source_encoded[:, :min_len]
                 asr_emb = asr_emb[:, :min_len]
 
+            # Optionally delay the prediction of source_tokens by a flag
+            delay_source_text_by = self.cfg.get("delay_source_text_by", 0)
+            if delay_source_text_by > 0:
+                pad = torch.full(
+                    (source_tokens.shape[0], delay_source_text_by),
+                    fill_value=self.text_pad_id,
+                    device=source_tokens.device,
+                    dtype=torch.long,
+                )
+                source_tokens = torch.cat([pad, source_tokens[:, :-delay_source_text_by]], dim=-1)
+
             user_bos_id = self.tokenizer.text_to_ids('^')[0]
             user_eos_id = self.tokenizer.text_to_ids('$')[0]
 
@@ -692,6 +703,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     mask[i, bos_idx:eos_idx] = True
 
             target_tokens = torch.where(mask, source_tokens_flat, target_tokens_flat)
+            logging.info(f"target_tokens[0] w/ delay of {delay_source_text_by}: {target_tokens[0]}")
 
         input_ids = torch.cat([target_codes, target_tokens[..., None]], dim=-1)
         if self._use_tp:
@@ -917,8 +929,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 )
                 * inputs["loss_scale"][:, :, 1:].flatten(0, 2)
             ).sum(-1) / (num_frames * self._num_codebooks)
-
-        import pdb; pdb.set_trace()
 
         loss = self.cfg.text_loss_weight * text_loss + self.cfg.audio_loss_weight * audio_loss
 

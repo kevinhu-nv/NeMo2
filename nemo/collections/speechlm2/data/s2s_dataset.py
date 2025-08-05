@@ -90,6 +90,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         target_sample_rate: int,
         input_roles: list[str] = None,
         output_roles: list[str] = None,
+        word_align_position: str = 'left',
     ):
         self.tokenizer = tokenizer
         self.frame_length = frame_length
@@ -97,6 +98,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.target_sample_rate = target_sample_rate
         self.input_roles = set(ifnone(input_roles, ["user"]))
         self.output_roles = set(ifnone(output_roles, ["agent"]))
+        self.word_align_position = word_align_position
         
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
@@ -112,7 +114,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             cuts, self.tokenizer, self.frame_length, roles=self.output_roles, bos_id=self.tokenizer.bos, eos_id=self.tokenizer.eos
         )
         source_tokens, source_token_lens = collate_token_channel(
-            cuts, self.tokenizer, self.frame_length, roles=self.input_roles, bos_id=self.tokenizer.text_to_ids('^')[0], eos_id=self.tokenizer.text_to_ids('$')[0]
+            cuts, self.tokenizer, self.frame_length, roles=self.input_roles, bos_id=self.tokenizer.text_to_ids('^')[0], eos_id=self.tokenizer.text_to_ids('$')[0], word_align_position=self.word_align_position
         )
 
         # extract target speaker first turn audio to uses for speaker conditioning
@@ -165,10 +167,11 @@ def collate_token_channel(
     roles: set[str],
     bos_id: int = None,
     eos_id: int = None,
+    word_align_position: str = 'left',
 ) -> tuple[torch.Tensor, torch.Tensor]:
     pad_id = get_pad_id(tokenizer)
     tokens = [
-        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id, bos_id=bos_id, eos_id=eos_id)
+        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id, bos_id=bos_id, eos_id=eos_id, word_align_position=word_align_position)
         for c in cuts
     ]
     token_lens = torch.tensor([len(tt) for tt in tokens])
@@ -184,6 +187,7 @@ def build_token_channel(
         pad_id: int = -1,
         bos_id: int = None,
         eos_id: int = None,
+        word_align_position: str = 'left',
 ) -> torch.Tensor:
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
@@ -205,7 +209,7 @@ def build_token_channel(
             available_frames_for_text = eospos - pos
 
             # Use different bos_id for user and agent
-            text_ids = torch.as_tensor([bos_id] + _text_to_ids(supervision.text, tokenizer, available_frames_for_text=available_frames_for_text))
+            text_ids = torch.as_tensor([bos_id] + _text_to_ids(supervision.text, tokenizer, available_frames_for_text=available_frames_for_text, word_align_position=word_align_position))
 
 
             if available_frames_for_text > 0 and len(text_ids) > available_frames_for_text:
@@ -254,10 +258,11 @@ def _strip_timestamps(
 
 def _text_to_ids(text: str, tokenizer: TokenizerSpec,
                  _TIMESTAMP_PATTERN_STR=r"<\|(\d+)\|>",
-                 available_frames_for_text=None):
+                 available_frames_for_text=None,
+                 word_align_position='left'):
     _TIMESTAMP_PATTERN = re.compile(_TIMESTAMP_PATTERN_STR)
     if _TIMESTAMP_PATTERN.search(text):
-        text_ids = _text_with_timestamps_to_ids(text, tokenizer, _TIMESTAMP_PATTERN_STR, available_frames_for_text)
+        text_ids = _text_with_timestamps_to_ids(text, tokenizer, _TIMESTAMP_PATTERN_STR, available_frames_for_text, word_align_position)
     else:
         text_ids = tokenizer.text_to_ids(text)
     return text_ids
@@ -265,10 +270,11 @@ def _text_to_ids(text: str, tokenizer: TokenizerSpec,
 
 def _text_with_timestamps_to_ids(text: str, tokenizer: TokenizerSpec,
                                  _TIMESTAMP_PATTERN_STR=r"<\|(\d+)\|>",
-                                 available_frames_for_text=None) -> list[int]:
+                                 available_frames_for_text=None,
+                                 word_align_position='left') -> list[int]:
     text_ids = []
     text_ids, start_times, end_times, word_lens = _extract_text_and_time_tokens(text, tokenizer, _TIMESTAMP_PATTERN_STR)
-    text_ids_with_timestamps = _expand_text_with_timestamps_and_word_lengths(text_ids, word_lens, start_times, end_times, available_frames_for_text, frame_rate=0.08, pad_id=get_pad_id(tokenizer))
+    text_ids_with_timestamps = _expand_text_with_timestamps_and_word_lengths(text_ids, word_lens, start_times, end_times, available_frames_for_text, frame_rate=0.08, pad_id=get_pad_id(tokenizer), word_align_position=word_align_position)
     logging.info(f'text_ids_with_timestamps: {text_ids_with_timestamps}')
     logging.info(f'text_ids: {text_ids}')
     logging.info(f'start_times: {start_times}')
@@ -297,7 +303,7 @@ def _extract_text_and_time_tokens(text, tokenizer: TokenizerSpec,
 
 
 def _expand_text_with_timestamps_and_word_lengths(
-        text_ids, word_lens, start_time, end_time, available_frames_for_text, frame_rate=0.08, pad_id=None, align_position='left'
+        text_ids, word_lens, start_time, end_time, available_frames_for_text, frame_rate=0.08, pad_id=None, word_align_position='left'
     ):    
     """
     Expand word tokens according to start time tokens and word lengths for a batch of sequences.
@@ -331,12 +337,12 @@ def _expand_text_with_timestamps_and_word_lengths(
     for word_idx, word_len in enumerate(word_lens):
         start_idx = discretize_time(start_time[word_idx], speech_frame_rate=frame_rate)
         end_idx = discretize_time(end_time[word_idx], speech_frame_rate=frame_rate)
-        if align_position == 'left':
+        if word_align_position == 'left':
             end_idx = min(start_idx + word_len, end_idx)
-        elif align_position == 'right':
+        elif word_align_position == 'right':
             start_idx = max(start_idx, end_idx - word_len)
         else:
-            raise ValueError(f"Unknown align_position: {align_position}")
+            raise ValueError(f"Unknown word_align_position: {word_align_position}")
 
         # Get ids of a single word
         word_ids = text_ids[cur_word_idx : cur_word_idx + word_len]

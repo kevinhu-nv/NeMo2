@@ -44,7 +44,8 @@ def train(cfg):
         source_sample_rate=cfg.data.source_sample_rate,
         target_sample_rate=cfg.data.target_sample_rate,
         input_roles=cfg.data.input_roles,
-        output_roles=cfg.data.output_roles
+        output_roles=cfg.data.output_roles,
+        word_align_position=cfg.data.word_align_position,
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 
