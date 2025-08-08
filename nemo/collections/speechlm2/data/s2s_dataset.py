@@ -111,7 +111,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             cuts.resample(self.target_sample_rate), recording_field="target_audio"
         )
         target_tokens, target_token_lens = collate_token_channel(
-            cuts, self.tokenizer, self.frame_length, roles=self.output_roles, bos_id=self.tokenizer.bos, eos_id=self.tokenizer.eos
+            cuts, self.tokenizer, self.frame_length, roles=self.output_roles, bos_id=self.tokenizer.bos, eos_id=self.tokenizer.eos, remove_timestamps=True
         )
         source_tokens, source_token_lens = collate_token_channel(
             cuts, self.tokenizer, self.frame_length, roles=self.input_roles, bos_id=self.tokenizer.text_to_ids('^')[0], eos_id=self.tokenizer.text_to_ids('$')[0], word_align_position=self.word_align_position
@@ -136,7 +136,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 " ".join(_strip_timestamps(s.text) for s in cut.supervisions if s.speaker in self.input_roles) for cut in cuts
             ],
             "target_texts": [
-                " ".join(s.text for s in cut.supervisions if s.speaker in self.output_roles) for cut in cuts
+                " ".join(_strip_timestamps(s.text) for s in cut.supervisions if s.speaker in self.output_roles) for cut in cuts
             ],
             "target_first_turn_audio": target_first_turn_audio,
             "target_first_turn_audio_lens": target_first_turn_audio_lens,
@@ -168,10 +168,11 @@ def collate_token_channel(
     bos_id: int = None,
     eos_id: int = None,
     word_align_position: str = 'left',
+    remove_timestamps: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     pad_id = get_pad_id(tokenizer)
     tokens = [
-        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id, bos_id=bos_id, eos_id=eos_id, word_align_position=word_align_position)
+        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id, bos_id=bos_id, eos_id=eos_id, word_align_position=word_align_position, remove_timestamps=remove_timestamps)
         for c in cuts
     ]
     token_lens = torch.tensor([len(tt) for tt in tokens])
@@ -188,6 +189,7 @@ def build_token_channel(
         bos_id: int = None,
         eos_id: int = None,
         word_align_position: str = 'left',
+        remove_timestamps: bool = False,
 ) -> torch.Tensor:
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
@@ -209,7 +211,7 @@ def build_token_channel(
             available_frames_for_text = eospos - pos
 
             # Use different bos_id for user and agent
-            text_ids = torch.as_tensor([bos_id] + _text_to_ids(supervision.text, tokenizer, available_frames_for_text=available_frames_for_text, word_align_position=word_align_position))
+            text_ids = torch.as_tensor([bos_id] + _text_to_ids(supervision.text, tokenizer, available_frames_for_text=available_frames_for_text, word_align_position=word_align_position, remove_timestamps=remove_timestamps))
 
 
             if available_frames_for_text > 0 and len(text_ids) > available_frames_for_text:
@@ -259,9 +261,10 @@ def _strip_timestamps(
 def _text_to_ids(text: str, tokenizer: TokenizerSpec,
                  _TIMESTAMP_PATTERN_STR=r"<\|(\d+)\|>",
                  available_frames_for_text=None,
-                 word_align_position='left'):
+                 word_align_position='left',
+                 remove_timestamps=False):
     _TIMESTAMP_PATTERN = re.compile(_TIMESTAMP_PATTERN_STR)
-    if _TIMESTAMP_PATTERN.search(text):
+    if _TIMESTAMP_PATTERN.search(text) and not remove_timestamps:
         text_ids = _text_with_timestamps_to_ids(text, tokenizer, _TIMESTAMP_PATTERN_STR, available_frames_for_text, word_align_position)
     else:
         text_ids = tokenizer.text_to_ids(text)

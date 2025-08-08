@@ -979,9 +979,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         bleu = self.bleu.compute()
         for k, m in bleu.items():
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
-        src_bleu = self.src_bleu.compute()
-        for k, m in src_bleu.items():
-            self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+        if self.predict_user_text:
+            src_bleu = self.src_bleu.compute()
+            for k, m in src_bleu.items():
+                self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
         text_bos_acc = self.text_bos_acc.compute()
         for k, m in text_bos_acc.items():
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
@@ -1032,7 +1033,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 )
 
             self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
-            self.src_bleu.update(name=name, refs=dataset_batch["source_texts"], hyps=results["src_text"])
+            if self.predict_user_text:
+                self.src_bleu.update(name=name, refs=dataset_batch["source_texts"], hyps=results["src_text"])
             self.text_bos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
             self.text_eos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
 
@@ -1226,7 +1228,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             gen_text = gen_text_tgt
 
         ans = {
-            "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
+            "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, insert_spaces=False),
             "src_text": tokens_to_str(gen_text_src, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id) if self.predict_user_text else None,
             "tokens_text": gen_text,
             "tokens_audio": gen_audio,

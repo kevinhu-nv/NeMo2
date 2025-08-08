@@ -457,8 +457,6 @@ class DuplexS2SModel(LightningModule, HFHubMixin):
             gen_text = gen_text[:, :T_local]
             gen_audio = gen_audio[:, :T_local]
 
-        import pdb; pdb.set_trace()
-
         ans = {
             "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
             "tokens_text": gen_text,
