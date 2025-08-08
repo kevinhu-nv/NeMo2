@@ -663,6 +663,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         if self.predict_user_text:
             source_tokens = batch["source_tokens"]
+            user_bos_id = self.tokenizer.text_to_ids('^')[0]
+            user_eos_id = self.tokenizer.text_to_ids('$')[0]
+
             if source_tokens.shape != target_tokens.shape:
                 min_len = min(source_tokens.shape[1], target_tokens.shape[1])
                 source_tokens = source_tokens[:, :min_len]
@@ -680,13 +683,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     device=source_tokens.device,
                     dtype=torch.long,
                 )
-                source_tokens = torch.cat([pad, source_tokens[:, :-delay_source_text_by]], dim=-1)
+                source_tokens_delayed = torch.cat([pad, source_tokens[:, :-delay_source_text_by]], dim=-1)
+                # Add back user_eos_id since it may be truncated
+                source_tokens_delayed[:, -1] = user_eos_id
 
-            user_bos_id = self.tokenizer.text_to_ids('^')[0]
-            user_eos_id = self.tokenizer.text_to_ids('$')[0]
-
-            source_tokens_flat = source_tokens
-            target_tokens_flat = target_tokens
+            source_tokens_flat = source_tokens_delayed.clone()
+            target_tokens_flat = target_tokens.clone()
 
             # For each batch, find all user_bos_id and user_eos_id pairs and build a mask
             mask = torch.zeros_like(source_tokens_flat, dtype=torch.bool)
@@ -694,13 +696,22 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 src = source_tokens_flat[i]
                 bos_indices = (src == user_bos_id).nonzero(as_tuple=True)[0]
                 eos_indices = (src == user_eos_id).nonzero(as_tuple=True)[0]
+                logging.info(f"source_tokens_flat[i]: {source_tokens_flat[i]}")
+                logging.info(f"bos_indices: {bos_indices}")
+                logging.info(f"eos_indices: {eos_indices}")
                 for bos_idx in bos_indices:
                     eos_after = eos_indices[eos_indices > bos_idx]
                     if len(eos_after) == 0:
                         continue
                     eos_idx = eos_after[0]
+                    # Assign user text tokens to the text channel, overriding until the agent bos
+                    bos_in_target = (target_tokens_flat[i, bos_idx:eos_idx] == self.text_bos_id).nonzero(as_tuple=True)
+                    if bos_in_target[0].numel() > 0:
+                        bos_in_target_idx = bos_in_target[0][0].item() + bos_idx
+                        eos_idx = min(eos_idx, bos_in_target_idx)
                     # Mark mask from bos_idx to eos_idx-1 (inclusive of bos, exclusive of eos)
                     mask[i, bos_idx:eos_idx] = True
+                logging.info(f"mask[i]: {mask[i]}")
 
             target_tokens = torch.where(mask, source_tokens_flat, target_tokens_flat)
             logging.info(f"target_tokens[0] w/ delay of {delay_source_text_by}: {target_tokens[0]}")
