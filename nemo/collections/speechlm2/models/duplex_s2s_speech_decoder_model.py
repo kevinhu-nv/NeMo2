@@ -696,9 +696,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 src = source_tokens_flat[i]
                 bos_indices = (src == user_bos_id).nonzero(as_tuple=True)[0]
                 eos_indices = (src == user_eos_id).nonzero(as_tuple=True)[0]
-                logging.info(f"source_tokens_flat[i]: {source_tokens_flat[i]}")
-                logging.info(f"bos_indices: {bos_indices}")
-                logging.info(f"eos_indices: {eos_indices}")
                 for bos_idx in bos_indices:
                     eos_after = eos_indices[eos_indices > bos_idx]
                     if len(eos_after) == 0:
@@ -711,7 +708,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                         eos_idx = min(eos_idx, bos_in_target_idx)
                     # Mark mask from bos_idx to eos_idx-1 (inclusive of bos, exclusive of eos)
                     mask[i, bos_idx:eos_idx] = True
-                logging.info(f"mask[i]: {mask[i]}")
 
             target_tokens = torch.where(mask, source_tokens_flat, target_tokens_flat)
             logging.info(f"target_tokens[0] w/ delay of {delay_source_text_by}: {target_tokens[0]}")
@@ -972,7 +968,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
         self.bleu = BLEU().reset()
-        self.src_bleu = BLEU().reset()
         tolerance = int(
             self.cfg.get("val_acc_tolerance", 160) / (1000 / self.target_fps)
         )  # 160 ms as default tolerance --> 2 tokens for 12.5FPS and 1 for 25FPS
@@ -982,6 +977,11 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         self.text_eos_acc = TokenAccuracy(
             token_name="text_eos", token_id=self.text_eos_id, tolerance=tolerance
         ).reset()
+        if self.predict_user_text:
+            self.src_bleu = BLEU().reset()
+            self.src_text_bos_acc = TokenAccuracy(
+                token_name="src_text_bos", token_id=self.tokenizer.text_to_ids('^')[0], tolerance=tolerance
+            ).reset()
 
     def on_validation_epoch_end(self, prefix="val") -> None:
         asr_bleu = self.asr_bleu.compute()
@@ -990,16 +990,20 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         bleu = self.bleu.compute()
         for k, m in bleu.items():
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
-        if self.predict_user_text:
-            src_bleu = self.src_bleu.compute()
-            for k, m in src_bleu.items():
-                self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
         text_bos_acc = self.text_bos_acc.compute()
         for k, m in text_bos_acc.items():
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
         text_eos_acc = self.text_eos_acc.compute()
         for k, m in text_eos_acc.items():
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+        if self.predict_user_text:
+            src_bleu = self.src_bleu.compute()
+            for k, m in src_bleu.items():
+                self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+            
+            src_text_bos_acc = self.src_text_bos_acc.compute()
+            for k, m in src_text_bos_acc.items():
+                self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
 
     def validation_step(self, batch: dict, batch_idx: int):
 
@@ -1044,10 +1048,11 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 )
 
             self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
-            if self.predict_user_text:
-                self.src_bleu.update(name=name, refs=dataset_batch["source_texts"], hyps=results["src_text"])
             self.text_bos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
             self.text_eos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
+            if self.predict_user_text:
+                self.src_bleu.update(name=name, refs=dataset_batch["source_texts"], hyps=results["src_text"])
+                self.src_text_bos_acc.update(name=name, refs=dataset_batch["source_tokens"], hyps=results["tokens_text_src"])
 
     def on_test_epoch_start(self) -> None:
         return self.on_validation_epoch_start()
@@ -1241,6 +1246,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         ans = {
             "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, insert_spaces=False),
             "src_text": tokens_to_str(gen_text_src, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id) if self.predict_user_text else None,
+            "tokens_text_src": gen_text_src,
             "tokens_text": gen_text,
             "tokens_audio": gen_audio,
             "tokens_len": lengths,
