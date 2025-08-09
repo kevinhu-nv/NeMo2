@@ -138,6 +138,9 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             "target_texts": [
                 " ".join(_strip_timestamps(s.text) for s in cut.supervisions if s.speaker in self.output_roles) for cut in cuts
             ],
+            "all_texts": [
+                " ".join(_strip_timestamps(s.text) for s in cut.supervisions) for cut in cuts
+            ],
             "target_first_turn_audio": target_first_turn_audio,
             "target_first_turn_audio_lens": target_first_turn_audio_lens,
             "formatter": [getattr(cut, "formatter", "s2s_duplex") for cut in cuts],
