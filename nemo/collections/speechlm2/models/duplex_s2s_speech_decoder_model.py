@@ -45,6 +45,7 @@ from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.metrics.asr_bleu import ASRBLEU
 from nemo.collections.speechlm2.parts.metrics.bleu import BLEU
+from nemo.collections.speechlm2.parts.metrics.wer import WER
 from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
 from nemo.collections.speechlm2.parts.metrics.token_accuracy import TokenAccuracy
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
@@ -983,6 +984,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.src_text_bos_acc = TokenAccuracy(
                 token_name="text_bos", token_id=self.tokenizer.text_to_ids('^')[0], tolerance=tolerance
             ).reset()
+            self.src_wer = WER().reset()
 
     def on_validation_epoch_end(self, prefix="val") -> None:
         asr_bleu = self.asr_bleu.compute()
@@ -1006,6 +1008,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
             src_text_bos_acc = self.src_text_bos_acc.compute()
             for k, m in src_text_bos_acc.items():
+                self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+            src_wer = self.src_wer.compute()
+            for k, m in src_wer.items():
                 self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
 
     def validation_step(self, batch: dict, batch_idx: int):
@@ -1059,6 +1064,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             if self.predict_user_text:
                 self.src_bleu.update(name=name, refs=dataset_batch["source_texts"], hyps=results["src_text"])
                 self.src_text_bos_acc.update(name=name, refs=dataset_batch["source_tokens"], hyps=results["tokens_text_src"])
+                self.src_wer.update(name=name, refs=dataset_batch["source_texts"], hyps=results["src_text"])
 
     def on_test_epoch_start(self) -> None:
         return self.on_validation_epoch_start()
