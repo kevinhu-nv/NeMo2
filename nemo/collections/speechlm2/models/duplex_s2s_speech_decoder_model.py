@@ -1039,6 +1039,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     hyps=results["text"],
                     src_refs=dataset_batch["source_texts"],
                     src_hyps=results["src_text"],
+                    all_refs=dataset_batch["all_texts"],
+                    all_hyps=results["all_text"],
                     asr_hyps=asr_hyps,
                     samples_id=dataset_batch['sample_id'],
                     pred_audio=results["audio"],

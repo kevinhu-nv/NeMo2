@@ -300,8 +300,9 @@ def _extract_text_and_time_tokens(text, tokenizer: TokenizerSpec,
     # Process each word, tokenize it, and calculate token lengths
     text_ids = []
     word_lens = []
-    for _, word in enumerate(words):
-        word_ids = tokenizer.text_to_ids(word)
+    for i, word in enumerate(words):
+        word_with_space = word if i == 0 else ' ' + word
+        word_ids = tokenizer.text_to_ids(word_with_space)
         word_len = len(word_ids)
         text_ids.extend(word_ids)
         word_lens.append(word_len)

@@ -78,6 +78,8 @@ class ResultsLogger:
         hyps: list[str],
         src_refs: list[str],
         src_hyps: list[str],
+        all_refs: list[str],
+        all_hyps: list[str],
         asr_hyps: list[str],
         samples_id: list[str],
         pred_audio: torch.Tensor,
@@ -111,11 +113,13 @@ class ResultsLogger:
             # cache metadata
             out_dict = {
                 "target_text": refs[i],
-                "src_text": src_refs[i],
                 "pred_text": hyps[i],
-                "pred_src_text": src_hyps[i] if src_hyps is not None and src_hyps[i] is not None else "",
                 "speech_pred_transcribed": asr_hyps[i],
                 "audio_path": os.path.relpath(out_audio_path, self.save_path),
+                "src_text": src_refs[i],
+                "pred_src_text": src_hyps[i] if src_hyps is not None and src_hyps[i] is not None else "",
+                "all_text": all_refs[i],
+                "pred_all_text": all_hyps[i],
             }
             if results is not None:
                 if tokenizer is not None:
