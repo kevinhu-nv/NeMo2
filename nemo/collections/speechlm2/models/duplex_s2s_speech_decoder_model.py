@@ -156,6 +156,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             if self.cfg.get("use_extra_id_for_pad", False):
                 self.tokenizer.pad_token = '<|extra_1|>'
 
+        self.user_bos_id = self.tokenizer.text_to_ids('^')[0]
+        self.user_eos_id = self.tokenizer.text_to_ids('$')[0]
+
         llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights).train()
         self.llm = llm.model  # fetch PretrainedBaseModel from model "ForCausalLM"
         self.lm_head = llm.lm_head
@@ -668,8 +671,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         if self.predict_user_text:
             source_tokens = batch["source_tokens"]
-            user_bos_id = self.tokenizer.text_to_ids('^')[0]
-            user_eos_id = self.tokenizer.text_to_ids('$')[0]
+            user_bos_id = self.user_bos_id
+            user_eos_id = self.user_eos_id
 
             if source_tokens.shape != target_tokens.shape:
                 min_len = min(source_tokens.shape[1], target_tokens.shape[1])
@@ -986,7 +989,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         if self.predict_user_text:
             self.src_bleu = BLEU().reset()
             self.src_text_bos_acc = TokenAccuracy(
-                token_name="text_bos", token_id=self.tokenizer.text_to_ids('^')[0], tolerance=tolerance
+                token_name="text_bos", token_id=self.user_bos_id, tolerance=tolerance
             ).reset()
             self.src_wer = WER().reset()
 
@@ -1262,8 +1265,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         ans = {
             "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
-            "src_text": tokens_to_str(gen_text_src, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id) if self.predict_user_text else None,
-            "all_text": tokens_to_str(all_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
+            "src_text": tokens_to_str(gen_text_src, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, user_bos_id=self.user_bos_id) if self.predict_user_text else None,
+            "all_text": tokens_to_str(all_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, user_bos_id=self.user_bos_id),
             "tokens_text_src": gen_text_src,
             "tokens_text": gen_text,
             "tokens_audio": gen_audio,
