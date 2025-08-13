@@ -1171,28 +1171,46 @@ def read_nemo_tarred_to_duplex(config) -> tuple[CutSet, bool]:
             return cut
             
         original_sup = cut.supervisions[0]
-        duration = cut.duration
+        orig_user_duration = cut.duration
 
         # Note here we use the last part of the audio as agent silence, which may cut user text, but this avoid using synthetic silence
         # TODO(kevinhu): Evaluate how this impacts user EOU
+
+        # Append agent_silence_duration of silence to the original recording
+        if agent_silence_duration > 0:
+            sr = cut.recording.sampling_rate
+            user_sil_samples = int(agent_silence_duration * sr)
+            silence_audio = np.zeros((1, user_sil_samples), dtype=np.float32)
+            # Concatenate silence to the end of the original audio
+            orig_audio = cut.recording.load_audio()
+            if orig_audio.ndim == 1:
+                orig_audio = orig_audio[None, :]
+            new_audio = np.concatenate([orig_audio, silence_audio], axis=1)
+            # Create a new Recording with the extended audio
+            new_recording = create_recording_from_array(new_audio, sr, cut.recording.id)
+            cut.recording = new_recording
+            cut.duration = new_audio.shape[1] / sr
         
         # Create user supervision (original speech)
+        user_dur = orig_user_duration + agent_silence_duration
         user_sup = SupervisionSegment(
             id=f"{cut.id}_user",
             recording_id=cut.recording_id,
             start=0.0,
-            duration=duration - agent_silence_duration,
+            duration=user_dur,
             text=original_sup.text,
             language=original_sup.language,
             speaker="user",
         )
         
         # Create agent supervision (silence with configurable duration)
+        agent_start = orig_user_duration + agent_silence_duration if agent_silence_duration < 0 else orig_user_duration
+        agent_dur = abs(agent_silence_duration)
         agent_sup = SupervisionSegment(
             id=f"{cut.id}_agent", 
             recording_id=cut.recording_id,
-            start=duration - agent_silence_duration,
-            duration=agent_silence_duration,
+            start=agent_start,
+            duration=agent_dur,
             text="",  # Empty text for silence
             language=original_sup.language,
             speaker="agent",
@@ -1200,7 +1218,7 @@ def read_nemo_tarred_to_duplex(config) -> tuple[CutSet, bool]:
         
         # Create target_audio with all zeros (silence)
         sr = cut.recording.sampling_rate
-        num_samples = int(duration * sr)
+        num_samples = int(cut.duration * sr)
         silence_audio = np.zeros((1, num_samples), dtype=np.float32)
         
         # Create a Recording from the silence audio
@@ -1217,8 +1235,8 @@ def read_nemo_tarred_to_duplex(config) -> tuple[CutSet, bool]:
         
         return cut
 
-    # Get agent silence duration from config with default value
-    agent_silence_duration = config.get("agent_silence_duration", 0.08)
+    # by default, use the last part of user audio as agent silence duration
+    agent_silence_duration = config.get("agent_silence_duration", -0.08)
 
     # Reuse the existing nemo_tarred parser by creating a config with type: nemo_tarred
     nemo_config = DictConfig(config)

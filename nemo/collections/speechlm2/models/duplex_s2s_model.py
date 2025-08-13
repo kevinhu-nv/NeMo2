@@ -616,19 +616,10 @@ def replace_control_speech_codes(speech_codes: torch.Tensor, control_codes: torc
     return torch.where(torch.isin(speech_codes, control_codes), speech_codes[:, :1], speech_codes)
 
 
-def tokens_to_str(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer: AutoTokenizer, pad_id: int, insert_spaces: bool = True) -> list[str]:
+def tokens_to_str(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer: AutoTokenizer, pad_id: int) -> list[str]:
     ans = []
     for token_ids, hyp_ids, hyp_len in zip(tokens.cpu(), tokens.cpu(), lengths.cpu()):
         hyp_ids = hyp_ids[:hyp_len]
         hyp_ids = hyp_ids[hyp_ids != pad_id]
-        if insert_spaces:
-            # Convert IDs to tokens and manually add spaces
-            tokens_list = tokenizer.tokenizer.convert_ids_to_tokens(token_ids)
-            # Remove special tokens and join with spaces
-            clean_tokens = [t for t in tokens_list if not t.startswith('<|') and not t.startswith('|>')]
-            text = ' '.join(clean_tokens)
-            ans.append(text)
-        else:
-            # Use the original method
-            ans.append(tokenizer.ids_to_text(hyp_ids))
+        ans.append(tokenizer.ids_to_text(hyp_ids))
     return ans

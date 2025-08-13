@@ -659,8 +659,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             target_tokens = torch.cat([target_tokens[:, self.advance_text_channel_by :], pad], dim=-1)
             # make sure that eos/bos is in the place (it can cut tokens from the first advance_text_channel_by tokens and this will breaks everything)
 
+        original_target_tokens = target_tokens.clone()
         if self.cfg.get("delay_text_eos_by", None):
             target_tokens = delay_eos(target_tokens, self.text_eos_id, self.text_pad_id, shift=self.cfg.delay_text_eos_by)
+
+        if self.cfg.get("delay_text_bos_by", None):
+            target_tokens = delay_eos(target_tokens, self.text_bos_id, self.text_pad_id, shift=self.cfg.delay_text_bos_by)
 
         if self.predict_user_text:
             source_tokens = batch["source_tokens"]
@@ -1257,7 +1261,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             gen_text = gen_text_tgt
 
         ans = {
-            "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, insert_spaces=False),
+            "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
             "src_text": tokens_to_str(gen_text_src, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id) if self.predict_user_text else None,
             "all_text": tokens_to_str(all_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
             "tokens_text_src": gen_text_src,
