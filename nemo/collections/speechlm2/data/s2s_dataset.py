@@ -155,10 +155,23 @@ def collate_first_turn_audio(
     first_turn_audios = []
     first_turn_audios_lens = []
     for cut in cuts:
-        first_supervision = [s for s in cut.supervisions if s.speaker in roles][0]
+        # Find supervisions that match the specified roles
+        matching_supervisions = [s for s in cut.supervisions if s.speaker in roles]
+        
+        if not matching_supervisions:
+            # Log warning and skip this cut if no matching supervisions found
+            logging.warning(f"No supervisions found with roles {roles} for cut {cut.id}. Available speakers: {[s.speaker for s in cut.supervisions]}")
+            continue
+            
+        first_supervision = matching_supervisions[0]
         truncated_audio = cut.truncate(offset=max(0, first_supervision.start), duration=first_supervision.duration).load_custom(recording_field)
         first_turn_audios.append(truncated_audio.squeeze(0))
         first_turn_audios_lens.append(truncated_audio.shape[-1])
+
+    if not first_turn_audios:
+        # If no valid audio was found, return empty tensors
+        logging.error(f"No valid audio found for any cuts with roles {roles}")
+        return torch.empty(0), torch.empty(0)
 
     return collate_vectors(first_turn_audios, padding_value=0), torch.tensor(first_turn_audios_lens)
 
