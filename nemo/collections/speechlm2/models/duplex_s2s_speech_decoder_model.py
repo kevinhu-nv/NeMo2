@@ -1035,6 +1035,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             results = self.offline_inference(
                 dataset_batch["source_audio"],
                 dataset_batch["source_audio_lens"],
+                agent_bos_vad=dataset_batch["agent_bos_vad"],
+                sample_id=dataset_batch['sample_id'],
             )
 
             with fp32_precision():  # resample is fragile to bfloat16 default dtype
@@ -1096,6 +1098,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         input_signal: torch.Tensor,
         input_signal_lens: torch.Tensor,
         decode_audio: bool = True,
+        agent_bos_vad: torch.Tensor = None,
+        sample_id: list = None,
     ) -> dict[str, torch.Tensor]:
         """
         Autoregressive prediction.
@@ -1207,6 +1211,16 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     gen_audio[:, 0],  # silence
                     gen_audio[:, t],  # speech
                 )
+
+            if self.cfg.get('inference_force_text_bos_based_on_vad', None):
+                # Only set text_bos_id when t > vad_pos and there's still no text_bos_id in gen_text[b, :t]
+                for b in range(gen_text.size(0)):
+                    vad_pos = agent_bos_vad[b]
+                    if vad_pos < gen_text.size(1):
+                        # Check if we need to force text_bos_id at current position t
+                        if t >= vad_pos and not (self.text_bos_id in gen_text[b, :t+1]):
+                            gen_text[b, t] = self.text_bos_id
+
             # inference trick force speech decoder eos/bos to make the model more robust
             num_speech_delay = 1
             if self.cfg.get('inference_force_speech_bos', None) and num_speech_delay < gen_text.shape[1]:
@@ -1267,7 +1281,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
             "src_text": tokens_to_str(gen_text_src, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, user_bos_id=self.user_bos_id) if self.predict_user_text else None,
             "all_text": tokens_to_str(all_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, user_bos_id=self.user_bos_id),
-            "tokens_text_src": gen_text_src,
+            "tokens_text_src": gen_text_src if self.predict_user_text else None,
             "tokens_text": gen_text,
             "tokens_audio": gen_audio,
             "tokens_len": lengths,
