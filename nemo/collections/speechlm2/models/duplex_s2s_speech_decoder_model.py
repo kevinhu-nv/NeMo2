@@ -48,6 +48,7 @@ from nemo.collections.speechlm2.parts.metrics.bleu import BLEU
 from nemo.collections.speechlm2.parts.metrics.wer import WER
 from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
 from nemo.collections.speechlm2.parts.metrics.token_accuracy import TokenAccuracy
+from nemo.collections.speechlm2.parts.metrics.empty_text import EmptyTextMetric
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
 from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.speechlm2.parts.pretrained import (
@@ -992,6 +993,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 token_name="text_bos", token_id=self.user_bos_id, tolerance=tolerance
             ).reset()
             self.src_wer = WER().reset()
+            self.empty_user_text = EmptyTextMetric().reset()
 
     def on_validation_epoch_end(self, prefix="val") -> None:
         asr_bleu = self.asr_bleu.compute()
@@ -1018,6 +1020,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
             src_wer = self.src_wer.compute()
             for k, m in src_wer.items():
+                self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+            empty_user_text = self.empty_user_text.compute()
+            for k, m in empty_user_text.items():
                 self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
 
     def validation_step(self, batch: dict, batch_idx: int):
@@ -1074,6 +1079,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 self.src_bleu.update(name=name, refs=dataset_batch["source_texts"], hyps=results["src_text"])
                 self.src_text_bos_acc.update(name=name, refs=dataset_batch["source_tokens"], hyps=results["tokens_text_src"])
                 self.src_wer.update(name=name, refs=dataset_batch["source_texts"], hyps=results["src_text"])
+                self.empty_user_text.update(name=name, hyps=results["src_text"])
 
     def on_test_epoch_start(self) -> None:
         return self.on_validation_epoch_start()
