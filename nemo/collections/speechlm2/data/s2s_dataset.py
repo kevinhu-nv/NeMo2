@@ -91,7 +91,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         input_roles: list[str] = None,
         output_roles: list[str] = None,
         word_align_position: str = 'left',
-        use_vad_for_user_audio: bool = False,
+        use_vad_for_user_audio: bool = False
     ):
         self.tokenizer = tokenizer
         self.frame_length = frame_length
@@ -104,9 +104,49 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
+    
+    def _create_minimal_batch(self) -> dict:
+        """Create a minimal valid batch when all cuts are filtered out."""
+        # Create minimal tensors with batch size 1
+        device = torch.device('cpu')  # Default device
+        
+        return {
+            "sample_id": ["empty_batch"],
+            "source_audio": torch.zeros((1, 1000), dtype=torch.float32),  # 1 second of silence at 16kHz
+            "source_audio_lens": torch.tensor([1000], dtype=torch.long),
+            "agent_bos_vad": None,
+            "target_audio": torch.zeros((1, 22050), dtype=torch.float32),  # 1 second of silence at 22.05kHz
+            "target_audio_lens": torch.tensor([22050], dtype=torch.long),
+            "target_tokens": torch.full((1, 50), self.tokenizer.pad_id, dtype=torch.long),
+            "target_token_lens": torch.tensor([1], dtype=torch.long),
+            "source_tokens": torch.full((1, 50), self.tokenizer.pad_id, dtype=torch.long),
+            "source_token_lens": torch.tensor([1], dtype=torch.long),
+            "source_texts": [""],
+            "target_texts": [""],
+            "all_texts": [""],
+            "target_first_turn_audio": torch.zeros((1, 22050), dtype=torch.float32),
+            "target_first_turn_audio_lens": torch.tensor([22050], dtype=torch.long),
+            "formatter": ["s2s_duplex"],
+        }
 
     def __getitem__(self, cuts: CutSet) -> dict:
         # cuts = cuts.transform_text(_strip_timestamps)
+
+        if cuts[0].formatter == 'nemo_tarred_to_duplex':
+            filtered_cuts = []
+            skipped_cuts = []
+            for cut in cuts:
+                if any(s.text.strip() for s in cut.supervisions if s.speaker in self.input_roles):
+                    filtered_cuts.append(cut)
+                else:
+                    skipped_cuts.append(cut.id)
+            if skipped_cuts:
+                logging.info(f"Skipped {len(skipped_cuts)} cuts with empty input text. Skipped cut ids: {', '.join(skipped_cuts)}")
+            if not filtered_cuts:
+                logging.warning(f"All cuts were filtered out! Original batch size: {len(cuts)}. Returning minimal valid batch to continue training.")
+                return self._create_minimal_batch()
+            cuts = CutSet.from_cuts(filtered_cuts)
+            
 
         source_audio, source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
         target_audio, target_audio_lens = collate_audio(
