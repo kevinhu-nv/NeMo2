@@ -23,6 +23,7 @@ from lhotse.dataset.collation import collate_audio, collate_vectors
 from lhotse.utils import ifnone
 
 from nemo.collections.common.tokenizers import TokenizerSpec
+from nemo.collections.speechlm2.data import utils
 from nemo.collections.speechlm2.data.utils import get_pad_id
 from nemo.utils import logging
 
@@ -159,48 +160,15 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             cuts, self.tokenizer, self.frame_length, roles=self.input_roles, bos_id=self.tokenizer.text_to_ids('^')[0], eos_id=self.tokenizer.text_to_ids('$')[0], word_align_position=self.word_align_position
         )
 
+        agent_bos_vad = None
         if self.use_vad_for_user_audio:
-            # Use external VAD to run on the user audio and save the results in a new tensor
-            # Zero out user speech based on ground-truth
-            model, utils = torch.hub.load('/lustre/fsw/portfolios/convai/users/kevinhu/s2s/silero-vad', 'silero_vad', source='local', trust_repo=True, force_reload=False)
-            get_speech_timestamps, _, read_audio, _, _ = utils
-
-            # Create mask with same shape as source_tokens [B, T]
-            is_agent_turn = torch.ones_like(source_tokens)
-            
-            for batch_idx in range(source_audio.shape[0]):
-                wav = source_audio[batch_idx, :]
-                speech_timestamps = get_speech_timestamps(wav, model, sampling_rate=self.source_sample_rate,  threshold=0.75, min_speech_duration_ms=1000, min_silence_duration_ms=600, speech_pad_ms=80, return_seconds=True)
-                
-                for segment in speech_timestamps:
-                    # Convert audio timestamps to token positions
-                    start_time = segment['start']
-                    end_time = segment['end']
-                    
-                    # Convert time to token frame indices using the same logic as build_token_channel
-                    start_frame = int(start_time / self.frame_length)
-                    end_frame = int(end_time / self.frame_length)
-                    
-                    # Ensure frame indices are within bounds
-                    start_frame = max(0, min(start_frame, source_tokens.shape[1] - 1))
-                    end_frame = max(0, min(end_frame, source_tokens.shape[1] - 1))
-                    
-                    # Mark user speech regions as 0 (not agent turn)
-                    is_agent_turn[batch_idx, start_frame:end_frame + 1] = 0.0
-            
-            # Find the last position where mask transitions from 0 to 1 for each batch
-            # This will be a tensor of shape [B], where each entry is the index of the last 0->1 transition
-            def find_last_zero_to_one_transition(mask, lens):
-                B, T = mask.shape
-                transition_pos = lens.clone() - 1
-                for b in range(B):
-                    transition_pos[b] = lens[b].item()  # Default to end if no transition found
-                    for t in range(1, T):  # Start from 1 to check previous position
-                        if mask[b, t] == 1 and mask[b, t-1] == 0:
-                            transition_pos[b] = t
-                return transition_pos
-
-            agent_bos_vad = find_last_zero_to_one_transition(is_agent_turn, source_token_lens)
+            # Use VAD utility to create agent turn mask and find transition positions
+            is_agent_turn = utils.create_agent_turn_mask_from_vad(
+                source_audio, source_tokens, source_token_lens, 
+                self.frame_length, self.source_sample_rate,
+                vad_model_path='/lustre/fsw/portfolios/convai/users/kevinhu/s2s/silero-vad'
+            )
+            agent_bos_vad = utils.find_last_zero_to_one_transition(is_agent_turn, source_token_lens)            
 
         # extract target speaker first turn audio to uses for speaker conditioning
         target_first_turn_audio, target_first_turn_audio_lens = collate_first_turn_audio(
@@ -211,7 +179,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             "sample_id": [str(cut.id) for cut in cuts],
             "source_audio": source_audio,
             "source_audio_lens": source_audio_lens,
-            "agent_bos_vad": agent_bos_vad if self.use_vad_for_user_audio else None,
+            "agent_bos_vad": agent_bos_vad,
             "target_audio": target_audio,
             "target_audio_lens": target_audio_lens,
             "target_tokens": target_tokens,
