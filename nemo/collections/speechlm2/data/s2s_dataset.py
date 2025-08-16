@@ -92,7 +92,8 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         input_roles: list[str] = None,
         output_roles: list[str] = None,
         word_align_position: str = 'left',
-        use_vad_for_user_audio: bool = False
+        use_vad_for_user_audio: bool = False,
+        predict_user_text: bool = False
     ):
         self.tokenizer = tokenizer
         self.frame_length = frame_length
@@ -102,6 +103,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.output_roles = set(ifnone(output_roles, ["agent"]))
         self.word_align_position = word_align_position
         self.use_vad_for_user_audio = use_vad_for_user_audio
+        self.predict_user_text = predict_user_text
         
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
@@ -133,7 +135,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
     def __getitem__(self, cuts: CutSet) -> dict:
         # cuts = cuts.transform_text(_strip_timestamps)
 
-        if cuts[0].formatter == 'nemo_tarred_to_duplex':
+        if hasattr(cuts[0], 'formatter') and cuts[0].formatter == 'nemo_tarred_to_duplex':
             filtered_cuts = []
             skipped_cuts = []
             for cut in cuts:
@@ -157,7 +159,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             cuts, self.tokenizer, self.frame_length, roles=self.output_roles, bos_id=self.tokenizer.bos, eos_id=self.tokenizer.eos, remove_timestamps=True
         )
         source_tokens, source_token_lens = collate_token_channel(
-            cuts, self.tokenizer, self.frame_length, roles=self.input_roles, bos_id=self.tokenizer.text_to_ids('^')[0], eos_id=self.tokenizer.text_to_ids('$')[0], word_align_position=self.word_align_position
+            cuts, self.tokenizer, self.frame_length, roles=self.input_roles, bos_id=self.tokenizer.text_to_ids('^')[0], eos_id=self.tokenizer.text_to_ids('$')[0], word_align_position=self.word_align_position, remove_timestamps=not self.predict_user_text
         )
 
         agent_bos_vad = None
