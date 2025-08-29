@@ -335,10 +335,13 @@ def _text_to_ids(text: str, tokenizer: TokenizerSpec,
                  available_frames_for_text=None,
                  word_align_position='left',
                  remove_timestamps=False):
-    _TIMESTAMP_PATTERN = re.compile(_TIMESTAMP_PATTERN_STR)
-    if _TIMESTAMP_PATTERN.search(text) and not remove_timestamps:
+    if not remove_timestamps:
         text_ids = _text_with_timestamps_to_ids(text, tokenizer, _TIMESTAMP_PATTERN_STR, available_frames_for_text, word_align_position)
     else:
+        _TIMESTAMP_PATTERN = re.compile(_TIMESTAMP_PATTERN_STR)
+        text = _TIMESTAMP_PATTERN.sub("", text)
+        # Remove extra spaces between words
+        text = " ".join(text.strip().split())
         text_ids = tokenizer.text_to_ids(text)
     return text_ids
 
