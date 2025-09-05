@@ -93,7 +93,8 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         output_roles: list[str] = None,
         word_align_position: str = 'left',
         use_vad_for_user_audio: bool = False,
-        predict_user_text: bool = False
+        predict_user_text: bool = False,
+        cfg: dict = None,
     ):
         self.tokenizer = tokenizer
         self.frame_length = frame_length
@@ -104,6 +105,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.word_align_position = word_align_position
         self.use_vad_for_user_audio = use_vad_for_user_audio
         self.predict_user_text = predict_user_text
+        self.cfg = cfg
         
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
@@ -159,7 +161,16 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             cuts, self.tokenizer, self.frame_length, roles=self.output_roles, bos_id=self.tokenizer.bos, eos_id=self.tokenizer.eos, remove_timestamps=True
         )
         source_tokens, source_token_lens = collate_token_channel(
-            cuts, self.tokenizer, self.frame_length, roles=self.input_roles, bos_id=self.tokenizer.text_to_ids('^')[0], eos_id=self.tokenizer.text_to_ids('$')[0], word_align_position=self.word_align_position, remove_timestamps=not self.predict_user_text
+            cuts, self.tokenizer, self.frame_length, 
+            roles=self.input_roles, 
+            bos_id=self.tokenizer.text_to_ids('^')[0], 
+            eos_id=self.tokenizer.text_to_ids('$')[0], 
+            word_align_position=self.word_align_position, 
+            remove_timestamps=not self.predict_user_text, 
+            user_bos_id=self.tokenizer.text_to_ids('^')[0], 
+            agent_bos_id=self.tokenizer.bos, 
+            threshold=self.cfg.get("eou_threshold", None) if self.cfg is not None else None, 
+            eos_buffer=self.cfg.get("eos_buffer", None) if self.cfg is not None else None
         )
 
         agent_bos_vad = None
@@ -176,6 +187,10 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         target_first_turn_audio, target_first_turn_audio_lens = collate_first_turn_audio(
             cuts.resample(self.target_sample_rate), roles=self.output_roles, recording_field="target_audio"
         )
+
+        # print("source_tokens[0]:", source_tokens[0, :500]*(source_tokens[0, :500]!=self.tokenizer.pad_id))
+        # print("target_tokens[0]:", target_tokens[0, :500]*(target_tokens[0, :500]!=self.tokenizer.pad_id))
+        # import pdb; pdb.set_trace()
 
         return {
             "sample_id": [str(cut.id) for cut in cuts],
@@ -241,10 +256,14 @@ def collate_token_channel(
     eos_id: int = None,
     word_align_position: str = 'left',
     remove_timestamps: bool = False,
+    user_bos_id: int = None,
+    agent_bos_id: int = None,
+    threshold: int = None,
+    eos_buffer: int = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     pad_id = get_pad_id(tokenizer)
     tokens = [
-        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id, bos_id=bos_id, eos_id=eos_id, word_align_position=word_align_position, remove_timestamps=remove_timestamps)
+        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id, bos_id=bos_id, eos_id=eos_id, word_align_position=word_align_position, remove_timestamps=remove_timestamps, user_bos_id=user_bos_id,agent_bos_id=agent_bos_id, threshold=threshold, eos_buffer=eos_buffer)
         for c in cuts
     ]
     token_lens = torch.tensor([len(tt) for tt in tokens])
@@ -262,6 +281,10 @@ def build_token_channel(
         eos_id: int = None,
         word_align_position: str = 'left',
         remove_timestamps: bool = False,
+        user_bos_id: int = None,
+        agent_bos_id: int = None,
+        threshold: int = None,
+        eos_buffer: int = None,
 ) -> torch.Tensor:
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
@@ -283,7 +306,8 @@ def build_token_channel(
             available_frames_for_text = eospos - pos
 
             # Use different bos_id for user and agent
-            text_ids = torch.as_tensor([bos_id] + _text_to_ids(supervision.text, tokenizer, available_frames_for_text=available_frames_for_text, word_align_position=word_align_position, remove_timestamps=remove_timestamps))
+            print("cut: ", cut)
+            text_ids = torch.as_tensor([bos_id] + _text_to_ids(supervision.text, tokenizer, available_frames_for_text=available_frames_for_text, word_align_position=word_align_position, remove_timestamps=remove_timestamps, pad_id=pad_id, user_bos_id=user_bos_id, user_eos_id=agent_bos_id, threshold=threshold, eos_buffer=eos_buffer))
 
 
             if available_frames_for_text > 0 and len(text_ids) > available_frames_for_text:
@@ -329,14 +353,61 @@ def _strip_timestamps(
     text = _TIMESTAMP_PATTERN.sub("", text)  # strip timestamp tokens if present
     return _SPACE_PATTERN.sub(" ", text).strip()  # strip multi-whitespaces
 
+def _insert_eos_to_long_pad_segments(text_ids, pad_id, user_eos_id, user_bos_id, threshold=12, eos_buffer=12):
+    """
+    In text_ids, for any segment of continuous pad_id longer than threshold,
+    set the last id of that segment to user_eos_id, ignoring beginning and ending paddings.
+    """
+    if user_eos_id is None or pad_id is None or not isinstance(text_ids, list) or len(text_ids) == 0:
+        return text_ids
+
+    # Find the first and last non-pad_id indices
+    first_nonpad = next((i for i, x in enumerate(text_ids) if x != pad_id), None)
+    last_nonpad = next((i for i, x in reversed(list(enumerate(text_ids))) if x != pad_id), None)
+    if first_nonpad is None or last_nonpad is None or last_nonpad <= first_nonpad:
+        return text_ids
+
+    i = first_nonpad
+    while i <= last_nonpad:
+        if text_ids[i] == pad_id:
+            seg_start = i
+            while i <= last_nonpad and text_ids[i] == pad_id:
+                i += 1
+            seg_end = i  # exclusive
+            seg_len = seg_end - seg_start
+            if seg_len > threshold:
+                text_ids[seg_start + eos_buffer] = user_eos_id
+                text_ids[seg_end - 1] = user_bos_id
+        else:
+            i += 1
+    return text_ids
 
 def _text_to_ids(text: str, tokenizer: TokenizerSpec,
                  _TIMESTAMP_PATTERN_STR=r"<\|(\d+)\|>",
                  available_frames_for_text=None,
                  word_align_position='left',
-                 remove_timestamps=False):
-    if not remove_timestamps:
+                 remove_timestamps=False,
+                 pad_id=None,
+                 user_bos_id=None,
+                 user_eos_id=None,
+                 threshold=None,
+                 eos_buffer=None):
+    if not remove_timestamps and re.compile(_TIMESTAMP_PATTERN_STR).search(text):
         text_ids = _text_with_timestamps_to_ids(text, tokenizer, _TIMESTAMP_PATTERN_STR, available_frames_for_text, word_align_position)
+
+        mask = [1 if x != 151643 else 0 for x in text_ids]
+        masked_text_ids = [x if m == 1 else 0 for x, m in zip(text_ids, mask)]
+        print("masked_text_ids:", masked_text_ids)
+
+        if threshold is not None and threshold > 0:
+            text_ids = _insert_eos_to_long_pad_segments(text_ids, pad_id, user_eos_id, user_bos_id, threshold=threshold, eos_buffer=eos_buffer)
+
+            mask = [1 if x != 151643 else 0 for x in text_ids]
+            new_masked_text_ids = [x if m == 1 else 0 for x, m in zip(text_ids, mask)]
+            print("new_masked_text_ids:", new_masked_text_ids)
+
+            # if user_eos_id is not None and user_eos_id in text_ids:
+            #     import pdb; pdb.set_trace()
     else:
         _TIMESTAMP_PATTERN = re.compile(_TIMESTAMP_PATTERN_STR)
         text = _TIMESTAMP_PATTERN.sub("", text)

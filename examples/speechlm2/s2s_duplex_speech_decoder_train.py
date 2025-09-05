@@ -47,7 +47,8 @@ def train(cfg):
         output_roles=cfg.data.output_roles,
         word_align_position=getattr(cfg.data, "word_align_position", "left"),
         use_vad_for_user_audio=getattr(cfg.data, "use_vad_for_user_audio", False),
-        predict_user_text=getattr(cfg.model, "predict_user_text", False)
+        predict_user_text=getattr(cfg.model, "predict_user_text", False),
+        cfg=cfg.data
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 

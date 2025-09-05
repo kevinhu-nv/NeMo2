@@ -821,44 +821,60 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             source_tokens_flat = source_tokens_delayed.clone()
             target_tokens_flat = target_tokens.clone()
 
-            # For each batch, find all user_bos_id and user_eos_id pairs and build a mask
+            # For each batch, find all user_bos_id and user_eos_id pairs and build a user mask
             mask = torch.zeros_like(source_tokens_flat, dtype=torch.bool)
             for i in range(source_tokens_flat.size(0)):
                 src = source_tokens_flat[i]
-                bos_indices = (src == user_bos_id).nonzero(as_tuple=True)[0]
-                eos_indices = (src == user_eos_id).nonzero(as_tuple=True)[0]
-                for bos_idx in bos_indices:
-                    eos_after = eos_indices[eos_indices > bos_idx]
-                    if len(eos_after) == 0:
+                user_bos_indices = (src == user_bos_id).nonzero(as_tuple=True)[0]
+                user_eos_indices = (src == user_eos_id).nonzero(as_tuple=True)[0]
+                for user_bos_idx in user_bos_indices:
+                    user_eos_after = user_eos_indices[user_eos_indices > user_bos_idx]
+                    if len(user_eos_after) == 0:
                         continue
-                    eos_idx = eos_after[0]
+                    user_eos_idx = user_eos_after[0]
                     
-                    # Assign user text tokens to the text channel, overriding until the agent bos
-                    # In the case of agent_bos appear between user turn, take the earlier of agent_bos or user_eos
+                    # In the case of agent_bos appear during user turn, take the agent_bos
                     # uuuuu
                     #    aaaaa --> uuuaaa
-                    bos_in_target = (target_tokens_flat[i, bos_idx:eos_idx] == self.text_bos_id).nonzero(as_tuple=True)
+                    bos_in_target = (target_tokens_flat[i, user_bos_idx:user_eos_idx] == self.text_bos_id).nonzero(as_tuple=True)
                     if bos_in_target[0].numel() > 0:
-                        bos_in_target_idx = bos_in_target[0][0].item() + bos_idx
-                        eos_idx = min(eos_idx, bos_in_target_idx)
+                        bos_in_target_idx = bos_in_target[0][0].item() + user_bos_idx
+                        user_eos_idx = min(user_eos_idx, bos_in_target_idx)
                     
                     # Check if there's a text_eos_id (agent turn end) between bos_idx and eos_idx
                     # If so, move it to just before bos_idx to preserve agent turn boundary
                     # aaaaa
                     #    uuuuu --> aaauuuuu
-                    text_eos_in_range = (target_tokens_flat[i, bos_idx:eos_idx] == self.text_eos_id).nonzero(as_tuple=True)
+                    text_eos_in_range = (target_tokens_flat[i, user_bos_idx:user_eos_idx] == self.text_eos_id).nonzero(as_tuple=True)
                     if text_eos_in_range[0].numel() > 0:
-                        text_eos_idx = text_eos_in_range[0][0].item() + bos_idx
-                        # Move the text_eos_id to just before bos_idx
-                        target_tokens_flat[i, bos_idx-1] = self.text_eos_id
+                        text_eos_idx = text_eos_in_range[0][0].item() + user_bos_idx
+                        # Move the text_eos_id before bos_idx
+                        if self.cfg.get("force_move_text_eos_to_user_speech_start", False):
+                            new_eos_idx = min(user_bos_idx - 1, text_eos_idx - self.cfg.get("delay_text_channel_by", 1))
+                        else:
+                            new_eos_idx = user_bos_idx - 1
+                        target_tokens_flat[i, new_eos_idx] = self.text_eos_id
                         # Clear the original text_eos_id position
                         target_tokens_flat[i, text_eos_idx] = self.text_pad_id
                     
                     # Mark mask from bos_idx to eos_idx-1 (inclusive of bos, exclusive of eos)
-                    mask[i, bos_idx:eos_idx] = True
+                    mask[i, user_bos_idx:user_eos_idx] = True
 
             target_tokens = torch.where(mask, source_tokens_flat, target_tokens_flat)
             logging.info(f"target_tokens[0] w/ delay of {delay_source_text_by}: {target_tokens[0]}")
+
+        if self.cfg.get("debug", False):
+            import pdb; pdb.set_trace()
+            i = 12
+            target_tokens_flat_masked = target_tokens_flat[i]*(target_tokens_flat[i] != self.text_pad_id)
+            print(f"target_tokens_flat[i]:", target_tokens_flat_masked)
+            target_tokens_masked = target_tokens[i]*(target_tokens[i] != self.text_pad_id)
+            print(f"target_tokens[i]:", target_tokens_masked)
+            source_tokens_flat_masked = source_tokens_flat[i]*(source_tokens_flat[i] != self.text_pad_id)
+            print(f"source_tokens_flat[i]:", source_tokens_flat_masked)
+            stacked = torch.stack([source_tokens_flat_masked, target_tokens_flat_masked], dim=1)
+            print("stacked[:500]:", stacked[:500])
+            import pdb; pdb.set_trace()
 
         input_ids = torch.cat([target_codes, target_tokens[..., None]], dim=-1)
         if self._use_tp:
@@ -894,11 +910,14 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         audio_labels = input_ids[:, 1:, :-1]  # (B, T-1, K)
 
         if self.cfg.get("debug", False):
-            i = 0
-            asr_masked  = asr_labels[i][-1000:]  * (asr_labels[i][-1000:]  != 151643)
-            text_masked = text_labels[i][-1000:] * (text_labels[i][-1000:] != 151643)
-            stacked = torch.stack([asr_masked, text_masked], dim=1)
-            print("stacked:", stacked[-200:])
+            import pdb; pdb.set_trace()
+            # ori_stacked = torch.stack([batch['source_tokens'][0]*(batch['source_tokens'][0]!=self.text_pad_id), batch['target_tokens'][0]*(batch['target_tokens'][0]!=self.text_pad_id)], dim=1)
+            # print("ori_stacked[:500]:", ori_stacked)
+            # i = 0
+            # asr_masked  = asr_labels[i][-1000:]  * (asr_labels[i][-1000:]  != 151643)
+            # text_masked = text_labels[i][-1000:] * (text_labels[i][-1000:] != 151643)
+            # stacked = torch.stack([asr_masked, text_masked], dim=1)
+            # print("stacked:", stacked[-200:])
             # import pdb; pdb.set_trace()
             
 
@@ -1629,6 +1648,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             agent_bos_pos = torch.full((gen_text.size(0),), gen_text.size(1), dtype=torch.long, device=gen_text.device)
             any_agent_bos = agent_bos_mask.any(dim=1)
             if any_agent_bos.any():
+                # Use the last BOS:
+                # agent_bos_indices = agent_bos_mask.float().flip(dims=[1]).argmax(dim=1)
                 agent_bos_indices = agent_bos_mask.float().argmax(dim=1)
                 agent_bos_pos = torch.where(any_agent_bos, agent_bos_indices, agent_bos_pos)
             # Create masks for src and tgt
