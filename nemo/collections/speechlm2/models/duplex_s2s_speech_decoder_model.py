@@ -1354,12 +1354,16 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     pred_audio_lens=(results["audio_len"] / 22050 * 16000).to(torch.long),
                 )
 
+                # if self.cfg.get("debug", False):
+                #     import pdb; pdb.set_trace()
+
                 self.results_logger.update(
                     name=name,
                     refs=dataset_batch["target_texts"],
                     hyps=results["text"],
                     src_refs=dataset_batch["source_texts"],
                     src_hyps=results["src_text"],
+                    src_tokens=results["tokens_text_src"],
                     all_refs=dataset_batch["all_texts"],
                     all_hyps=results["all_text"],
                     asr_hyps=asr_hyps,
@@ -1376,6 +1380,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     fps=self.source_fps,
                     results=results if self.cfg.get("dump_tokens_text", False) else None,
                     tokenizer=self.tokenizer,
+                    user_eos_id=self.user_eos_id,
                 )
 
             self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
@@ -1383,9 +1388,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.text_bos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
             self.text_eos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
             if self.predict_user_text:
-                self.src_bleu.update(name=name, refs=dataset_batch["source_texts"], hyps=results["src_text"])
+                src_text_clean = [s.replace("^", "").replace("$", "") for s in results["src_text"]]
+                self.src_bleu.update(name=name, refs=dataset_batch["source_texts"], hyps=src_text_clean)
                 self.src_text_bos_acc.update(name=name, refs=dataset_batch["source_tokens"], hyps=results["tokens_text_src"])
-                self.src_wer.update(name=name, refs=dataset_batch["source_texts"], hyps=results["src_text"])
+                self.src_wer.update(name=name, refs=dataset_batch["source_texts"], hyps=src_text_clean)
                 self.empty_user_text.update(name=name, hyps=results["src_text"])
 
     def on_test_epoch_start(self) -> None:
@@ -1412,6 +1418,151 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         text_bos = torch.full((1,), fill_value=self.text_pad_id, device=self.device)
         input_embeds = self.embed_asr_tokens(text_bos)
         return input_embeds
+
+    def _remove_continuous_agent_bos_id(self, gen_text: torch.Tensor, bos_id: int, is_asr: bool = False) -> torch.Tensor:
+        """
+        Adhoc fix for the user and agent text.
+        """
+        if is_asr:
+            # Remove continuous appearance of bos_id, possibly separated by pad_id
+            cleaned_gen_text = gen_text.clone()
+            for b in range(cleaned_gen_text.size(0)):
+                in_bos = False
+                for t in range(cleaned_gen_text.size(1)):
+                    token = cleaned_gen_text[b, t]
+                    if token == bos_id:
+                        if in_bos:
+                            cleaned_gen_text[b, t] = self.text_pad_id
+                        else:
+                            in_bos = True
+                    elif token == self.text_pad_id:
+                        continue
+                    else:
+                        in_bos = False
+            gen_text = cleaned_gen_text
+        return gen_text
+
+    def _remove_last_turn_if_short(self, gen_text: torch.Tensor, bos_id: int, is_asr: bool = False) -> torch.Tensor:
+        """
+        If the last turn contains less than 5 non-pad tokens, set the last turn all to pad.
+        """
+        if is_asr:
+            fixed_gen_text = gen_text.clone()
+            
+            for b in range(gen_text.size(0)):
+                # Find all bos_id positions
+                bos_indices = (gen_text[b] == bos_id).nonzero(as_tuple=True)[0]
+                
+                if len(bos_indices) > 0:
+                    # Get the last bos_id position
+                    last_bos_idx = bos_indices[-1].item()
+                    
+                    # Count non-pad tokens from last BOS to end of sequence
+                    last_turn_tokens = gen_text[b, last_bos_idx:]
+                    non_pad_count = (last_turn_tokens != self.text_pad_id).sum().item()
+                    
+                    # If less than 5 non-pad tokens, set the entire last turn to pad
+                    if non_pad_count < 5:
+                        fixed_gen_text[b, last_bos_idx+1:] = self.text_pad_id
+        return fixed_gen_text
+
+    def _find_eou(self, gen_text: torch.Tensor, is_asr: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Segment text into alternating user and agent text segments.
+        
+        User text segments start with user_bos_id and continue until the next agent_bos_id.
+        Agent text segments start with text_bos_id (agent_bos_id) and continue until the next user_bos_id.
+        
+        Args:
+            gen_text: Input text tensor of shape [batch_size, seq_len]
+            
+        Returns:
+            tuple: (gen_text_src, gen_text_tgt) where:
+                - gen_text_src: User text segments with agent text padded
+                - gen_text_tgt: Agent text segments with user text padded
+        """
+
+        if is_asr:
+            user_eos_indices = (gen_text == self.text_bos_id).nonzero(as_tuple=True)
+            return user_eos_indices
+        return None
+    
+
+    def _segment_alternating_user_agent_text(self, gen_text: torch.Tensor, is_asr: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Segment text into alternating user and agent text segments.
+        
+        User text segments start with user_bos_id and continue until the next agent_bos_id.
+        Agent text segments start with text_bos_id (agent_bos_id) and continue until the next user_bos_id.
+        
+        Args:
+            gen_text: Input text tensor of shape [batch_size, seq_len]
+            
+        Returns:
+            tuple: (gen_text_src, gen_text_tgt) where:
+                - gen_text_src: User text segments with agent text padded
+                - gen_text_tgt: Agent text segments with user text padded
+        """
+        user_bos_id = self.user_bos_id
+        user_eos_id = self.user_eos_id
+        agent_bos_id = self.text_bos_id
+
+        if is_asr:
+            gen_text_src = torch.where(gen_text == agent_bos_id, user_eos_id, gen_text)
+            gen_text_tgt = gen_text.clone()
+            return gen_text_src, gen_text_tgt
+        
+        # Initialize masks for user and agent text
+        user_mask = torch.zeros_like(gen_text, dtype=torch.bool)
+        agent_mask = torch.zeros_like(gen_text, dtype=torch.bool)
+        
+        # Process each sequence in the batch
+        for b in range(gen_text.size(0)):
+            # Find all user and agent BOS positions
+            user_bos_indices = (gen_text[b] == user_bos_id).nonzero(as_tuple=True)[0]
+            agent_bos_indices = (gen_text[b] == agent_bos_id).nonzero(as_tuple=True)[0]
+            
+            # Combine and sort all BOS positions with their types
+            all_bos_positions = []
+            for idx in user_bos_indices:
+                all_bos_positions.append((idx.item(), 'user'))
+            for idx in agent_bos_indices:
+                all_bos_positions.append((idx.item(), 'agent'))
+            
+            # Sort by position
+            all_bos_positions.sort(key=lambda x: x[0])
+            
+            # Create alternating segments
+            current_type = None
+            segment_start = 0
+            
+            for pos, bos_type in all_bos_positions:
+                # If we have a current segment, mark it
+                if current_type is not None:
+                    if current_type == 'user':
+                        user_mask[b, segment_start:pos] = True
+                    else:  # agent
+                        agent_mask[b, segment_start:pos] = True
+                
+                # Start new segment
+                current_type = bos_type
+                segment_start = pos
+            
+            # Handle the last segment (from last BOS to end of sequence)
+            if current_type is not None:
+                if current_type == 'user':
+                    user_mask[b, segment_start:] = True
+                else:  # agent
+                    agent_mask[b, segment_start:] = True
+        
+        # Create gen_text_src (user text) and gen_text_tgt (agent text)
+        gen_text_src = gen_text.clone()
+        gen_text_src[~user_mask] = self.text_pad_id
+        
+        gen_text_tgt = gen_text.clone()
+        gen_text_tgt[~agent_mask] = self.text_pad_id
+        
+        return gen_text_src, gen_text_tgt
 
     @torch.no_grad()
     def offline_inference(
@@ -1640,34 +1791,48 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         if self.predict_user_text and self.cfg.get("use_separate_asr_head", False) and not self.cfg.get("force_use_asr_head_for_user_agent_text", False):
             gen_text_src = gen_asr
         elif self.predict_user_text:
+            # Use a single text channel for both user and agent text
             if self.cfg.get("force_use_asr_head_for_user_agent_text", False):
                 gen_text = gen_asr
-            # Split gen_text into gen_text_src and gen_text_tgt based on self.text_bos_id
-            agent_bos_mask = (gen_text == self.text_bos_id)
-            # Default to last index if not found
-            agent_bos_pos = torch.full((gen_text.size(0),), gen_text.size(1), dtype=torch.long, device=gen_text.device)
-            any_agent_bos = agent_bos_mask.any(dim=1)
-            if any_agent_bos.any():
-                # Use the last BOS:
-                # agent_bos_indices = agent_bos_mask.float().flip(dims=[1]).argmax(dim=1)
-                agent_bos_indices = agent_bos_mask.float().argmax(dim=1)
-                agent_bos_pos = torch.where(any_agent_bos, agent_bos_indices, agent_bos_pos)
-            # Create masks for src and tgt
-            row_idx = torch.arange(gen_text.size(1), device=gen_text.device).unsqueeze(0).expand(gen_text.size(0), -1)
-            # src: keep tokens before agent_bos_pos, pad from agent_bos_pos onwards
-            src_mask = row_idx < agent_bos_pos.unsqueeze(1)
-            gen_text_src = gen_text.clone()
-            gen_text_src[~src_mask] = self.text_pad_id
-            # tgt: keep tokens from agent_bos_pos onwards, pad before agent_bos_pos
-            tgt_mask = row_idx >= agent_bos_pos.unsqueeze(1)
-            gen_text_tgt = gen_text.clone()
-            gen_text_tgt[~tgt_mask] = self.text_pad_id
+
+            # A few fixes
+            gen_text = self._remove_continuous_agent_bos_id(gen_text, bos_id=self.user_bos_id, is_asr=True)
+            gen_text = self._remove_continuous_agent_bos_id(gen_text, bos_id=self.text_bos_id, is_asr=True)
+            gen_text = self._remove_last_turn_if_short(gen_text, bos_id=self.user_bos_id, is_asr=True)    
+            gen_text = self._remove_last_turn_if_short(gen_text, bos_id=self.text_bos_id, is_asr=True)
+
+            # user_eos_indices = self._find_eou(gen_text, is_asr=True)
+
+            # Split gen_text into alternating user and agent text segments
+            gen_text_src, gen_text_tgt = self._segment_alternating_user_agent_text(gen_text, is_asr=True)
+            
+            # Debug: Breakpoint if gen_text_src differs from gen_text for any batch b
+            src_text_cleaned = []
+            for b in range(gen_text.shape[0]):
+                gen_text_b = self.tokenizer.ids_to_text(gen_text_tgt[b])
+                gen_text_src_b = self.tokenizer.ids_to_text(gen_text_src[b])
+                gen_text_src_b = gen_text_src_b.rstrip("^")
+                # replace continuous ^ with a single one
+                import re
+                gen_text_src_b = re.sub(r"\^{2,}", "^", gen_text_src_b)
+                # Remove the text after the last ^ if it is only 1 word
+                if "^" in gen_text_src_b:
+                    last_caret_idx = gen_text_src_b.rfind("^")
+                    last_turn = gen_text_src_b[last_caret_idx+1:].strip()
+                    if last_turn and len(last_turn.split()) <= 1 and len(last_turn) and len(last_turn) < 5:
+                        gen_text_src_b = gen_text_src_b[:last_caret_idx+1]
+                if gen_text_src_b.count("^") > 1:
+                    print(f"Batch index with difference: {b}")
+                    print("gen_text:", gen_text_b)
+                    print("gen_text_src:", gen_text_src_b)
+                    # import pdb; pdb.set_trace()
+                src_text_cleaned.append(gen_text_src_b)
 
             gen_text = gen_text_tgt
 
         ans = {
             "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
-            "src_text": tokens_to_str(gen_text_src, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, user_bos_id=self.user_bos_id) if self.predict_user_text else None,
+            "src_text": src_text_cleaned if self.predict_user_text else None,
             "all_text": tokens_to_str(all_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, user_bos_id=self.user_bos_id),
             "tokens_text_src": gen_text_src if self.predict_user_text else None,
             "tokens_text": gen_text,

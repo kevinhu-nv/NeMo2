@@ -78,6 +78,7 @@ class ResultsLogger:
         hyps: list[str],
         src_refs: list[str],
         src_hyps: list[str],
+        src_tokens: list[str],
         all_refs: list[str],
         all_hyps: list[str],
         asr_hyps: list[str],
@@ -90,6 +91,7 @@ class ResultsLogger:
         fps: float = None,
         results=None,
         tokenizer=None,
+        user_eos_id=None,
     ) -> None:
 
         out_json_path = os.path.join(self.matadata_save_path, f"{name}.json")
@@ -110,6 +112,8 @@ class ResultsLogger:
                 eou_pred_wav = eou_pred_wav.float() * 0.8  #  make 1 audible and keep 0 as total silence
                 torchaudio.save(out_audio_path_eou, eou_pred_wav.squeeze().unsqueeze(0).detach().cpu(), pred_audio_sr)
 
+            user_eos_positions = [k for k, token in enumerate(src_tokens[i]) if token == user_eos_id]
+
             # cache metadata
             out_dict = {
                 "target_text": refs[i],
@@ -118,6 +122,7 @@ class ResultsLogger:
                 "audio_path": os.path.relpath(out_audio_path, self.save_path),
                 "src_text": src_refs[i],
                 "pred_src_text": src_hyps[i] if src_hyps is not None and src_hyps[i] is not None else "",
+                "src_eou": ",".join([str(x*0.08) for x in user_eos_positions]) if user_eos_positions is not None else "",
                 "all_text": all_refs[i],
                 "pred_all_text": all_hyps[i],
             }
