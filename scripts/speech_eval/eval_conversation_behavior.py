@@ -20,6 +20,57 @@ def parse_float_list(arg):
     return [float(x.strip()) for x in arg.split(',')]
 
 
+def parse_timestamped_text(text_with_timestamps):
+    import re
+    
+    timestamp_pattern = r'<\|([\d\.]+)\|>'
+    timestamps = [float(match.group(1)) for match in re.finditer(timestamp_pattern, text_with_timestamps)]
+    
+    # Convert timestamps to agent segments
+    agent_segments = []
+    for i, timestamp in enumerate(timestamps):
+        if i < len(timestamps) - 1:
+            # Segment from current timestamp to next timestamp
+            agent_segments.append({
+                'start': timestamp,
+                'end': timestamps[i + 1]
+            })
+        else:
+            # Last segment - assume it lasts for a reasonable duration
+            agent_segments.append({
+                'start': timestamp,
+                'end': timestamp + 5.0  # Default 5 seconds for last segment
+            })
+    
+    return agent_segments
+
+
+def load_jsonl(json_file, field_name='pred_text'):
+    output = {}
+    
+    with open(json_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.strip():
+                data = json.loads(line)
+                audio_path = data.get('audio_path', '')
+                pred_text = data.get(field_name, '')
+                
+                if audio_path and pred_text:
+                    if '/' in audio_path:
+                        filename = audio_path.split('/')[-1]  # Get filename
+                        # Remove .wav extension if present
+                        if filename.endswith('.wav'):
+                            filename = filename[:-4]
+                        # Remove "demo_" prefix if present
+                        if filename.startswith('demo_'):
+                            filename = filename[5:]  # Remove "demo_" (5 characters)
+                    else:
+                        filename = audio_path
+                    
+                    output[filename] = pred_text
+    return output
+
+
 def is_stopped_by_backchannel(agent_speech_segments, end_times, delay=0.99):
     """
     Check if agent's speech was interrupted by user backchanneling.
@@ -205,8 +256,11 @@ def print_metrics(metrics_dict, verbose=False):
     # Build the complete output string
     output = f"""
 Evaluation metrics for conversation {metrics_dict['item_id']}:
-1. 1st turn-taking latency: {metrics_dict['tt_latency']:.3f} seconds
-   - 1st turn-taking accuracy: {'Accurate' if metrics_dict['tt_accuracy'] else 'Inaccurate'}
+1. Turn-taking metrics:
+   - Average latency: {metrics_dict['tt_latency']:.3f} seconds
+   - Precision: {metrics_dict['tt_precision']:.3f}
+   - Recall: {metrics_dict['tt_recall']:.3f}
+   - F1: {metrics_dict['tt_f1']:.3f}
 2. Barge-in statistics:
 {chr(10).join(barge_in_stats)}
 3. Backchanneling failures: {metrics_dict['bc_failure']}{segment_info}
@@ -247,32 +301,100 @@ def get_filtered_wav_keys(pred_audio_dir, validation_set_name):
     return filtered_wav_keys    
 
 
-def compute_turn_taking_metrics(agent_segments, user_segments, tt_accuracy_threshold_sec):
+def compute_turn_taking_metrics(agent_segments, user_segments, tt_latency_threshold_sec, tt_precision_buffer_sec, tt_recall_buffer_sec):
     """
-    Compute turn-taking metrics including latency and accuracy.
+    Compute turn-taking metrics using precision and recall.
     
     Args:
         agent_segments: List of dicts with 'start' and 'end' times of agent speech
         user_segments: List of dicts with 'start' and 'end' times of user speech
-        tt_accuracy_threshold_sec: Threshold in seconds for considering turn-taking to be accurate
-    
+        tt_latency_threshold_sec: Threshold in seconds for considering turn-taking to be accurate
+        tt_precision_buffer_sec: Buffer time in seconds for precision calculation (agent segments)
+        tt_recall_buffer_sec: Buffer time in seconds for recall calculation (user segments)
     Returns:
-        tuple: (tt_latency, tt_accuracy) where tt_latency is in seconds and tt_accuracy is boolean
+        dict: Contains precision, recall, f1, and latency metrics
     """
-    if agent_segments and user_segments:
-        tt_latency = agent_segments[0]['start'] - user_segments[0]['end']
-        # If tt_latency is negative, the model interrupts the user; set accuracy to 0 and latency to INF_LATENCY
-        if tt_latency < 0:
-            tt_latency = INF_LATENCY
-            tt_accuracy = False
-        else:
-            tt_accuracy = tt_latency <= tt_accuracy_threshold_sec
-    else:
-        # Agent no response
-        tt_latency = INF_LATENCY
-        tt_accuracy = False
+    if not agent_segments or not user_segments:
+        return {
+            'precision': 0.0,
+            'recall': 0.0,
+            'f1': 0.0,
+            'avg_latency': INF_LATENCY,
+            'true_positives': 0,
+            'false_positives': 0,
+            'false_negatives': 0
+        }
     
-    return tt_latency, tt_accuracy
+    # Calculate true positives (tp), false positives (fp), and false negatives (fn)
+    tp = 0
+    fp = 0
+    fn = 0
+    tp_latencies = []
+
+    # For each agent segment, check if it follows any user segment end within the threshold
+    for agent_seg in agent_segments:
+        found_tp = False
+        min_latency = INF_LATENCY
+        
+        for user_seg in user_segments:
+            gap = agent_seg['start'] - user_seg['end']
+            if (gap >= -tt_precision_buffer_sec and 
+                gap <= tt_latency_threshold_sec and 
+                agent_seg['start'] >= user_seg['start']):
+                found_tp = True
+                min_latency = min(min_latency, max(gap, 0))
+        
+        if found_tp:
+            tp += 1
+            tp_latencies.append(min_latency)
+        else:
+            fp += 1
+
+    # For each user segment, check if there is any agent segment following its end within the threshold
+    for user_seg in user_segments:
+        found_tp = False
+        for agent_seg in agent_segments:
+            gap = agent_seg['start'] - user_seg['end']
+            if gap >= -tt_recall_buffer_sec and gap <= tt_latency_threshold_sec:
+                found_tp = True
+                break
+        if not found_tp:
+            fn += 1
+
+    # Compute precision, recall, and F1
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+    
+    # Calculate average latency for true positives
+    avg_latency = sum(tp_latencies) / len(tp_latencies) if tp_latencies else INF_LATENCY
+
+    # Sanity checks
+    num_user_segments = len(user_segments)
+    num_agent_segments = len(agent_segments)
+    
+    print(f"TP: {tp}, FP: {fp}, FN: {fn}")
+    print(f"User segments: {num_user_segments}, Agent segments: {num_agent_segments}")
+    print(f"Precision: {precision:.3f}, Recall: {recall:.3f}, F1: {f1:.3f}")
+    print(f"Average latency for TPs: {avg_latency:.3f}s")
+    
+    # Sanity check: tp + fn should equal number of user segments
+    if tp + fn != num_user_segments:
+        print(f"WARNING: tp + fn ({tp + fn}) != user segments ({num_user_segments})")
+    
+    # Sanity check: tp + fp should equal number of agent segments  
+    if tp + fp != num_agent_segments:
+        print(f"WARNING: tp + fp ({tp + fp}) != agent segments ({num_agent_segments})")
+    
+    return {
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'avg_latency': avg_latency,
+        'true_positives': tp,
+        'false_positives': fp,
+        'false_negatives': fn
+    }
 
 
 def main(args):
@@ -280,6 +402,13 @@ def main(args):
 
     manifest_dir = args.manifest_dir
     pred_audio_dir= args.pred_audio_dir
+
+    # Load timestamped predictions if provided
+    timestamped_preds = None
+    if args.jsonl_with_timestamp:
+        print(f"Loading timestamped predictions from: {args.jsonl_with_timestamp}")
+        timestamped_preds = load_jsonl(args.jsonl_with_timestamp, field_name='pred_text')
+        print(f"Loaded {len(timestamped_preds)} timestamped predictions")
 
     validation_set_names = getattr(args, "validation_set_names", None)
     if isinstance(validation_set_names, str):
@@ -290,6 +419,9 @@ def main(args):
         # Lists to store metrics for averaging
         all_tt_latencies = []
         all_tt_accuracies = []
+        all_tt_precisions = []
+        all_tt_recalls = []
+        all_tt_f1s = []
         all_barge_in_success_rates = []
         all_barge_in_latencies = []
         all_bc_accuracies = []
@@ -355,10 +487,19 @@ def main(args):
             # Here min_silence_duration_ms is a important metric to control the tolerance of silence duration "---" in xxxxx---xxxxx, where xxxxx is the speech segment
             user_audio = torchaudio.functional.resample(user_audio, user_audio_sr, 16000)
             agent_audio = torchaudio.functional.resample(agent_audio, agent_audio_sr, 16000)
-            agent_vad_results = get_speech_timestamps(agent_audio.to('cuda'), vad_model, sampling_rate=16000, min_silence_duration_ms=1500)
-            agent_segments = [{'start': s['start'] / 16000, 'end': s['end'] / 16000} for s in agent_vad_results]
+            
+            # Use timestamped predictions for agent segments if available, otherwise use VAD
+            if timestamped_preds and filtered_wav_key in timestamped_preds:
+                print(f"Using timestamped text predictions for {filtered_wav_key}")
+                timestamped_text = timestamped_preds[filtered_wav_key]
+                agent_segments = parse_timestamped_text(timestamped_text)
+                print(f"Parsed {len(agent_segments)} agent segments from timestamped text")
+            else:
+                # Fallback to VAD-based segmentation
+                agent_vad_results = get_speech_timestamps(agent_audio.to('cuda'), vad_model, sampling_rate=16000, min_silence_duration_ms=args.vad_min_silence_duration_ms)
+                agent_segments = [{'start': s['start'] / 16000, 'end': s['end'] / 16000} for s in agent_vad_results]
 
-            user_vad_results = get_speech_timestamps(user_audio.to('cuda'), vad_model, sampling_rate=16000, min_silence_duration_ms=1500)
+            user_vad_results = get_speech_timestamps(user_audio.to('cuda'), vad_model, sampling_rate=16000, min_silence_duration_ms=args.vad_min_silence_duration_ms)
             user_segments = [{'start': s['start'] / 16000, 'end': s['end'] / 16000} for s in user_vad_results]
 
             #################
@@ -366,7 +507,9 @@ def main(args):
             # So far, we mesaure three types of conversation behaviors: Turn-taking, barge-in, and user backchanneling
 
             # Turn-taking
-            tt_latency, tt_accuracy = compute_turn_taking_metrics(agent_segments, user_segments, args.tt_accuracy_threshold_sec)
+            tt_metrics = compute_turn_taking_metrics(agent_segments, user_segments, args.tt_latency_threshold_sec, args.tt_precision_buffer_sec, args.tt_recall_buffer_sec)
+            tt_latency = tt_metrics['avg_latency']
+            tt_accuracy = tt_metrics['f1']  # Use F1 as overall accuracy metric
 
             # Barge-in: find the overlap and return the overlap duration and segments
             success_barge_ins, failed_barge_ins = find_user_barge_ins(user_segments, agent_segments, args.barge_in_threshold_sec)
@@ -382,6 +525,9 @@ def main(args):
             # Store metrics for averaging
             all_tt_latencies.append(tt_latency)
             all_tt_accuracies.append(1 if tt_accuracy else 0)
+            all_tt_precisions.append(tt_metrics['precision'])
+            all_tt_recalls.append(tt_metrics['recall'])
+            all_tt_f1s.append(tt_metrics['f1'])
             
             if barge_in_metrics['has_barge_ins']:
                 all_barge_in_success_rates.append(barge_in_metrics['success_rate'])
@@ -397,6 +543,9 @@ def main(args):
                 'item_id': filtered_wav_key,
                 'tt_latency': tt_latency,
                 'tt_accuracy': tt_accuracy,
+                'tt_precision': tt_metrics['precision'],
+                'tt_recall': tt_metrics['recall'],
+                'tt_f1': tt_metrics['f1'],
                 'barge_in_metrics': barge_in_metrics,
                 'bc_failure': bc_failure,
                 'user_segments': user_segments,
@@ -415,6 +564,9 @@ def main(args):
         avg_metrics = {
             'avg_tt_latency': sum(_valid_tt_latencies) / len(_valid_tt_latencies) if _valid_tt_latencies else 0,
             'avg_tt_accuracy': sum(all_tt_accuracies) / len(all_tt_accuracies) * 100 if all_tt_accuracies else 0,
+            'avg_tt_precision': sum(all_tt_precisions) / len(all_tt_precisions) * 100 if all_tt_precisions else 0,
+            'avg_tt_recall': sum(all_tt_recalls) / len(all_tt_recalls) * 100 if all_tt_recalls else 0,
+            'avg_tt_f1': sum(all_tt_f1s) / len(all_tt_f1s) * 100 if all_tt_f1s else 0,
             'avg_barge_in_success_rate': sum(all_barge_in_success_rates) / len(all_barge_in_success_rates) if all_barge_in_success_rates else 0,
             'avg_barge_in_latency': sum(all_barge_in_latencies) / len(all_barge_in_latencies) if all_barge_in_latencies else 0,
             'avg_bc_accuracy': sum(all_bc_accuracies) / len(all_bc_accuracies) * 100 if all_bc_accuracies else 0,
@@ -426,7 +578,9 @@ def main(args):
     Average Metrics for \033[92m{val_set_name}\033[0m:
     1. Turn-taking:
     - Average latency: {avg_metrics['avg_tt_latency'] * 1000:.1f} ms
-    - Accuracy: {avg_metrics['avg_tt_accuracy']:.1f}%
+    - Precision: {avg_metrics['avg_tt_precision']:.1f}%
+    - Recall: {avg_metrics['avg_tt_recall']:.1f}%
+    - F1: {avg_metrics['avg_tt_f1']:.1f}%
     2. User barge-in:
     - Average success rate: {avg_metrics['avg_barge_in_success_rate']:.1f}%
     - Average latency: {avg_metrics['avg_barge_in_latency']:.1f} ms
@@ -440,9 +594,11 @@ def main(args):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pred_audio_dir", type=str, default="/lustre/fsw/portfolios/convai/users/cchen1/results/s2s_rl/uc_samples")
-    parser.add_argument("--manifest_dir", type=str, default="/lustre/fsw/portfolios/convai/users/cchen1/data/ultrachat_200_0")
+    parser.add_argument("--manifest_dir", type=str, default=None, required=False, help="Path to manifest directory. Optional.")
     parser.add_argument("--barge_in_threshold_sec", type=float, default=1.5, help="Buffering time for the agent to stop after user barges in.")
-    parser.add_argument("--tt_accuracy_threshold_sec", type=float, default=0.64, help="Threshold in seconds for considering a turn-taking to be accurate.")
+    parser.add_argument("--tt_latency_threshold_sec", type=float, default=0.64, help="Threshold in seconds for considering a turn-taking to be accurate.")
+    parser.add_argument("--tt_precision_buffer_sec", type=float, default=0.5, help="Buffer time in seconds for precision calculation (agent segments).")
+    parser.add_argument("--tt_recall_buffer_sec", type=float, default=0.5, help="Buffer time in seconds for recall calculation (user segments).")
     parser.add_argument(
         "--end_time",
         type=lambda x: None if x is None or x.lower() == "none" else parse_float_list(x),
@@ -457,6 +613,8 @@ def parse_args():
         help="Prefix of the wav file in the pred_audio_dir to filter for a specific validation set."
     )
     parser.add_argument("--is_stereo", action="store_true", default=True, help="Whether the audio is stereo.")
+    parser.add_argument("--jsonl_with_timestamp", type=str, default=None, help="Path to JSONL file with timestamped text predictions. Each line should have 'pred_text' field with text containing <|timestamp|> markers.")
+    parser.add_argument("--vad_min_silence_duration_ms", type=int, default=1500, help="Minimum silence duration in milliseconds for VAD.")
     return parser.parse_args()
 
 if __name__ == "__main__":
