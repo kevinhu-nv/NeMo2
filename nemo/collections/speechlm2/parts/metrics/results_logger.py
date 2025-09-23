@@ -112,7 +112,9 @@ class ResultsLogger:
                 eou_pred_wav = eou_pred_wav.float() * 0.8  #  make 1 audible and keep 0 as total silence
                 torchaudio.save(out_audio_path_eou, eou_pred_wav.squeeze().unsqueeze(0).detach().cpu(), pred_audio_sr)
 
-            user_eos_positions = [k for k, token in enumerate(src_tokens[i]) if token == user_eos_id]
+            user_eos_positions = None
+            if src_tokens is not None:
+                user_eos_positions = [k for k, token in enumerate(src_tokens[i]) if token == user_eos_id]
 
             # cache metadata
             out_dict = {

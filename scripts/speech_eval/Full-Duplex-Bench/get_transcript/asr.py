@@ -10,7 +10,7 @@ from tqdm import tqdm
 MODEL_NAME = ""
 
 
-def get_time_aligned_transcription(data_path, task):
+def get_time_aligned_transcription(data_path, task, is_stereo=False):
     # Collect all output.wav files under the root directory
     audio_paths = sorted(glob(f"{data_path}/*.wav"))
 
@@ -23,6 +23,9 @@ def get_time_aligned_transcription(data_path, task):
         print(audio_path)
         # Read the audio file (waveform and sample rate)
         waveform, sr = sf.read(audio_path)
+        # If stereo and args.stereo is True, use channel 2 (index 1)
+        if waveform.ndim > 1 and is_stereo:
+            waveform = waveform[:, 1]
         # If multichannel audio, convert to mono by averaging channels
         if waveform.ndim > 1:
             waveform = waveform.mean(axis=1)
@@ -103,6 +106,11 @@ if __name__ == "__main__":
         choices=["full", "user_interruption"],
         help="Choose 'full' for entire transcript or 'user_interruption' to crop before ASR",
     )
+    parser.add_argument(
+        "--stereo",
+        action="store_true",
+        help="Set this flag if the audio files are stereo (2 channels)."
+    )
     args = parser.parse_args()
 
-    get_time_aligned_transcription(args.root_dir, args.task)
+    get_time_aligned_transcription(args.root_dir, args.task, args.stereo)

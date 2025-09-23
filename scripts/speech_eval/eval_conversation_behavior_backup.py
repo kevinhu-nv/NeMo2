@@ -23,53 +23,24 @@ def parse_float_list(arg):
 def parse_timestamped_text(text_with_timestamps):
     import re
     
-    # Parse both BOS and EOS timestamps
-    bos_pattern = r'<\|([\d\.]+)\|>'
-    eos_pattern = r'<\$([\d\.]+)\$>'
-    
-    bos_timestamps = [float(match.group(1)) for match in re.finditer(bos_pattern, text_with_timestamps)]
-    eos_timestamps = [float(match.group(1)) for match in re.finditer(eos_pattern, text_with_timestamps)]
+    timestamp_pattern = r'<\|([\d\.]+)\|>'
+    timestamps = [float(match.group(1)) for match in re.finditer(timestamp_pattern, text_with_timestamps)]
     
     # Convert timestamps to agent segments
     agent_segments = []
-    
-    # If we have both BOS and EOS timestamps, pair them up
-    if bos_timestamps and eos_timestamps:
-        for i, start_time in enumerate(bos_timestamps):
-            # Find the corresponding EOS timestamp (next EOS after this BOS)
-            end_time = None
-            for eos_time in eos_timestamps:
-                if eos_time > start_time:
-                    end_time = eos_time
-                    break
-            
-            if end_time is not None:
-                agent_segments.append({
-                    'start': start_time,
-                    'end': end_time
-                })
-            else:
-                # No corresponding EOS found, use default duration
-                agent_segments.append({
-                    'start': start_time,
-                    'end': start_time + 5.0
-                })
-    
-    # Fallback: if only BOS timestamps are available, add default value
-    elif bos_timestamps:
-        for i, timestamp in enumerate(bos_timestamps):
-            if i < len(bos_timestamps) - 1:
-                # Segment from current timestamp to next timestamp
-                agent_segments.append({
-                    'start': timestamp,
-                    'end': bos_timestamps[i + 1]
-                })
-            else:
-                # Last segment - assume it lasts for a reasonable duration
-                agent_segments.append({
-                    'start': timestamp,
-                    'end': timestamp + 5.0  # Default 5 seconds for last segment
-                })
+    for i, timestamp in enumerate(timestamps):
+        if i < len(timestamps) - 1:
+            # Segment from current timestamp to next timestamp
+            agent_segments.append({
+                'start': timestamp,
+                'end': timestamps[i + 1]
+            })
+        else:
+            # Last segment - assume it lasts for a reasonable duration
+            agent_segments.append({
+                'start': timestamp,
+                'end': timestamp + 5.0  # Default 5 seconds for last segment
+            })
     
     return agent_segments
 
@@ -330,16 +301,15 @@ def get_filtered_wav_keys(pred_audio_dir, validation_set_name):
     return filtered_wav_keys    
 
 
-def compute_turn_taking_metrics(agent_segments, user_segments, tt_latency_threshold_sec, tt_precision_buffer_sec, tt_recall_buffer_sec):
+def compute_turn_taking_metrics(agent_segments, user_segments, tt_accuracy_threshold_sec, tt_accuracy_buffer_sec):
     """
     Compute turn-taking metrics using precision and recall.
     
     Args:
         agent_segments: List of dicts with 'start' and 'end' times of agent speech
         user_segments: List of dicts with 'start' and 'end' times of user speech
-        tt_latency_threshold_sec: Threshold in seconds for considering turn-taking to be accurate
-        tt_precision_buffer_sec: Buffer time in seconds for precision calculation (agent segments)
-        tt_recall_buffer_sec: Buffer time in seconds for recall calculation (user segments)
+        tt_accuracy_threshold_sec: Threshold in seconds for considering turn-taking to be accurate
+        tt_accuracy_buffer_sec: Buffer time in seconds for considering turn-taking to be accurate
     Returns:
         dict: Contains precision, recall, f1, and latency metrics
     """
@@ -367,9 +337,7 @@ def compute_turn_taking_metrics(agent_segments, user_segments, tt_latency_thresh
         
         for user_seg in user_segments:
             gap = agent_seg['start'] - user_seg['end']
-            if (gap >= -tt_precision_buffer_sec and 
-                gap <= tt_latency_threshold_sec and 
-                agent_seg['start'] >= user_seg['start']):
+            if gap >= -tt_accuracy_buffer_sec and gap <= tt_accuracy_threshold_sec:
                 found_tp = True
                 min_latency = min(min_latency, max(gap, 0))
         
@@ -384,7 +352,7 @@ def compute_turn_taking_metrics(agent_segments, user_segments, tt_latency_thresh
         found_tp = False
         for agent_seg in agent_segments:
             gap = agent_seg['start'] - user_seg['end']
-            if gap >= -tt_recall_buffer_sec and gap <= tt_latency_threshold_sec:
+            if gap >= -tt_accuracy_buffer_sec and gap <= tt_accuracy_threshold_sec:
                 found_tp = True
                 break
         if not found_tp:
@@ -536,7 +504,7 @@ def main(args):
             # So far, we mesaure three types of conversation behaviors: Turn-taking, barge-in, and user backchanneling
 
             # Turn-taking
-            tt_metrics = compute_turn_taking_metrics(agent_segments, user_segments, args.tt_latency_threshold_sec, args.tt_precision_buffer_sec, args.tt_recall_buffer_sec)
+            tt_metrics = compute_turn_taking_metrics(agent_segments, user_segments, args.tt_accuracy_threshold_sec, args.tt_accuracy_buffer_sec)
             tt_latency = tt_metrics['avg_latency']
             tt_accuracy = tt_metrics['f1']  # Use F1 as overall accuracy metric
 
@@ -623,11 +591,10 @@ def main(args):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pred_audio_dir", type=str, default="/lustre/fsw/portfolios/convai/users/cchen1/results/s2s_rl/uc_samples")
-    parser.add_argument("--manifest_dir", type=str, default=None, required=False, help="Path to manifest directory. Optional.")
+    parser.add_argument("--manifest_dir", type=str, default="/lustre/fsw/portfolios/convai/users/cchen1/data/ultrachat_200_0")
     parser.add_argument("--barge_in_threshold_sec", type=float, default=1.5, help="Buffering time for the agent to stop after user barges in.")
-    parser.add_argument("--tt_latency_threshold_sec", type=float, default=0.64, help="Threshold in seconds for considering a turn-taking to be accurate.")
-    parser.add_argument("--tt_precision_buffer_sec", type=float, default=0.5, help="Buffer time in seconds for precision calculation (agent segments).")
-    parser.add_argument("--tt_recall_buffer_sec", type=float, default=0.5, help="Buffer time in seconds for recall calculation (user segments).")
+    parser.add_argument("--tt_accuracy_threshold_sec", type=float, default=0.64, help="Threshold in seconds for considering a turn-taking to be accurate.")
+    parser.add_argument("--tt_accuracy_buffer_sec", type=float, default=0.5, help="Buffer time in seconds for considering a turn-taking to be accurate.")
     parser.add_argument(
         "--end_time",
         type=lambda x: None if x is None or x.lower() == "none" else parse_float_list(x),
