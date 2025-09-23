@@ -23,24 +23,53 @@ def parse_float_list(arg):
 def parse_timestamped_text(text_with_timestamps):
     import re
     
-    timestamp_pattern = r'<\|([\d\.]+)\|>'
-    timestamps = [float(match.group(1)) for match in re.finditer(timestamp_pattern, text_with_timestamps)]
+    # Parse both BOS and EOS timestamps
+    bos_pattern = r'<\|([\d\.]+)\|>'
+    eos_pattern = r'<\$([\d\.]+)\$>'
+    
+    bos_timestamps = [float(match.group(1)) for match in re.finditer(bos_pattern, text_with_timestamps)]
+    eos_timestamps = [float(match.group(1)) for match in re.finditer(eos_pattern, text_with_timestamps)]
     
     # Convert timestamps to agent segments
     agent_segments = []
-    for i, timestamp in enumerate(timestamps):
-        if i < len(timestamps) - 1:
-            # Segment from current timestamp to next timestamp
-            agent_segments.append({
-                'start': timestamp,
-                'end': timestamps[i + 1]
-            })
-        else:
-            # Last segment - assume it lasts for a reasonable duration
-            agent_segments.append({
-                'start': timestamp,
-                'end': timestamp + 5.0  # Default 5 seconds for last segment
-            })
+    
+    # If we have both BOS and EOS timestamps, pair them up
+    if bos_timestamps and eos_timestamps:
+        for i, start_time in enumerate(bos_timestamps):
+            # Find the corresponding EOS timestamp (next EOS after this BOS)
+            end_time = None
+            for eos_time in eos_timestamps:
+                if eos_time > start_time:
+                    end_time = eos_time
+                    break
+            
+            if end_time is not None:
+                agent_segments.append({
+                    'start': start_time,
+                    'end': end_time
+                })
+            else:
+                # No corresponding EOS found, use default duration
+                agent_segments.append({
+                    'start': start_time,
+                    'end': start_time + 5.0
+                })
+    
+    # Fallback: if only BOS timestamps are available, add default value
+    elif bos_timestamps:
+        for i, timestamp in enumerate(bos_timestamps):
+            if i < len(bos_timestamps) - 1:
+                # Segment from current timestamp to next timestamp
+                agent_segments.append({
+                    'start': timestamp,
+                    'end': bos_timestamps[i + 1]
+                })
+            else:
+                # Last segment - assume it lasts for a reasonable duration
+                agent_segments.append({
+                    'start': timestamp,
+                    'end': timestamp + 5.0  # Default 5 seconds for last segment
+                })
     
     return agent_segments
 

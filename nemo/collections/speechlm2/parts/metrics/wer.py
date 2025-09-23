@@ -53,10 +53,13 @@ class WER:
             
             self._refs[name].append(normalized_ref)
             self._hyps[name].append(normalized_hyp)
-            
-            if self.verbose:
-                wer_score = jiwer.wer(normalized_ref, normalized_hyp)
-                logging.info(f"[REF]\t{normalized_ref}\n[HYP]\t{normalized_hyp} [WER: {wer_score:.4f}]")
+
+            if normalized_ref.strip() == "":
+                wer_score = -1.0
+            else:
+                if self.verbose:
+                    wer_score = jiwer.wer(normalized_ref, normalized_hyp)
+                    logging.info(f"[REF]\t{normalized_ref}\n[HYP]\t{normalized_hyp} [WER: {wer_score:.4f}]")
 
     def compute(self) -> dict[str, torch.Tensor]:
         corpus_metric = {}
