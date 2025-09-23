@@ -45,6 +45,7 @@ def inference(cfg):
         target_sample_rate=cfg.data.target_sample_rate,
         input_roles=cfg.data.input_roles,
         output_roles=cfg.data.output_roles,
+        train_half_duplex_asr=getattr(cfg.data, "train_half_duplex_asr", False),
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 

@@ -48,7 +48,9 @@ def train(cfg):
         word_align_position=getattr(cfg.data, "word_align_position", "left"),
         use_vad_for_user_audio=getattr(cfg.data, "use_vad_for_user_audio", False),
         predict_user_text=getattr(cfg.model, "predict_user_text", False),
-        cfg=cfg.data
+        train_half_duplex_asr=getattr(cfg.model, "train_half_duplex_asr", False),
+        cfg=cfg.data,
+        model_cfg=cfg.model,
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 

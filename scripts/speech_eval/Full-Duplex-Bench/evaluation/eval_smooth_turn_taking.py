@@ -10,7 +10,7 @@ turn_num_words_threshold = 3
 
 def remove_punctuation(text: str) -> str:
     return re.sub(r"[^\w\s\[\]]", "", text)
-
+ 
 
 def round_to_quarter(number):
     return round(number * 4) / 4
@@ -62,7 +62,6 @@ def eval_smooth_turn_taking(data_dir):
         else:
             output_start_time = segments_cw[0]["timestamp"][0]
             duration = segments_cw[-1]["timestamp"][-1] - segments_cw[0]["timestamp"][0]
-            import pdb; pdb.set_trace()
             if duration < turn_duration_threshold:
                 if len(segments_cw) <= turn_num_words_threshold:
                     TOR = 0
@@ -72,7 +71,8 @@ def eval_smooth_turn_taking(data_dir):
             else:
                 TOR = 1
                 latency = output_start_time - input_end_time
-
+                
+        
         take_turn_list.append(TOR)
         if TOR == 1:
             if latency < 0:

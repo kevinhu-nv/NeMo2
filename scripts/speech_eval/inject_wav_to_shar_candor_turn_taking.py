@@ -50,14 +50,16 @@ def create_pipeline(model_id, token=""):
     )
     return pipeline
 
-def create_prompt(question):
+def create_prompt(question, syste_prompt=None):
+    DEFAULT_SYSTEM_PROMPT = "Based on the question, directly answer by one short sentence using spoken words. The answer should be at most 1 sentences with at most 20 words."
+    sys_prompt = DEFAULT_SYSTEM_PROMPT if syste_prompt is None else syste_prompt
     prompt = [
-        {"role": "system", "content": "Based on the question, directly answer by one short sentence using spoken words. The answer should be at most 1 sentences with at most 20 words."},
+        {"role": "system", "content": sys_prompt},
         {"role": "user", "content": f"{question}"},
     ]
     return prompt
 
-def generate_agent_response(llm_pipeline, user_transcription):
+def run_llm_pipeline(llm_pipeline, user_transcription):
     """Generate agent response using Meta-Llama-3.1-8B-Instruct based on user transcription."""
     if llm_pipeline is None:
         return ""
@@ -113,7 +115,8 @@ def transcribe_audio_segment(asr_model_obj, audio_path):
 
 def update_shar_with_new_recording(
         in_dir, shar_index, out_shar_dir, new_wav_dir, transcribe=False, asr_model="nvidia/parakeet-tdt-0.6b-v2", 
-        use_llm=False, llm_model="meta-llama/Meta-Llama-3.1-8B-Instruct", turn_silence_sec=0.32, use_end_timestamp=False):
+        use_llm=False, llm_model="meta-llama/Meta-Llama-3.1-8B-Instruct", turn_silence_sec=0.32, use_end_timestamp=False,
+        paraphrase_user_text=False, start_index=0, end_index=None):
     cuts_name = [f"{in_dir}/cuts.{shar_index:06d}.jsonl.gz"]
 
     cuts = LazySharIterator(
@@ -128,7 +131,27 @@ def update_shar_with_new_recording(
     
     # Get all subdirectories (which are the cut IDs)
     subdirs = [d for d in os.listdir(new_wav_dir) if os.path.isdir(os.path.join(new_wav_dir, d))]
-    subdirs.sort()  # Sort to ensure consistent ordering
+    
+    # Sort numerically for numeric directories, keep non-numeric ones at the end
+    def sort_key(d):
+        try:
+            return (0, int(d))  # Numeric directories first, sorted by integer value
+        except ValueError:
+            return (1, d)  # Non-numeric directories after, sorted alphabetically
+    
+    subdirs.sort(key=sort_key)
+    
+    # Filter subdirs based on start_index and end_index
+    if end_index is None:
+        end_index = len(subdirs)
+    # Ensure indices are within bounds
+    start_index = max(0, start_index)
+    end_index = min(len(subdirs), end_index)
+    # Filter subdirs to only include the specified range
+    filtered_subdirs = subdirs[start_index:end_index]
+    
+    print(f"Processing subdirs {start_index} to {end_index-1} (total: {len(filtered_subdirs)} out of {len(subdirs)})")
+    
     subdir_index = 0
 
     # Initialize ASR model if transcription is enabled
@@ -146,11 +169,11 @@ def update_shar_with_new_recording(
         print("LLM model loaded successfully.")
 
     for cut in tqdm(cuts):
-        if subdir_index >= len(subdirs):
+        if subdir_index >= len(filtered_subdirs):
             print("No more audio directories available.")
             break
 
-        subdir_name = subdirs[subdir_index]
+        subdir_name = filtered_subdirs[subdir_index]
         subdir_index += 1
         
         # Construct path to input.wav in the subdirectory
@@ -178,11 +201,24 @@ def update_shar_with_new_recording(
                 user_transcription = ""
                 user_end_timestamp = 0.0
 
+        # Use the LLM to generate a similar sentence to the user_transcription, instead of using it directly.
+        if paraphrase_user_text and use_llm and llm_pipeline is not None and user_transcription:
+            llm_prompt = create_prompt(user_transcription, syste_prompt="Paraphrase the following sentence, keeping the meaning but changing the wording. Keep it as a single sentence and natural for spoken English.")
+            try:
+                llm_user_transcription = run_llm_pipeline(llm_pipeline, llm_prompt)
+                print(f"LLM-generated similar sentence for {subdir_name}: {llm_user_transcription}")
+            except Exception as e:
+                print(f"Error generating similar sentence with LLM: {e}")
+                llm_user_transcription = user_transcription
+            print(f'user_transcription: {user_transcription}')
+            print(f'llm_user_transcription: {llm_user_transcription}')
+            user_transcription = llm_user_transcription
+
         # Generate agent response using LLM if enabled
         agent_response = ""
         if use_llm and llm_pipeline is not None and user_transcription:
             try:
-                agent_response = generate_agent_response(llm_pipeline, user_transcription)
+                agent_response = run_llm_pipeline(llm_pipeline, user_transcription)
                 print(f"Agent response for {subdir_name}: {agent_response}")
             except Exception as e:
                 print(f"Error generating agent response: {e}")
@@ -269,7 +305,10 @@ def main():
     parser.add_argument('--asr_model', type=str, default="nvidia/parakeet-tdt-0.6b-v2", help="NeMo ASR model to use for transcription.")
     parser.add_argument('--use_llm', action='store_true', help="Enable LLM generation of agent responses.")
     parser.add_argument('--llm_model', type=str, default="meta-llama/Meta-Llama-3.1-8B-Instruct", help="LLM model to use for generating agent responses.")
+    parser.add_argument('--paraphrase_user_text', action='store_true', help="Use LLM to paraphrase user transcription text.")
     parser.add_argument('--use_end_timestamp', action='store_true', help="Use end timestamp of last word for precise timing.")
+    parser.add_argument('--start_index', type=int, default=0, help="Start index for processing subdirectories (0-based).")
+    parser.add_argument('--end_index', type=int, default=None, help="End index for processing subdirectories (exclusive, 0-based). If None, process until the end.")
 
     args = parser.parse_args()
 
@@ -282,7 +321,10 @@ def main():
         asr_model=args.asr_model,
         use_llm=args.use_llm,
         llm_model=args.llm_model,
-        use_end_timestamp=args.use_end_timestamp
+        use_end_timestamp=args.use_end_timestamp,
+        paraphrase_user_text=args.paraphrase_user_text,
+        start_index=args.start_index,
+        end_index=args.end_index
     )
 
 if __name__ == "__main__":

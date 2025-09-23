@@ -6,19 +6,21 @@ function eval_conv() {
 extra_args="$1"
 python $CODE_DIR/scripts/speech_eval/eval_conversation_behavior.py \
     --pred_audio_dir $pred_audio_dir \
-    --manifest_dir $manifest_dir \
+    ${manifest_dir:+--manifest_dir $manifest_dir} \
     --barge_in_threshold_sec $barge_in_threshold_sec \
     --end_time $end_time \
-    --tt_accuracy_threshold_sec 1.5 \
-    --barge_in_threshold_sec 1.5 \
-    --validation_set_name $validation_set_name $extra_args
+    --tt_latency_threshold_sec $tt_latency_threshold_sec \
+    --tt_precision_buffer_sec $tt_precision_buffer_sec \
+    --tt_recall_buffer_sec $tt_recall_buffer_sec \
+    --barge_in_threshold_sec $barge_in_threshold_sec \
+    --validation_set_name $validation_set_name $extra_args 2>&1 | tee $output_log
 }
 
 pred_audio_dir="/lustre/fsw/portfolios/convai/users/kevinhu/results/s2s_rl/uc_samples"
 manifest_dir="/lustre/fsw/portfolios/convai/users/kevinhu/data/ultrachat_200_0"
 barge_in_threshold_sec=1.5
 end_time=None  # Note that this comes from predefined values when creating backchanneling data
-tt_accuracy_threshold_sec=0.64
+tt_latency_threshold_sec=0.64
 verbose=True
 # eval_conv
 
@@ -42,9 +44,35 @@ validation_set_name="mistral_511,voicebench_alpaca,voicebench_openbook,voicebenc
 pred_audio_dir="/lustre/fsw/portfolios/convai/users/kevinhu/S2S-Duplex-new-codebase/results/inferences/1.78kbps/demo_model_no_aug_chen_chen_only_demo_1demo_model_no_aug_chen_chen_4nodes_nonsil10.0_zhehuai_01_jul_g_baseline_no_davidai_qwen_no_lat_with_bos_eos_dp_sd_with_bos_eos_dp_sd_sd_state/validation_logs/pred_wavs"
 barge_in_threshold_sec=1.5
 end_time=None  # Note that this comes from predefined values when creating backchanneling data
-tt_accuracy_threshold_sec=0.64
+tt_latency_threshold_sec=0.64
 validation_set_name="demo"
-eval_conv "--verbose"
+# eval_conv "--verbose"
+
+######################
+# Eval demo text
+log_dir=/lustre/fsw/portfolios/convai/users/kevinhu/s2s/exp/DFW_qwen_1b_4nodes_repro_recipe2_newae_kevincd/inf/validation_logs/
+pred_audio_dir=${log_dir}/pred_wavs/
+jsonl_with_timestamp=${log_dir}/metadatas/demo.json
+output_log=${jsonl_with_timestamp}.log
+barge_in_threshold_sec=1.5
+end_time=None  # Note that this comes from predefined values when creating backchanneling data
+tt_latency_threshold_sec=1.5
+tt_recall_buffer_sec=5
+tt_precision_buffer_sec=1
+vad_min_silence_duration_ms=2000
+validation_set_name="demo"
+eval_conv "--verbose --jsonl_with_timestamp $jsonl_with_timestamp --vad_min_silence_duration_ms $vad_min_silence_duration_ms"
+echo "Output log: $output_log"
+
+######################
+# Eval repro baseline ckpt-recipe1 decoded demo audios
+# ckpt-recipe1 from https://docs.google.com/document/d/17z9JeCK8Ht-ojLp1H8ynJqr8Pz7aGdohy0C0PYIvXvY/edit?pli=1&tab=t.0#bookmark=id.7im551u1k7e0
+pred_audio_dir="/lustre/fsw/portfolios/convai/users/kevinhu/S2S-Duplex-new-codebase/results/inferences/1.78kbps/demo_model_no_aug_chen_chen_only_demo_1demo_model_no_aug_chen_chen_4nodes_nonsil10.0_zhehuai_01_jul_g_baseline_no_davidai_qwen_no_lat_with_bos_eos_dp_sd_with_bos_eos_dp_sd_sd_state/validation_logs/pred_wavs"
+barge_in_threshold_sec=1.5
+end_time=None  # Note that this comes from predefined values when creating backchanneling data
+tt_latency_threshold_sec=0.64
+validation_set_name="demo"
+# eval_conv "--verbose"
 
 ######################
 # Transcribe using full-duplex-bench ASR
