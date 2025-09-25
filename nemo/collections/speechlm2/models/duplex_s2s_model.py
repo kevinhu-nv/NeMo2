@@ -631,7 +631,7 @@ def tokens_to_str(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer: AutoTo
                 all_positions.append((pos.item(), 'bos'))
             for pos in agent_eos_positions:
                 all_positions.append((pos.item(), 'eos'))
-            
+
             # Sort by position
             all_positions.sort(key=lambda x: x[0])
             
