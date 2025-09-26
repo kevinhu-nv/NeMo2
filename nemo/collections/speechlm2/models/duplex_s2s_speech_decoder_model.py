@@ -1821,6 +1821,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             gen_text_tgt = gen_text.clone()
             gen_text_tgt[~tgt_mask] = self.text_pad_id
             gen_text = gen_text_tgt
+
+            src_text_cleaned = []
+            for b in range(gen_text.shape[0]):
+                gen_text_b = self.tokenizer.ids_to_text(gen_text_tgt[b])
+                gen_text_src_b = self.tokenizer.ids_to_text(gen_text_src[b])
+                src_text_cleaned.append(gen_text_src_b)
+
         elif self.predict_user_text:
             # Multi-turn conversation decoding
             # Use a single text channel for both user and agent text
