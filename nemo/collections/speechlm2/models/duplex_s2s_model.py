@@ -628,9 +628,9 @@ def tokens_to_str(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer: AutoTo
             # Combine and sort all positions with their types
             all_positions = []
             for pos in agent_bos_positions:
-                all_positions.append((pos.item(), 'bos'))
+                all_positions.append((pos, 'bos'))
             for pos in agent_eos_positions:
-                all_positions.append((pos.item(), 'eos'))
+                all_positions.append((pos, 'eos'))
 
             # Sort by position
             all_positions.sort(key=lambda x: x[0])

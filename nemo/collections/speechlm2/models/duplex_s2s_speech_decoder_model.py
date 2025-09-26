@@ -253,6 +253,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             llm_tokenizer_vocab_items=llm_tokenizer_vocab_items,
         )
 
+        if self.cfg.get("pretrained_perception_from_s2s", None):
+            self.init_perception_from_another_s2s_checkpoint(self.cfg.pretrained_perception_from_s2s)
+
         if self.cfg.get("pretrained_s2s_model", None):
             logging.info(f"Loading pretrained s2s model from {self.cfg.pretrained_s2s_model}")
             self.init_from_model_from_ckpt(self.cfg.pretrained_s2s_model)
@@ -334,6 +337,22 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             if self.cfg.get("use_eou_decoder", None) or self.cfg.get("inference_use_external_eou_predictor", None):
                 checkpoint_state = set_model_dict_for_partial_init(checkpoint_state, self.eou_decoder.state_dict())
                 self.eou_decoder.load_state_dict(checkpoint_state, strict=True)
+
+    def init_perception_from_another_s2s_checkpoint(self, checkpoint_path):
+        if checkpoint_path is not None:
+            if '.nemo' in checkpoint_path:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    NLPSaveRestoreConnector._unpack_nemo_file(checkpoint_path, tmpdir)
+                    checkpoint_path = f"{tmpdir}/model_weights.ckpt"
+                    checkpoint_state = torch.load(checkpoint_path, map_location='cpu')
+            else:
+                checkpoint_state = torch.load(checkpoint_path, weights_only=False, map_location='cpu')['state_dict']
+
+            checkpoint_state = {
+                k.replace("perception.", ""): v for k, v in checkpoint_state.items() if "perception." in k
+            }
+            checkpoint_state = set_model_dict_for_partial_init(checkpoint_state, self.perception.state_dict())
+            self.perception.load_state_dict(checkpoint_state, strict=True)
 
     def init_from_model_from_ckpt(self, checkpoint_path):
         if checkpoint_path is not None:
@@ -1319,19 +1338,19 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         text_eos_acc = self.text_eos_acc.compute()
         for k, m in text_eos_acc.items():
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
-        if self.predict_user_text:
-            src_bleu = self.src_bleu.compute()
-            for k, m in src_bleu.items():
-                self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
-            src_text_bos_acc = self.src_text_bos_acc.compute()
-            for k, m in src_text_bos_acc.items():
-                self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
-            src_wer = self.src_wer.compute()
-            for k, m in src_wer.items():
-                self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
-            empty_user_text = self.empty_user_text.compute()
-            for k, m in empty_user_text.items():
-                self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+        # if self.predict_user_text:
+            # src_bleu = self.src_bleu.compute()
+            # for k, m in src_bleu.items():
+            #     self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+            # src_text_bos_acc = self.src_text_bos_acc.compute()
+            # for k, m in src_text_bos_acc.items():
+            #     self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+            # src_wer = self.src_wer.compute()
+            # for k, m in src_wer.items():
+            #     self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+            # empty_user_text = self.empty_user_text.compute()
+            # for k, m in empty_user_text.items():
+            #     self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
 
     def validation_step(self, batch: dict, batch_idx: int):
 
