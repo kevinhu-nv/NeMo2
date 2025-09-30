@@ -160,7 +160,6 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 logging.warning(f"All cuts were filtered out! Original batch size: {len(cuts)}. Returning minimal valid batch to continue training.")
                 return self._create_minimal_batch()
             cuts = CutSet.from_cuts(filtered_cuts)
-            
 
         source_audio, source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
         target_audio, target_audio_lens = collate_audio(
@@ -205,7 +204,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 self.frame_length, self.source_sample_rate,
                 vad_model_path='/lustre/fsw/portfolios/convai/users/kevinhu/s2s/silero-vad'
             )
-            agent_bos_vad = utils.find_last_zero_to_one_transition(is_agent_turn, source_token_lens)            
+            agent_bos_vad = utils.find_last_zero_to_one_transition(is_agent_turn, source_token_lens)
 
         # extract target speaker first turn audio to uses for speaker conditioning
         target_first_turn_audio, target_first_turn_audio_lens = collate_first_turn_audio(

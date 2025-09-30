@@ -24,16 +24,20 @@ CODE_DIR=/lustre/fsw/convai_convaird_nemo-speech/users/kevinhu/s2s/NeMo
 
 # EXP_NAME=DFW_qwen_1b_asr_sil2_4nodes_reproduce-old_asr_la_d15_na2
 # EXP_NAME=DFW_qwen_1b_convasr_4nodes_reproduce-old_convasr_sa_la_d4_08281419
-EXP_NAME=EOS_qwen_1b_asr_sil2_4nodes_reproduce-old_asr_la_d15_na2_sfix_sl128
+# EXP_NAME=EOS_qwen_1b_asr_sil2_4nodes_reproduce-old_asr_la_d15_na2_sfix_sl128
 # EXP_NAME=EOS_qwen_1b_asr_sil2_4nodes_reproduce-old_asr_la_d15_na2_sfix_sl1024
+EXP_NAME=DFW_qwen_1b_asr_sil2_4nodes_asr_la_d15_na2_3B
+# EXP_NAME=DFW_qwen_1b_asr_sil2_ma_4nodes_asr_la_d15_na2_3B_ma
 
-BASE_DIR="/lustre/fsw/convai_convaird_nemo-speech/users/kevinhu/s2s/exp/${EXP_NAME}/inf/validation_logs/metadatas"
+LOG_DIR="/lustre/fsw/convai_convaird_nemo-speech/users/kevinhu/s2s/exp/${EXP_NAME}/inf"
+BASE_DIR="${LOG_DIR}/validation_logs/metadatas"
 
 TEST_SETS="ls_test_clean.json ls_test_other.json spgispeech.json gigaspeech.json earnings22.json riva_asr_6p0.json ami.json tedlium.json voxpopuli.json"
+# TEST_SETS="ls_test_clean.json ls_test_other.json spgispeech.json"
 
 TIMESTAMP=$(date +%Y%m%d)
 for fname in $TEST_SETS; do
-  log_dir="${BASE_DIR}/${TIMESTAMP}"
+  log_dir="${LOG_DIR}/${TIMESTAMP}"
   mkdir -p "$log_dir"
   json_output="${BASE_DIR}/${fname}"
   log_output="${log_dir}/${fname}.log"
@@ -45,7 +49,7 @@ done
 
 # TIMESTAMP=20250910_1347
 for fname in $TEST_SETS; do
-  log_dir="${BASE_DIR}/${TIMESTAMP}"
+  log_dir="${LOG_DIR}/${TIMESTAMP}"
   log_output="${log_dir}/${fname}.log"
   echo "================== $fname =================="
   awk '/SUMMARY/ {show=1; next} show' "$log_output"

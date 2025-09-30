@@ -86,6 +86,10 @@ def main():
     for entry in data:
         ref = entry.get("src_text", "")
         hyp = entry.get("pred_src_text", "")
+
+        # Remove any '^' characters from hyp before normalization
+        hyp = hyp.replace('^', '')
+
         if ref.strip() == "" and hyp.strip() == "":
             continue  # skip empty pairs
         
@@ -98,6 +102,7 @@ def main():
         normalized_hyp = normalizer(hyp)
         normalized_refs.append(normalized_ref)
         normalized_hyps.append(normalized_hyp)
+       
 
     if not refs or not hyps:
         print("No valid reference/hypothesis pairs found.")

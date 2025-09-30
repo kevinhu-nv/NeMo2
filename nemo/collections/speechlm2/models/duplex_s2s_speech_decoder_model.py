@@ -1020,6 +1020,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     self.cfg.get("scale_loss_mask", self.cfg.get("nonsil_weight", 4.0)),
                     asr_loss_scale[:, :, :1],
                 )
+                if 'source_id' in batch:
+                    # Do not use user text for pretraining data since it is not aligned
+                    # Set asr_loss_scale to 0 for batches where source_id is 'pt'
+                    for i, source_id in enumerate(batch['source_id']):
+                        if source_id == 'pt':
+                            asr_loss_scale[i, :, :1] = 0.0
 
         # debug samples:
         if (
