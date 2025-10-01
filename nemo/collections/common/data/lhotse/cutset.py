@@ -403,6 +403,10 @@ def read_lhotse_manifest(config) -> tuple[CutSet, bool]:
             cuts = CutSet.from_shar(
                 **_resolve_shar_inputs(config.shar_path, metadata_only), shuffle_shards=True, seed=shard_seed
             )
+            # Add source tracking metadata
+            source_id = config.get("source_id", "single_source")
+            field_name = "source_id" if config.get("source_id") is not None else "yaml_source"
+            cuts = cuts.map(lambda cut: cut.with_custom(field_name, source_id))
             if not metadata_only and not force_finite:
                 cuts = cuts.repeat()
         elif isinstance(config.shar_path, Sequence):
@@ -414,7 +418,7 @@ def read_lhotse_manifest(config) -> tuple[CutSet, bool]:
             )
             cutsets = []
             weights = []
-            for item in config.shar_path:
+            for i, item in enumerate(config.shar_path):
                 if isinstance(item, (str, Path)):
                     path = item
                     cs = CutSet.from_shar(
@@ -432,7 +436,13 @@ def read_lhotse_manifest(config) -> tuple[CutSet, bool]:
                     cs = CutSet.from_shar(
                         **_resolve_shar_inputs(path, metadata_only), shuffle_shards=True, seed=shard_seed
                     )
-                logging.info(f"- {path=} {weight=}")
+                
+                # Add source tracking metadata to each cut
+                source_id = config.get("source_id", f"source_{i}")
+                field_name = "source_id" if config.get("source_id") is not None else "yaml_source"
+                cs = cs.map(lambda cut: cut.with_custom(field_name, source_id))
+                
+                logging.info(f"- {path=} {weight=} source_id={source_id}")
                 cutsets.append(cs)
                 weights.append(weight)
 
@@ -452,6 +462,10 @@ def read_lhotse_manifest(config) -> tuple[CutSet, bool]:
             if metadata_only:
                 fields = {"cuts": fields["cuts"]}
             cuts = CutSet.from_shar(fields=fields, shuffle_shards=True, seed=shard_seed)
+            # Add source tracking metadata
+            source_id = config.get("source_id", "mapping_source")
+            field_name = "source_id" if config.get("source_id") is not None else "yaml_source"
+            cuts = cuts.map(lambda cut: cut.with_custom(field_name, source_id))
             if not metadata_only and not force_finite:
                 cuts = cuts.repeat()
         else:
@@ -929,7 +943,29 @@ def _resolve_shar_inputs(path: Union[str, Path], only_metadata: bool) -> dict:
     if only_metadata:
         return dict(fields={"cuts": sorted(Path(path).glob("cuts.*"))})
     else:
-        return dict(in_dir=path)
+        # Instead of using in_dir which scans all files, use fields to specify exactly which files to include
+        # This allows us to filter out unwanted files like .log files
+        path_obj = Path(path)
+        
+        # Find all shard files, excluding .log files and other non-shard files
+        shard_files = {}
+        
+        # Look for common shard file patterns
+        for pattern in ["cuts.*", "recording.*", "features.*", "supervision.*", "custom.*", "target_audio.*"]:
+            files = sorted(path_obj.glob(pattern))
+            if files:
+                # Filter out .log files and other non-shard files
+                filtered_files = [f for f in files if not f.name.endswith('.log') and not f.name.endswith('.txt')]
+                if filtered_files:
+                    field_name = pattern.split('.')[0]  # e.g., "cuts", "recording", etc.
+                    shard_files[field_name] = filtered_files
+        
+        # If we found specific shard files, use fields approach
+        if shard_files:
+            return dict(fields=shard_files)
+        else:
+            # Fallback to in_dir if no specific shard files found
+            return dict(in_dir=path)
 
 
 def resolve_relative_paths(cut: Cut, manifest_path: str) -> Cut:

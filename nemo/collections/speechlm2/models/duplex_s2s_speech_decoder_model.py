@@ -811,7 +811,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         if self.cfg.get("delay_text_bos_by", None):
             target_tokens = delay_eos(target_tokens, self.text_bos_id, self.text_pad_id, shift=self.cfg.delay_text_bos_by)
 
-        if self.predict_user_text and batch["formatter"][0] == 'nemo_tarred_to_duplex':
+        if self.predict_user_text:
             source_tokens = batch["source_tokens"]
             user_bos_id = self.user_bos_id
             user_eos_id = self.user_eos_id
@@ -884,7 +884,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         if self.cfg.get("debug", False):
             import pdb; pdb.set_trace()
-            i = 12
+            i = 0
             target_tokens_flat_masked = target_tokens_flat[i]*(target_tokens_flat[i] != self.text_pad_id)
             print(f"target_tokens_flat[i]:", target_tokens_flat_masked)
             target_tokens_masked = target_tokens[i]*(target_tokens[i] != self.text_pad_id)
@@ -1018,6 +1018,16 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     self.cfg.get("scale_loss_mask", self.cfg.get("nonsil_weight", 4.0)),
                     asr_loss_scale[:, :, :1],
                 )
+                # print(f'source_id: ', [x for x in batch['source_id']])
+                # if any(x == 'pt' for x in batch['source_id']) and not all(x == 'pt' for x in batch['source_id']):
+                #     import pdb; pdb.set_trace()
+                if 'source_id' in batch and not self.cfg.get("force_align_user_text", False):
+                    # Do not use user text for pretraining data since it is not aligned
+                    # Set asr_loss_scale to 0 for batches where source_id is 'pt'
+                    for i, source_id in enumerate(batch['source_id']):
+                        if source_id == 'pt':
+                            asr_loss_scale[i, :, :1] = 0.0
+                    
 
         # debug samples:
         if (
@@ -1228,6 +1238,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     )
                     * inputs["asr_loss_scale"][:, :, 0].flatten(0, 1)
                 ).sum(-1) / num_frames
+                print(f'asr_loss: {asr_loss}')
 
             # mask audio logits to ignore sequence padding
             audio_logits = forward_outputs["audio_logits"]
@@ -1484,7 +1495,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     # If less than 5 non-pad tokens, set the entire last turn to pad
                     if non_pad_count < 5:
                         fixed_gen_text[b, last_bos_idx+1:] = self.text_pad_id
-        return fixed_gen_text
+            return fixed_gen_text
+        else:
+            return gen_text
 
     def _find_agent_bos(self, gen_text: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         agent_bos_id = self.text_bos_id
@@ -1492,12 +1505,12 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         return agent_bos_indices
     
 
-    def _segment_alternating_user_agent_text(self, gen_text: torch.Tensor, is_asr: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    def _segment_alternating_user_agent_text(self, gen_text: torch.Tensor, is_asr: bool = False, user_eos_id=None) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Segment text into alternating user and agent text segments.
         
-        User text segments start with user_bos_id and continue until the next agent_bos_id.
-        Agent text segments start with text_bos_id (agent_bos_id) and continue until the next user_bos_id.
+        User text segments start with user_bos_id and continue until the next agent_bos_id. Including user_eos_id.
+        Agent text segments start with agent_bos_id and continue until the next user_bos_id. Including agent_eos_id.
         
         Args:
             gen_text: Input text tensor of shape [batch_size, seq_len]
@@ -1508,7 +1521,6 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 - gen_text_tgt: Agent text segments with user text padded
         """
         user_bos_id = self.user_bos_id
-        user_eos_id = self.user_eos_id
         agent_bos_id = self.text_bos_id
 
         if is_asr:
@@ -1794,8 +1806,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         all_text = gen_text.clone()
         if self.predict_user_text and self.cfg.get("use_separate_asr_head", False) and not self.cfg.get("force_use_asr_head_for_user_agent_text", False):
             gen_text_src = gen_asr
-        elif self.predict_user_text and self.cfg.get("is_asr", False):
-            # ASR only decoding
+            src_text_cleaned = [self.tokenizer.ids_to_text(gen_text_src[b]) for b in range(gen_text_src.shape[0])]
+        elif self.predict_user_text and self.cfg.get("is_asr", False) and not self.cfg.get("predict_eou", False):
+            # ASR only decoding for streaming ASR
             if self.cfg.get("force_use_asr_head_for_user_agent_text", False):
                 gen_text = gen_asr
             # Split gen_text into gen_text_src and gen_text_tgt based on self.text_bos_id
@@ -1820,45 +1833,68 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             gen_text_tgt[~tgt_mask] = self.text_pad_id
             gen_text = gen_text_tgt
         elif self.predict_user_text:
-            # Multi-turn conversation decoding
+            # Multi-turn decoding, including
+            # 1) Joint ASR + EOU (pontentially multi-turn), or
+            # 2) Multiturn S2S
+
+            is_asr = self.cfg.get("is_asr", False)
+
             # Use a single text channel for both user and agent text
             if self.cfg.get("force_use_asr_head_for_user_agent_text", False):
                 gen_text = gen_asr
 
             # A few fixes
-            gen_text = self._remove_continuous_agent_bos_id(gen_text, bos_id=self.user_bos_id, is_asr=True)
-            gen_text = self._remove_continuous_agent_bos_id(gen_text, bos_id=self.text_bos_id, is_asr=True)
-            gen_text = self._remove_last_turn_if_short(gen_text, bos_id=self.user_bos_id, is_asr=True)    
-            gen_text = self._remove_last_turn_if_short(gen_text, bos_id=self.text_bos_id, is_asr=True)
+            gen_text = self._remove_continuous_agent_bos_id(gen_text, bos_id=self.user_bos_id, is_asr=is_asr)
+            gen_text = self._remove_continuous_agent_bos_id(gen_text, bos_id=self.text_bos_id, is_asr=is_asr)
+            gen_text = self._remove_last_turn_if_short(gen_text, bos_id=self.user_bos_id, is_asr=is_asr)
+            gen_text = self._remove_last_turn_if_short(gen_text, bos_id=self.text_bos_id, is_asr=is_asr)
 
             # user_eos_indices = self._find_eou(gen_text, is_asr=True)
 
             # Split gen_text into alternating user and agent text segments
-            gen_text_src, gen_text_tgt = self._segment_alternating_user_agent_text(gen_text, is_asr=True)
-            
-            # Debug: Breakpoint if gen_text_src differs from gen_text for any batch b
-            src_text_cleaned = []
-            for b in range(gen_text.shape[0]):
-                gen_text_b = self.tokenizer.ids_to_text(gen_text_tgt[b])
-                gen_text_src_b = self.tokenizer.ids_to_text(gen_text_src[b])
-                gen_text_src_b = gen_text_src_b.rstrip("^")
-                # replace continuous ^ with a single one
-                import re
-                gen_text_src_b = re.sub(r"\^{2,}", "^", gen_text_src_b)
-                # Remove the text after the last ^ if it is only 1 word
-                if "^" in gen_text_src_b:
-                    last_caret_idx = gen_text_src_b.rfind("^")
-                    last_turn = gen_text_src_b[last_caret_idx+1:].strip()
-                    if last_turn and len(last_turn.split()) <= 1 and len(last_turn) and len(last_turn) < 5:
-                        gen_text_src_b = gen_text_src_b[:last_caret_idx+1]
-                if gen_text_src_b.count("^") > 1:
-                    print(f"Batch index with difference: {b}")
-                    print("gen_text:", gen_text_b)
-                    print("gen_text_src:", gen_text_src_b)
-                    # import pdb; pdb.set_trace()
-                src_text_cleaned.append(gen_text_src_b)
+            if self.cfg.get("eval_text_turn_taking", False):
+                user_eos_id = self.user_eos_id if is_asr else self.text_eos_id
+                gen_text_src, gen_text_tgt = self._segment_alternating_user_agent_text(
+                    gen_text, is_asr=self.cfg.get("is_asr", False), user_eos_id=user_eos_id)
 
-            gen_text = gen_text_tgt
+            # Adhoc clean up for user text
+            if is_asr:
+                # Debug: Breakpoint if gen_text_src differs from gen_text for any batch b
+                src_text_cleaned = []
+                for b in range(gen_text.shape[0]):
+                    gen_text_b = self.tokenizer.ids_to_text(gen_text_tgt[b])
+                    gen_text_src_b = self.tokenizer.ids_to_text(gen_text_src[b])
+                    gen_text_src_b = gen_text_src_b.rstrip("^")
+                    # replace continuous ^ with a single one
+                    import re
+                    gen_text_src_b = re.sub(r"\^{2,}", "^", gen_text_src_b)
+                    # Remove the text after the last ^ if it is only 1 word
+                    if "^" in gen_text_src_b:
+                        last_caret_idx = gen_text_src_b.rfind("^")
+                        last_turn = gen_text_src_b[last_caret_idx+1:].strip()
+                        if last_turn and len(last_turn.split()) <= 1 and len(last_turn) and len(last_turn) < 5:
+                            gen_text_src_b = gen_text_src_b[:last_caret_idx+1]
+                    if gen_text_src_b.count("^") > 1:
+                        print(f"Batch index with difference: {b}")
+                        print("gen_text:", gen_text_b)
+                        print("gen_text_src:", gen_text_src_b)
+                        # import pdb; pdb.set_trace()
+                    src_text_cleaned.append(gen_text_src_b)
+            elif self.cfg.get("eval_text_turn_taking", False):
+                src_text_cleaned = [self.tokenizer.ids_to_text(gen_text_src[b]) for b in range(gen_text_src.shape[0])]
+            else:
+                src_text_cleaned = None
+                gen_text_src = None
+
+            if self.cfg.get("eval_text_turn_taking", False):
+                gen_text = gen_text_tgt
+
+            # For display, use $ to display agent_bos since it is also user_eos
+            if self.cfg.get("display_agent_bos_as_user_eos", False):
+                agent_bos_id = self.text_bos_id
+                user_eos_id = self.user_eos_id
+                gen_text = gen_text.clone()
+                gen_text[gen_text == agent_bos_id] = user_eos_id
 
         ans = {
             "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, eval_text_turn_taking=self.cfg.get("eval_text_turn_taking", False)),
