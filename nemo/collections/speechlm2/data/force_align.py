@@ -145,6 +145,8 @@ class ForceAligner:
                 # Convert alignment to timestamped text
                 original_text = user_supervisions[i].text
                 timestamped_text = self._convert_wav2vec2_alignment_to_timestamped_text(alignment_result, original_text)
+                print(f'original_text: {original_text}')
+                print(f'timestamped_text: {timestamped_text}')
                 # Update the supervision text with force-aligned timestamps
                 user_supervisions[i].text = timestamped_text
     
