@@ -4,30 +4,31 @@
 BASE_PATH="/lustre/fsw/portfolios/llmservice/users/kevinhu/data/granary"
 SCRIPT_PATH="/lustre/fsw/portfolios/llmservice/users/kevinhu/s2s/NeMo/scripts/speech_data_generation/granary/clean_up_manifest.py"
 
-# Loop through YTC_en1 to YTC_en9
-for i in {5..9}; do
-    DATASET_DIR="${BASE_PATH}/YTC_en${i}"
+# Function to process a dataset directory
+process_dataset() {
+    local DATASET_DIR="$1"
+    local DATASET_NAME="$2"
     
-    echo "Processing YTC_en${i}..."
+    echo "Processing ${DATASET_NAME}..."
     
     # Check if dataset directory exists
     if [ ! -d "$DATASET_DIR" ]; then
         echo "Warning: Directory $DATASET_DIR does not exist, skipping..."
-        continue
+        return
     fi
     
     # Check if manifests directory exists
     MANIFESTS_DIR="${DATASET_DIR}/manifests"
     if [ ! -d "$MANIFESTS_DIR" ]; then
         echo "Warning: Manifests directory $MANIFESTS_DIR does not exist, skipping..."
-        continue
+        return
     fi
     
     # Check if tars directory exists
     TARS_DIR="${DATASET_DIR}/tars"
     if [ ! -d "$TARS_DIR" ]; then
         echo "Warning: Tars directory $TARS_DIR does not exist, skipping..."
-        continue
+        return
     fi
     
     # Create output directories if they don't exist
@@ -69,8 +70,18 @@ for i in {5..9}; do
         fi
     done
     
-    echo "Completed processing YTC_en${i}"
+    echo "Completed processing ${DATASET_NAME}"
     echo "----------------------------------------"
+}
+
+# Process YTC_en datasets (YTC_en1 to YTC_en4)
+for i in {10..16}; do
+    DATASET_DIR="${BASE_PATH}/YTC_en${i}"
+    process_dataset "$DATASET_DIR" "YTC_en${i}"
 done
+
+# Process LibriLight_en dataset
+# LIBRILIGHT_DIR="${BASE_PATH}/LibriLight_en/ll2/webds"
+# process_dataset "$LIBRILIGHT_DIR" "LibriLight_en/ll2/webds"
 
 echo "All datasets processed!"
