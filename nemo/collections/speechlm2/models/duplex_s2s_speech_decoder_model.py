@@ -42,6 +42,7 @@ from nemo.collections.speechlm2.data.utils import get_pad_id
 from nemo.collections.speechlm2.models.duplex_s2s_model import replace_control_speech_codes, tokens_to_str
 from nemo.collections.speechlm2.modules import EOUDecoder, EOUDecoderFromWav, TransformerARSpeechDecoder
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
+from nemo.collections.speechlm2.parts.label_prep import prepare_labels
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.metrics.asr_bleu import ASRBLEU
 from nemo.collections.speechlm2.parts.metrics.bleu import BLEU
@@ -60,47 +61,6 @@ from nemo.collections.speechlm2.parts.pretrained import (
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.utils import logging
 
-
-def delay_eos(tokens, eos_token_id, pad_token_id, shift=10):
-    """
-    Delays each EOS token by `shift` steps forward. Replaces original EOS with PAD.
-    Skips move if it would go out of bounds or overwrite another EOS/PAD.
-    Safe for GPU execution.
-    """
-    B, T = tokens.shape
-    tokens = tokens.clone()
-    device = tokens.device
-
-    # Find all EOS positions
-    eos_mask = tokens == eos_token_id
-    if not eos_mask.any():
-        return tokens
-
-    # Flattened indices of EOS tokens
-    eos_indices = eos_mask.nonzero(as_tuple=False)  # [N, 2]
-    b_idx = eos_indices[:, 0]  # [N]
-    eos_pos = eos_indices[:, 1]  # [N]
-    new_pos = eos_pos + shift  # [N]
-
-    # Filter: new position must be in bounds and not overwrite EOS or PAD
-    valid = (new_pos < T)
-    if valid.any():
-        b_idx = b_idx[valid]
-        old_pos = eos_pos[valid]
-        new_pos = new_pos[valid]
-
-        # Now, check overwrite safety in new positions
-        target_vals = tokens[b_idx, new_pos]
-        safe = (target_vals != eos_token_id)
-
-        if safe.any():
-            b_idx = b_idx[safe]
-            old_pos = old_pos[safe]
-            new_pos = new_pos[safe]
-            # Move EOS token: clear original, set new
-            tokens[b_idx, old_pos] = pad_token_id
-            tokens[b_idx, new_pos] = eos_token_id
-    return tokens
 
 def generate_multiturn_speaking_mask(input_ids: torch.Tensor, bos_token_id: int = 0, eos_token_id: int = 1):
     """
@@ -776,172 +736,42 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             ],
             dim=1,
         )
-        # move back text channel by x, in inference it advance the text channel prediction
-        # it is the oposite of speech delay applied on text channel
-        if self.advance_text_channel_by:
-            pad = torch.full(
-                (target_tokens.shape[0], self.advance_text_channel_by),
-                fill_value=self.text_pad_id,
-                device=target_tokens.device,
-                dtype=torch.long,
-            )
-            target_tokens = torch.cat([target_tokens[:, self.advance_text_channel_by :], pad], dim=-1)
-            # make sure that eos/bos is in the place (it can cut tokens from the first advance_text_channel_by tokens and this will breaks everything)
 
-        if self.cfg.get("delay_text_channel_by", 0) > 0:
-            delay_by = self.cfg.get("delay_text_channel_by", 0)
-
-            eos_mask = (target_tokens == self.text_eos_id) & (torch.arange(target_tokens.size(1), device=target_tokens.device).unsqueeze(0) >= (target_tokens.size(1) - delay_by))
-            for i in range(target_tokens.size(0)):
-                if eos_mask[i].any():
-                    target_tokens[i, -(delay_by)] = self.text_eos_id
-            target_tokens = torch.where(eos_mask, self.text_pad_id, target_tokens)
-            pad = torch.full(
-                (target_tokens.shape[0], delay_by),
-                fill_value=self.text_pad_id,
-                device=target_tokens.device,
-                dtype=torch.long,
-            )
-            target_tokens = torch.cat([pad, target_tokens[:, :-delay_by]], dim=-1)
-
-        original_target_tokens = target_tokens.clone()
-        if self.cfg.get("delay_text_eos_by", None):
-            target_tokens = delay_eos(target_tokens, self.text_eos_id, self.text_pad_id, shift=self.cfg.delay_text_eos_by)
-
-        if self.cfg.get("delay_text_bos_by", None):
-            target_tokens = delay_eos(target_tokens, self.text_bos_id, self.text_pad_id, shift=self.cfg.delay_text_bos_by)
-
-        if self.predict_user_text:
-            source_tokens = batch["source_tokens"]
-            user_bos_id = self.user_bos_id
-            user_eos_id = self.user_eos_id
-
-            if source_tokens.shape != target_tokens.shape:
-                min_len = min(source_tokens.shape[1], target_tokens.shape[1])
-                source_tokens = source_tokens[:, :min_len]
-                target_tokens = target_tokens[:, :min_len]
-                target_codes = target_codes[:, :min_len]
-                source_encoded = source_encoded[:, :min_len]
-                asr_emb = asr_emb[:, :min_len]
-
-            # Optionally delay the prediction of source_tokens by a flag
-            delay_source_text_by = self.cfg.get("delay_source_text_by", 0)
-            if delay_source_text_by > 0:
-                pad = torch.full(
-                    (source_tokens.shape[0], delay_source_text_by),
-                    fill_value=self.text_pad_id,
-                    device=source_tokens.device,
-                    dtype=torch.long,
-                )
-                source_tokens_delayed = torch.cat([pad, source_tokens[:, :-delay_source_text_by]], dim=-1)
-                # Add back user_eos_id since it may be truncated
-                source_tokens_delayed[:, -1] = user_eos_id
-
-            source_tokens_flat = source_tokens_delayed.clone()
-            target_tokens_flat = target_tokens.clone()
-
-            # For each batch, find all user_bos_id and user_eos_id pairs and build a user mask
-            mask = torch.zeros_like(source_tokens_flat, dtype=torch.bool)
-            for i in range(source_tokens_flat.size(0)):
-                src = source_tokens_flat[i]
-                user_bos_indices = (src == user_bos_id).nonzero(as_tuple=True)[0]
-                user_eos_indices = (src == user_eos_id).nonzero(as_tuple=True)[0]
-                for user_bos_idx in user_bos_indices:
-                    user_eos_after = user_eos_indices[user_eos_indices > user_bos_idx]
-                    if len(user_eos_after) == 0:
-                        continue
-                    user_eos_idx = user_eos_after[0]
-                    
-                    # In the case of agent_bos appear during user turn, take the agent_bos
-                    # uuuuu
-                    #    aaaaa --> uuuaaa
-                    bos_in_target = (target_tokens_flat[i, user_bos_idx:user_eos_idx] == self.text_bos_id).nonzero(as_tuple=True)
-                    if bos_in_target[0].numel() > 0:
-                        bos_in_target_idx = bos_in_target[0][0].item() + user_bos_idx
-                        user_eos_idx = min(user_eos_idx, bos_in_target_idx)
-                    
-                    # Check if there's a text_eos_id (agent turn end) between bos_idx and eos_idx
-                    # If so, move it to just before bos_idx to preserve agent turn boundary
-                    # aaaaa
-                    #    uuuuu --> aaauuuuu
-                    text_eos_in_range = (target_tokens_flat[i, user_bos_idx:user_eos_idx] == self.text_eos_id).nonzero(as_tuple=True)
-                    if text_eos_in_range[0].numel() > 0:
-                        text_eos_idx = text_eos_in_range[0][0].item() + user_bos_idx
-                        # Move the text_eos_id before bos_idx
-                        if self.cfg.get("force_move_text_eos_to_user_speech_start", False):
-                            new_eos_idx = min(user_bos_idx - 1, text_eos_idx - self.cfg.get("delay_text_channel_by", 1))
-                        else:
-                            new_eos_idx = user_bos_idx - 1
-                        target_tokens_flat[i, new_eos_idx] = self.text_eos_id
-                        # Clear the original text_eos_id position
-                        target_tokens_flat[i, text_eos_idx] = self.text_pad_id
-                    
-                    # Mark mask from bos_idx to eos_idx-1 (inclusive of bos, exclusive of eos)
-                    mask[i, user_bos_idx:user_eos_idx] = True
-
-            target_tokens = torch.where(mask, source_tokens_flat, target_tokens_flat)
-            logging.info(f"target_tokens[0] w/ delay of {delay_source_text_by}: {target_tokens[0]}")
-
-        if self.cfg.get("debug", False):
-            import pdb; pdb.set_trace()
-            i = 0
-            target_tokens_flat_masked = target_tokens_flat[i]*(target_tokens_flat[i] != self.text_pad_id)
-            print(f"target_tokens_flat[i]:", target_tokens_flat_masked)
-            target_tokens_masked = target_tokens[i]*(target_tokens[i] != self.text_pad_id)
-            print(f"target_tokens[i]:", target_tokens_masked)
-            source_tokens_flat_masked = source_tokens_flat[i]*(source_tokens_flat[i] != self.text_pad_id)
-            print(f"source_tokens_flat[i]:", source_tokens_flat_masked)
-            stacked = torch.stack([source_tokens_flat_masked, target_tokens_flat_masked], dim=1)
-            print("stacked[:500]:", stacked[:500])
-            import pdb; pdb.set_trace()
-
-        input_ids = torch.cat([target_codes, target_tokens[..., None]], dim=-1)
-        if self._use_tp:
-            tp_world_size = self.device_mesh["tensor_parallel"].size()
-            if (remainder := (input_ids.shape[1] - 1) % tp_world_size) != 0:
-                input_ids = input_ids[:, :-remainder]
-                source_encoded = source_encoded[:, :-remainder]
-                asr_emb = asr_emb[:, :-remainder]        
-
-        text_inputs = input_ids[:, :-1, -1]  # (B, T-1)
-        text_labels = input_ids[:, 1:, -1]  # (B, T-1)
+        # Prepare labels (asr tet, agent text, and audio)
+        inputs = prepare_labels(
+            batch=batch,
+            target_codes=target_codes,
+            target_tokens=target_tokens,
+            source_encoded=source_encoded,
+            asr_emb=asr_emb,
+            cfg=self.cfg,
+            predict_user_text=self.predict_user_text,
+            user_bos_id=self.user_bos_id,
+            user_eos_id=self.user_eos_id,
+            text_pad_id=self.text_pad_id,
+            text_bos_id=self.text_bos_id,
+            text_eos_id=self.text_eos_id,
+            advance_text_channel_by=self.advance_text_channel_by,
+            use_tp=self._use_tp,
+            device_mesh=self.device_mesh if self._use_tp else None,
+        )
+        
+        source_encoded = inputs["source_encoded"]
+        text_inputs = inputs["text_inputs"]
+        text_labels = inputs["text_labels"]
+        audio_inputs = inputs["audio_inputs"]
+        audio_labels = inputs["audio_labels"]
         if self.cfg.get("use_separate_asr_head", False):
-            asr_ids = input_ids.clone()[:, :, -1]
-            if self.cfg.get("is_conv", False):
-                # Remove all ids between self.text_bos_id and self.text_eos_id and replace with self.text_pad_id.
-                # Keep the self.text_eos_id and remove the self.text_bos_id.
-                for i in range(asr_ids.shape[0]):
-                    bos_indices = (asr_ids[i] == self.text_bos_id).nonzero(as_tuple=True)[0]
-                    eos_indices = (asr_ids[i] == self.text_eos_id).nonzero(as_tuple=True)[0]
-                    for bos_idx in bos_indices:
-                        eos_after = eos_indices[eos_indices > bos_idx]
-                        if len(eos_after) == 0:
-                            # This is the last turn
-                            eos_after = torch.tensor([asr_ids.shape[1] - 1], device=asr_ids.device)
-                        eos_idx = eos_after[0]
-                        asr_ids[i, bos_idx+1:eos_idx+1] = self.text_pad_id
-            asr_inputs = asr_ids[:, :-1]
-            asr_labels = asr_ids[:, 1:]
-            if not self.cfg.get("force_use_asr_head_for_user_agent_text", False):
-                text_inputs = target_tokens_flat[:, :-1]
-                text_labels = target_tokens_flat[:, 1:]
-        audio_inputs = input_ids[:, :-1, :-1]  # (B, T-1, K)
-        audio_labels = input_ids[:, 1:, :-1]  # (B, T-1, K)
-
-        if self.cfg.get("debug", False):
-            import pdb; pdb.set_trace()
-            # ori_stacked = torch.stack([batch['source_tokens'][0]*(batch['source_tokens'][0]!=self.text_pad_id), batch['target_tokens'][0]*(batch['target_tokens'][0]!=self.text_pad_id)], dim=1)
-            # print("ori_stacked[:500]:", ori_stacked)
-            # i = 0
-            # asr_masked  = asr_labels[i][-1000:]  * (asr_labels[i][-1000:]  != 151643)
-            # text_masked = text_labels[i][-1000:] * (text_labels[i][-1000:] != 151643)
-            # stacked = torch.stack([asr_masked, text_masked], dim=1)
-            # print("stacked:", stacked[-200:])
-            # import pdb; pdb.set_trace()
+            asr_inputs = inputs["asr_inputs"]
+            asr_labels = inputs["asr_labels"]
             
 
         input_embeds = self.embed_tokens(text_inputs) * self.cfg.get("duplex_text_channel_weight", 1.0)
-        input_embeds.add_(source_encoded[:, :-1] * self.cfg.get("duplex_user_channel_weight", 1.0))
+        try:
+            input_embeds.add_(source_encoded[:, :-1] * self.cfg.get("duplex_user_channel_weight", 1.0))
+        except:
+            import pdb; pdb.set_trace()
+
         if self.cfg.get("use_separate_asr_head", False):
             asr_inputs_embeds = self.embed_asr_tokens(asr_inputs)
             input_embeds.add_(asr_inputs_embeds * self.cfg.get("duplex_asr_text_weight", 1.0))
@@ -1383,7 +1213,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     pred_audio=resample(results["audio"], 22050, 16000),
                     pred_audio_lens=(results["audio_len"] / 22050 * 16000).to(torch.long),
                 )
-
+                
                 self.results_logger.update(
                     name=name,
                     refs=dataset_batch["target_texts"],
@@ -1419,7 +1249,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.text_bos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
             self.text_eos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
             if self.predict_user_text:
-                src_text_clean = [s.replace("^", "").replace("$", "") for s in results["src_text"]]
+                src_text_clean = [s.replace("^", " ").replace("$", " ") for s in results["src_text"]]
                 self.src_bleu.update(name=name, refs=dataset_batch["source_texts"], hyps=src_text_clean)
                 self.src_text_bos_acc.update(name=name, refs=dataset_batch["source_tokens"], hyps=results["tokens_text_src"])
                 self.src_wer.update(name=name, refs=dataset_batch["source_texts"], hyps=src_text_clean)
@@ -1832,6 +1662,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             gen_text_tgt = gen_text.clone()
             gen_text_tgt[~tgt_mask] = self.text_pad_id
             gen_text = gen_text_tgt
+
+            src_text_cleaned = [self.tokenizer.ids_to_text(gen_text_src[b]) for b in range(gen_text_src.shape[0])]
         elif self.predict_user_text:
             # Multi-turn decoding, including
             # 1) Joint ASR + EOU (pontentially multi-turn), or

@@ -188,6 +188,45 @@ def init_vad_model():
     return vad_model, get_speech_timestamps
 
 
+def extract_segments_from_binary_audio(audio, sample_rate=16000):
+    """
+    Extract speech segments from binary audio where 1s indicate agent is active.
+    
+    Args:
+        audio: Tensor of shape (1, num_samples) with values 0 or 1
+        sample_rate: Sample rate of the audio (default: 16000)
+    
+    Returns:
+        List of dicts with 'start' and 'end' times in seconds
+    """
+    # Flatten audio to 1D array
+    audio_flat = audio.squeeze().cpu().numpy()
+    
+    segments = []
+    in_segment = False
+    start_idx = 0
+    
+    for i, val in enumerate(audio_flat):
+        if val > 0.5 and not in_segment:  # Start of active segment
+            in_segment = True
+            start_idx = i
+        elif val <= 0.5 and in_segment:  # End of active segment
+            in_segment = False
+            segments.append({
+                'start': start_idx / sample_rate,
+                'end': i / sample_rate
+            })
+    
+    # Handle case where audio ends while in a segment
+    if in_segment:
+        segments.append({
+            'start': start_idx / sample_rate,
+            'end': len(audio_flat) / sample_rate
+        })
+    
+    return segments
+
+
 def compute_barge_in_metrics(success_barge_ins, failed_barge_ins):
     """
     Compute barge-in metrics including success rate and counts.
@@ -318,6 +357,7 @@ def get_filtered_wav_keys(pred_audio_dir, validation_set_name):
     for fname in wav_files:
         # Remove prefix
         name_wo_prefix = fname[prefix_len:]
+        name_wo_prefix = name_wo_prefix[1:] if name_wo_prefix[0] == '_' else name_wo_prefix
         # Remove .wav suffix
         if name_wo_prefix.lower().endswith('.wav'):
             name_wo_prefix = name_wo_prefix[:-4]
@@ -487,6 +527,7 @@ def main(args):
                     with tarfile.open(recording_tar_path, 'r') as recording_tar:
                         with gzip.open(cuts_path, 'rt', encoding='utf-8') as f:
                             # load from pred_audio_path
+                            import pdb; pdb.set_trace()
                             pred_audio_file = get_pred_audio_path(pred_audio_dir, filtered_wav_key, val_set_name)
                             if not os.path.exists(pred_audio_file):
                                 print(f"File not found: {pred_audio_file}")
@@ -517,12 +558,17 @@ def main(args):
             user_audio = torchaudio.functional.resample(user_audio, user_audio_sr, 16000)
             agent_audio = torchaudio.functional.resample(agent_audio, agent_audio_sr, 16000)
             
-            # Use timestamped predictions for agent segments if available, otherwise use VAD
+            # Use timestamped predictions for agent segments if available, otherwise use VAD or binary audio
             if timestamped_preds and filtered_wav_key in timestamped_preds:
                 print(f"Using timestamped text predictions for {filtered_wav_key}")
                 timestamped_text = timestamped_preds[filtered_wav_key]
                 agent_segments = parse_timestamped_text(timestamped_text)
                 print(f"Parsed {len(agent_segments)} agent segments from timestamped text")
+            elif args.agent_binary_audio:
+                # Extract segments from binary audio (0s and 1s)
+                print(f"Extracting agent segments from binary audio for {filtered_wav_key}")
+                agent_segments = extract_segments_from_binary_audio(agent_audio, sample_rate=16000)
+                print(f"Extracted {len(agent_segments)} agent segments from binary audio")
             else:
                 # Fallback to VAD-based segmentation
                 agent_vad_results = get_speech_timestamps(agent_audio.to('cuda'), vad_model, sampling_rate=16000, min_silence_duration_ms=args.vad_min_silence_duration_ms)
@@ -644,6 +690,7 @@ def parse_args():
     parser.add_argument("--is_stereo", action="store_true", default=True, help="Whether the audio is stereo.")
     parser.add_argument("--jsonl_with_timestamp", type=str, default=None, help="Path to JSONL file with timestamped text predictions. Each line should have 'pred_text' field with text containing <|timestamp|> markers.")
     parser.add_argument("--vad_min_silence_duration_ms", type=int, default=1500, help="Minimum silence duration in milliseconds for VAD.")
+    parser.add_argument("--agent_binary_audio", action="store_true", default=False, help="Whether the agent audio is binary (0s and 1s) indicating active/inactive segments instead of actual speech audio.")
     return parser.parse_args()
 
 if __name__ == "__main__":

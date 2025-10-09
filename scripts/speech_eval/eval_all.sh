@@ -8,13 +8,15 @@
 # EXP_NAME=IAD_qwen_1b_sft_pt_4nodes_pt0.9sft0.05st0.05_na0.5_snr0.5-30-60_ta0_percep && CKPT_NAME=step-7001-last
 # EXP_NAME=IAD_qwen_1b_sft_pt-bd200_4nodes_pt0.9sft0.05st0.05_na0.5_snr0.5-30-60_ta0_percep_hdd0_ptbd200 && CKPT_NAME=step-10932-last
 # EXP_NAME=IAD_qwen_1b_sft_pt-bd200_4nodes_pt0.9sft0.05st0.05_na0.5_snr0.5-30-60_ta0_percep_hdd4_ptbd200 && CKPT_NAME=step-11358-last
-EXP_NAME=IAD_qwen_1b_convasr_joint_4nodes_left4_asrl3_txtl3_initsa-hdd4s2sta0 && CKPT_NAME=step-10726-last
-
+# EXP_NAME=IAD_qwen_1b_convasr_joint_4nodes_left4_asrl3_txtl3_initsa-hdd4s2sta0 && CKPT_NAME=step-10726-last
+# EXP_NAME=IAD_qwen_1b_convasr_joint_pt-bd200_4nodes_sa_left4_asrl3_txtl3_pt0.45asr0.45sft0.05 && CKPT_NAME=step-21304-last
+# EXP_NAME=IAD_qwen_1b_convasr_joint_pt-bd200_4nodes_sa_left4_asrl3_txtl3_pt0.9asr0.05sft0.05_fa && CKPT_NAME=step-10543-last
+EXP_NAME=IAD_qwen_1b_convasr_joint_pt-bd200_4nodes_sa_15_left8_asrl3_txtl3_pt0.9asr0.05sft0.05_fa_snr0.5-30-60_ta0 && CKPT_NAME=step-10397-last
 
 CODE_DIR=/lustre/fsw/portfolios/llmservice/users/kevinhu/s2s/NeMo
 
-bash ${CODE_DIR}/scripts/speech_eval/eval_candor_turn_taking_text.sh ${EXP_NAME} ${CKPT_NAME}
-sleep 5
-bash ${CODE_DIR}/scripts/speech_eval/eval_conv.sh ${EXP_NAME} ${CKPT_NAME}
-sleep 5
+# bash ${CODE_DIR}/scripts/speech_eval/eval_candor_turn_taking_text.sh ${EXP_NAME} ${CKPT_NAME}
+# sleep 5
+# bash ${CODE_DIR}/scripts/speech_eval/eval_conv.sh ${EXP_NAME} ${CKPT_NAME}
+# sleep 5
 bash ${CODE_DIR}/scripts/speech_eval/eval_intel.sh ${EXP_NAME} ${CKPT_NAME}

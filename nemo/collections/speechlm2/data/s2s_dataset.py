@@ -249,7 +249,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             first_non_pad_idx = (target_tokens[0] != self.tokenizer.pad_id).nonzero(as_tuple=True)[0][0].item() if (target_tokens[0] != self.tokenizer.pad_id).any() else None
             print("First non-pad token index in target_tokens[0]:", first_non_pad_idx)
             print('Agent start timestamp: ', int(cuts[0].supervisions[1].start / 0.08))
-            import pdb; pdb.set_trace()
+            # import pdb; pdb.set_trace()
 
         return {
             "sample_id": [str(cut.id) for cut in cuts],

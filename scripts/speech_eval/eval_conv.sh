@@ -72,9 +72,11 @@ CKPT_NAME=$2
 
 # log_dir=/lustre/fsw/portfolios/llmservice/users/kevinhu/s2s/exp/${EXP_NAME}/inf/${CKPT_NAME}/validation_logs
 log_dir=/lustre/fsw/portfolios/llmservice/users/kevinhu/s2s/exp/${EXP_NAME}/inf_all/${CKPT_NAME}/validation_logs
-
 pred_audio_dir=${log_dir}/pred_wavs/
+
+# Merge demo_rank0.json through demo_rank7.json into demo.json
 jsonl_with_timestamp=${log_dir}/metadatas/demo.json
+
 output_log=${jsonl_with_timestamp}.log
 barge_in_threshold_sec=1.5
 end_time=None  # Note that this comes from predefined values when creating backchanneling data
