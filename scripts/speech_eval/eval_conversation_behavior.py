@@ -7,6 +7,7 @@ import tarfile
 import gzip
 import json, os, re
 import argparse
+from nemo.collections import asr as nemo_asr
 
 INF_LATENCY = 9999.0
 
@@ -27,10 +28,14 @@ def parse_timestamped_text(text_with_timestamps):
     bos_pattern = r'<\|([\d\.]+)\|>'
     eos_pattern = r'<\$([\d\.]+)\$>'
     
-    bos_timestamps = [float(match.group(1)) for match in re.finditer(bos_pattern, text_with_timestamps)]
-    eos_timestamps = [float(match.group(1)) for match in re.finditer(eos_pattern, text_with_timestamps)]
+    # Find all BOS and EOS markers with their positions
+    bos_matches = list(re.finditer(bos_pattern, text_with_timestamps))
+    eos_matches = list(re.finditer(eos_pattern, text_with_timestamps))
     
-    # Convert timestamps to agent segments
+    bos_timestamps = [float(match.group(1)) for match in bos_matches]
+    eos_timestamps = [float(match.group(1)) for match in eos_matches]
+    
+    # Convert timestamps to agent segments with text
     agent_segments = []
     
     # If we have both BOS and EOS timestamps, pair them up
@@ -38,37 +43,60 @@ def parse_timestamped_text(text_with_timestamps):
         for i, start_time in enumerate(bos_timestamps):
             # Find the corresponding EOS timestamp (next EOS after this BOS)
             end_time = None
-            for eos_time in eos_timestamps:
+            eos_idx = None
+            for j, eos_time in enumerate(eos_timestamps):
                 if eos_time > start_time:
                     end_time = eos_time
+                    eos_idx = j
                     break
+            
+            # Extract text between BOS and EOS markers
+            text = ""
+            if end_time is not None and i < len(bos_matches) and eos_idx < len(eos_matches):
+                bos_end_pos = bos_matches[i].end()
+                eos_start_pos = eos_matches[eos_idx].start()
+                text = text_with_timestamps[bos_end_pos:eos_start_pos].strip()
             
             if end_time is not None:
                 agent_segments.append({
                     'start': start_time,
-                    'end': end_time
+                    'end': end_time,
+                    'text': text
                 })
             else:
                 # No corresponding EOS found, use default duration
                 agent_segments.append({
                     'start': start_time,
-                    'end': start_time + 5.0
+                    'end': start_time + 5.0,
+                    'text': text
                 })
     
     # Fallback: if only BOS timestamps are available, add default value
     elif bos_timestamps:
         for i, timestamp in enumerate(bos_timestamps):
+            # Extract text between this BOS and next BOS
+            text = ""
+            if i < len(bos_matches):
+                bos_end_pos = bos_matches[i].end()
+                if i < len(bos_matches) - 1:
+                    next_bos_start_pos = bos_matches[i + 1].start()
+                    text = text_with_timestamps[bos_end_pos:next_bos_start_pos].strip()
+                else:
+                    text = text_with_timestamps[bos_end_pos:].strip()
+            
             if i < len(bos_timestamps) - 1:
                 # Segment from current timestamp to next timestamp
                 agent_segments.append({
                     'start': timestamp,
-                    'end': bos_timestamps[i + 1]
+                    'end': bos_timestamps[i + 1],
+                    'text': text
                 })
             else:
                 # Last segment - assume it lasts for a reasonable duration
                 agent_segments.append({
                     'start': timestamp,
-                    'end': timestamp + 5.0  # Default 5 seconds for last segment
+                    'end': timestamp + 5.0,
+                    'text': text
                 })
     
     return agent_segments
@@ -157,18 +185,18 @@ def find_user_barge_ins(user_turns, agent_turns, threshold_seconds=0.5):
         a_start, a_end = agent_turns[j]['start'], agent_turns[j]['end']
 
         # Check if user started speaking during agent's turn
-        if u_start < a_end and u_start > a_start:
-            overlap_start = max(u_start, a_start)
-            overlap_end = min(u_end, a_end)
-            overlap_duration = round((overlap_end - overlap_start) * 1000)
+        if u_start > a_start and u_start < a_end:
+            # overlap_start = max(u_start, a_start)
+            # overlap_end = min(u_end, a_end)
+            stop_duration_ms = round((a_end - u_start) * 1000)
             
             barge_in_info = {
-                'overlap_ms': overlap_duration,
+                'stop_duration_ms': stop_duration_ms,
                 'user': user_turns[i],
                 'agent': agent_turns[j]
             }
             
-            if overlap_duration < threshold_seconds * 1000:
+            if stop_duration_ms < threshold_seconds * 1000:
                 success_barge_ins.append(barge_in_info)
             else:
                 failed_barge_ins.append(barge_in_info)
@@ -186,6 +214,86 @@ def init_vad_model():
     vad_model = vad_model.to('cuda')
     get_speech_timestamps, _, _, _, _ = utils
     return vad_model, get_speech_timestamps
+
+
+def init_asr_model(model_name="nvidia/parakeet-tdt-0.6b-v2"):
+    """Initialize ASR model for transcription using NeMo."""
+    print(f"Loading ASR model: {model_name}")
+    asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name=model_name).cuda()
+    print("ASR model loaded successfully.")
+    return asr_model
+
+
+def transcribe_segment(audio, start_time, end_time, sample_rate, asr_model, temp_dir="/tmp"):
+    """
+    Transcribe a specific segment of audio using NeMo ASR.
+    
+    Args:
+        audio: Audio tensor of shape (channels, samples)
+        start_time: Start time in seconds
+        end_time: End time in seconds
+        sample_rate: Sample rate of the audio
+        asr_model: NeMo ASR model
+        temp_dir: Temporary directory for saving audio segments
+    
+    Returns:
+        tuple: (transcribed_text, end_timestamp) where end_timestamp is the end time of last spoken word
+    """
+    import tempfile
+    
+    try:
+        # Extract segment
+        start_sample = int(start_time * sample_rate)
+        end_sample = int(end_time * sample_rate)
+        segment_audio = audio[:, start_sample:end_sample]
+        
+        # Skip very short segments
+        if segment_audio.shape[1] < 160:  # Less than 10ms at 16kHz
+            return "", 0.0
+        
+        # Resample to 16kHz if needed
+        if sample_rate != 16000:
+            segment_audio = torchaudio.functional.resample(segment_audio, sample_rate, 16000)
+            sample_rate = 16000
+        
+        # Convert to mono if stereo
+        if segment_audio.shape[0] > 1:
+            segment_audio = torch.mean(segment_audio, dim=0, keepdim=True)
+        
+        # Save to temporary file for NeMo API
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=temp_dir) as tmp_file:
+            tmp_path = tmp_file.name
+            torchaudio.save(tmp_path, segment_audio.cpu(), sample_rate)
+        
+        # Transcribe using NeMo API with timestamps
+        asr_outputs = asr_model.transcribe([tmp_path], timestamps=True)
+        
+        # Clean up temporary file
+        os.remove(tmp_path)
+        
+        if not asr_outputs:
+            return "", 0.0
+        
+        # Get the transcription result
+        result = asr_outputs[0]
+        text = result.text if hasattr(result, 'text') else ""
+        
+        # Extract end timestamp of the last word
+        end_timestamp = 0.0
+        if hasattr(result, 'timestamp') and result.timestamp and 'word' in result.timestamp:
+            word_timestamps = result.timestamp["word"]
+            if word_timestamps and len(word_timestamps) > 0:
+                last_word = word_timestamps[-1]
+                if isinstance(last_word, dict) and 'end' in last_word:
+                    end_timestamp = last_word['end']
+        elif hasattr(result, 'end_time'):
+            end_timestamp = result.end_time
+        
+        return text.strip(), end_timestamp
+        
+    except Exception as e:
+        print(f"Error transcribing segment [{start_time:.3f}s - {end_time:.3f}s]: {str(e)}")
+        return "", 0.0
 
 
 def extract_segments_from_binary_audio(audio, sample_rate=16000):
@@ -256,7 +364,7 @@ def compute_barge_in_metrics(success_barge_ins, failed_barge_ins):
         metrics['success_rate'] = (success_count / total_barge_ins) * 100
         
     if success_count > 0:
-        metrics['avg_latency_ms'] = sum(bi['overlap_ms'] for bi in success_barge_ins) / success_count
+        metrics['avg_latency_ms'] = sum(bi['stop_duration_ms'] for bi in success_barge_ins) / success_count
     
     return metrics
 
@@ -276,6 +384,8 @@ def print_metrics(metrics_dict, verbose=False):
             - agent_segments: List of agent speech segments (if verbose=True)
             - success_barge_ins: List of successful barge-in events (if verbose=True)
             - failed_barge_ins: List of failed barge-in events (if verbose=True)
+            - user_transcripts: Dict mapping (start, end) to transcript (optional)
+            - agent_transcripts: Dict mapping (start, end) to transcript (optional)
         verbose: If True, print detailed segment information
     """
     if not verbose:
@@ -292,7 +402,60 @@ def print_metrics(metrics_dict, verbose=False):
     # Build segment information section if verbose
     segment_info = ""
     if verbose:
-        # General speech segments
+        # Get transcripts if available
+        user_transcripts = metrics_dict.get('user_transcripts', {})
+        agent_transcripts = metrics_dict.get('agent_transcripts', {})
+        
+        # General speech segments - combine and sort by start time
+        all_segments = []
+        for seg in metrics_dict['user_segments']:
+            all_segments.append({'type': 'User', 'start': seg['start'], 'end': seg['end']})
+        for seg in metrics_dict['agent_segments']:
+            all_segments.append({'type': 'Agent', 'start': seg['start'], 'end': seg['end']})
+        
+        # Sort by start time
+        all_segments.sort(key=lambda x: x['start'])
+        
+        # Calculate response latencies for each user segment
+        user_to_agent_latencies = {}
+        for user_seg in metrics_dict['user_segments']:
+            # Find the next agent segment that starts after this user segment ends
+            next_agent = None
+            min_latency = float('inf')
+            for agent_seg in metrics_dict['agent_segments']:
+                if agent_seg['start'] >= user_seg['end']:
+                    latency = agent_seg['start'] - user_seg['end']
+                    if latency < min_latency:
+                        min_latency = latency
+                        next_agent = agent_seg
+            
+            if next_agent:
+                # Use a tuple of (start, end) as key to uniquely identify the segment
+                user_to_agent_latencies[(user_seg['start'], user_seg['end'])] = min_latency
+        
+        # Format segments in chronological order with colors and latencies
+        # ANSI color codes: \033[94m = Blue (User), \033[92m = Green (Agent), \033[0m = Reset
+        def format_segment(seg):
+            seg_key = (seg['start'], seg['end'])
+            transcript = ""
+            
+            if seg['type'] == 'User':
+                if seg_key in user_transcripts:
+                    transcript = f" ({user_transcripts[seg_key]})"
+                
+                if seg_key in user_to_agent_latencies:
+                    latency = user_to_agent_latencies[seg_key]
+                    return f"   \033[94m{seg['type']:5s}\033[0m [{seg['start']:6.3f}s - {seg['end']:6.3f}s], \033[93m{latency:.3f}s\033[0m{transcript}"
+                else:
+                    return f"   \033[94m{seg['type']:5s}\033[0m [{seg['start']:6.3f}s - {seg['end']:6.3f}s]{transcript}"
+            else:  # Agent
+                if seg_key in agent_transcripts:
+                    transcript = f" ({agent_transcripts[seg_key]})"
+                return f"   \033[92m{seg['type']:5s}\033[0m [{seg['start']:6.3f}s - {seg['end']:6.3f}s]{transcript}"
+        
+        segments_str = "\n".join(format_segment(seg) for seg in all_segments)
+        
+        # Also keep the old format for backwards compatibility
         user_segments_str = ", ".join(f"   [{seg['start']:.3f}s - {seg['end']:.3f}s]" for seg in metrics_dict['user_segments'])
         agent_segments_str = ", ".join(f"   [{seg['start']:.3f}s - {seg['end']:.3f}s]" for seg in metrics_dict['agent_segments'])
         
@@ -304,21 +467,19 @@ def print_metrics(metrics_dict, verbose=False):
                 for bi in metrics_dict['success_barge_ins']:
                     barge_in_segments.append(f"     User: [{bi['user']['start']:.3f}s - {bi['user']['end']:.3f}s]")
                     barge_in_segments.append(f"     Agent: [{bi['agent']['start']:.3f}s - {bi['agent']['end']:.3f}s]")
-                    barge_in_segments.append(f"     Overlap: {bi['overlap_ms']:.3f} ms")
+                    barge_in_segments.append(f"     Stop duration: {bi['stop_duration_ms']:.3f} ms")
             
             if metrics_dict['failed_barge_ins']:
                 barge_in_segments.append("   Failed barge-ins:")
                 for bi in metrics_dict['failed_barge_ins']:
                     barge_in_segments.append(f"     User: [{bi['user']['start']:.3f}s - {bi['user']['end']:.3f}s]")
                     barge_in_segments.append(f"     Agent: [{bi['agent']['start']:.3f}s - {bi['agent']['end']:.3f}s]")
-                    barge_in_segments.append(f"     Overlap: {bi['overlap_ms']:.3f} ms")
+                    barge_in_segments.append(f"     Stop duration: {bi['stop_duration_ms']:.3f} ms")
 
         segment_info = f"""
-4. User speech segments:
-{user_segments_str}
-5. Agent speech segments:
-{agent_segments_str}
-6. Barge-in details:
+4. Speech segments (chronological order):
+{segments_str}
+5. Barge-in details:
 {chr(10).join(barge_in_segments) if barge_in_segments else "   No barge-ins detected"}"""
 
     # Build the complete output string
@@ -468,6 +629,11 @@ def compute_turn_taking_metrics(agent_segments, user_segments, tt_latency_thresh
 
 def main(args):
     vad_model, get_speech_timestamps = init_vad_model()
+    
+    # Initialize ASR model for transcription if requested
+    asr_model = None
+    if args.enable_transcription:
+        asr_model = init_asr_model(args.asr_model_name)
 
     manifest_dir = args.manifest_dir
     pred_audio_dir= args.pred_audio_dir
@@ -527,7 +693,6 @@ def main(args):
                     with tarfile.open(recording_tar_path, 'r') as recording_tar:
                         with gzip.open(cuts_path, 'rt', encoding='utf-8') as f:
                             # load from pred_audio_path
-                            import pdb; pdb.set_trace()
                             pred_audio_file = get_pred_audio_path(pred_audio_dir, filtered_wav_key, val_set_name)
                             if not os.path.exists(pred_audio_file):
                                 print(f"File not found: {pred_audio_file}")
@@ -559,9 +724,12 @@ def main(args):
             agent_audio = torchaudio.functional.resample(agent_audio, agent_audio_sr, 16000)
             
             # Use timestamped predictions for agent segments if available, otherwise use VAD or binary audio
-            if timestamped_preds and filtered_wav_key in timestamped_preds:
-                print(f"Using timestamped text predictions for {filtered_wav_key}")
-                timestamped_text = timestamped_preds[filtered_wav_key]
+            # Find the full key that contains filtered_wav_key as a substring
+            matching_key = next((k for k in timestamped_preds.keys() if filtered_wav_key in k), None) if timestamped_preds else None
+            
+            if matching_key:
+                print(f"Using timestamped text predictions for {matching_key}")
+                timestamped_text = timestamped_preds[matching_key]
                 agent_segments = parse_timestamped_text(timestamped_text)
                 print(f"Parsed {len(agent_segments)} agent segments from timestamped text")
             elif args.agent_binary_audio:
@@ -613,6 +781,29 @@ def main(args):
             bc_accuracy = sum(1 for x in bc_failure if not x) / len(bc_failure) if bc_failure else 0
             all_bc_accuracies.append(bc_accuracy)
 
+            # Transcribe/extract text for segments
+            user_transcripts = {}
+            agent_transcripts = {}
+            
+            # Extract agent text from timestamped predictions if available
+            if timestamped_preds and matching_key:
+                timestamped_text = timestamped_preds[matching_key]
+                agent_segments_with_text = parse_timestamped_text(timestamped_text)
+                # Convert list to dict with (start, end) tuples as keys
+                agent_transcripts = {(seg['start'], seg['end']): seg.get('text', '') for seg in agent_segments_with_text}
+            
+            # Transcribe user segments with ASR if enabled
+            if asr_model is not None:
+                print(f"Transcribing {len(user_segments)} user segments...")
+                
+                # Transcribe user segments
+                for seg in user_segments:
+                    transcript, end_ts = transcribe_segment(
+                        user_audio, seg['start'], seg['end'], 
+                        16000, asr_model
+                    )
+                    user_transcripts[(seg['start'], seg['end'])] = transcript
+
             # Collect all metrics in a dictionary
             metrics_dict = {
                 'item_id': filtered_wav_key,
@@ -626,7 +817,9 @@ def main(args):
                 'user_segments': user_segments,
                 'agent_segments': agent_segments,
                 'success_barge_ins': success_barge_ins,
-                'failed_barge_ins': failed_barge_ins
+                'failed_barge_ins': failed_barge_ins,
+                'user_transcripts': user_transcripts,
+                'agent_transcripts': agent_transcripts
             }
 
             # Print all metrics
@@ -691,6 +884,8 @@ def parse_args():
     parser.add_argument("--jsonl_with_timestamp", type=str, default=None, help="Path to JSONL file with timestamped text predictions. Each line should have 'pred_text' field with text containing <|timestamp|> markers.")
     parser.add_argument("--vad_min_silence_duration_ms", type=int, default=1500, help="Minimum silence duration in milliseconds for VAD.")
     parser.add_argument("--agent_binary_audio", action="store_true", default=False, help="Whether the agent audio is binary (0s and 1s) indicating active/inactive segments instead of actual speech audio.")
+    parser.add_argument("--enable_transcription", action="store_true", default=True, help="Enable transcription of user segments using ASR model. Agent text is automatically extracted from --jsonl_with_timestamp if provided.")
+    parser.add_argument("--asr_model_name", type=str, default="nvidia/parakeet-tdt-0.6b-v2", help="Name of the ASR model to use for transcription of user segments.")
     return parser.parse_args()
 
 if __name__ == "__main__":

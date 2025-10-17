@@ -1,5 +1,9 @@
 #!/bin/bash
 
+export TORCH_HOME="/lustre/fsw/portfolios/convai/users/kevinhu/results/HFCACHE"
+export NEMO_CACHE_DIR="/lustre/fsw/portfolios/convai/users/kevinhu/results/HFCACHE"
+export HF_HOME="/lustre/fsw/portfolios/convai/users/kevinhu/results/HFCACHE"
+
 CODE_DIR=/lustre/fsw/portfolios/llmservice/users/kevinhu/s2s/NeMo
 
 function eval_conv() {
@@ -69,22 +73,26 @@ validation_set_name="demo"
 # EXP_NAME=IAD_qwen_1b_sft_pt_4nodes_pt0.8sft0.1st0.1_na0.5_snr0.5-6-60 && CKPT_NAME=step-6001-last
 EXP_NAME=$1
 CKPT_NAME=$2
+INF_NAME=$3
+TEST_NAME="${4:-demo}"
+TT_RECALL_BUFFER_SEC="${5:-1}"
+TT_PRECISION_BUFFER_SEC="${6:-1}"
 
 # log_dir=/lustre/fsw/portfolios/llmservice/users/kevinhu/s2s/exp/${EXP_NAME}/inf/${CKPT_NAME}/validation_logs
-log_dir=/lustre/fsw/portfolios/llmservice/users/kevinhu/s2s/exp/${EXP_NAME}/inf_all/${CKPT_NAME}/validation_logs
+log_dir=/lustre/fsw/portfolios/llmservice/users/kevinhu/s2s/exp/${EXP_NAME}/inf_all_boost/${CKPT_NAME}/${INF_NAME}/validation_logs
 pred_audio_dir=${log_dir}/pred_wavs/
 
 # Merge demo_rank0.json through demo_rank7.json into demo.json
-jsonl_with_timestamp=${log_dir}/metadatas/demo.json
+jsonl_with_timestamp=${log_dir}/metadatas/${TEST_NAME}.json
 
 output_log=${jsonl_with_timestamp}.log
 barge_in_threshold_sec=1.5
 end_time=None  # Note that this comes from predefined values when creating backchanneling data
 tt_latency_threshold_sec=1.5
-tt_recall_buffer_sec=20
-tt_precision_buffer_sec=1
+tt_recall_buffer_sec=$TT_RECALL_BUFFER_SEC
+tt_precision_buffer_sec=$TT_PRECISION_BUFFER_SEC
 vad_min_silence_duration_ms=2000
-validation_set_name="demo"
+validation_set_name="${TEST_NAME}"
 eval_conv "--verbose --jsonl_with_timestamp $jsonl_with_timestamp --vad_min_silence_duration_ms $vad_min_silence_duration_ms"
 echo "Output log: $output_log"
 
