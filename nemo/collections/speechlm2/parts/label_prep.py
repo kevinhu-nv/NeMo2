@@ -128,7 +128,10 @@ def prepare_labels(
         # make sure that eos/bos is in the place (it can cut tokens from the first advance_text_channel_by tokens and this will breaks everything)
 
     if cfg.get("delay_text_channel_by", 0) > 0:
-        delay_by = cfg.get("delay_text_channel_by", 0)
+        if batch.get("formatter", None) and batch["formatter"][0] == 'nemo_tarred_to_duplex':
+            delay_by = cfg.get("delay_source_text_by", 0)
+        else:
+            delay_by = cfg.get("delay_text_channel_by", 0)
 
         eos_mask = (target_tokens == text_eos_id) & (torch.arange(target_tokens.size(1), device=target_tokens.device).unsqueeze(0) >= (target_tokens.size(1) - delay_by))
         for i in range(target_tokens.size(0)):
@@ -142,6 +145,7 @@ def prepare_labels(
             dtype=torch.long,
         )
         target_tokens = torch.cat([pad, target_tokens[:, :-delay_by]], dim=-1)
+        # batch["target_token_lens"] = batch["target_token_lens"] + delay_by
 
     original_target_tokens = target_tokens.clone()
     if cfg.get("delay_text_eos_by", None):
@@ -173,6 +177,7 @@ def prepare_labels(
             source_tokens_delayed = torch.cat([pad, source_tokens[:, :-delay_source_text_by]], dim=-1)
             # Add back user_eos_id since it may be truncated
             source_tokens_delayed[:, -1] = user_eos_id
+            # batch["source_token_lens"] = batch["source_token_lens"] + delay_source_text_by
         else:
             source_tokens_delayed = source_tokens
 
@@ -182,7 +187,6 @@ def prepare_labels(
         if cfg.get("allow_user_text_in_agent_turn", False):
             # Keep user and agent text in separate channels and allow overlap between them
             if cfg.get("debug", False):
-                # import pdb; pdb.set_trace()
                 i = 0
                 target_tokens_flat_masked = target_tokens_flat[i] * (target_tokens_flat[i] != text_pad_id)
                 print(f"target_tokens_flat[i]:", target_tokens_flat_masked)
@@ -192,6 +196,7 @@ def prepare_labels(
                 print(f"source_tokens_flat[i]:", source_tokens_flat_masked)
                 stacked = torch.stack([source_tokens_flat_masked, target_tokens_flat_masked], dim=1)
                 print("stacked[:500]:", stacked[:500])
+                import pdb; pdb.set_trace()
 
             # To be consistent with the single channel case, replace the user_eos_id with agent_eos_id
             source_tokens_flat = source_tokens_flat.clone()
@@ -216,8 +221,10 @@ def prepare_labels(
             result = {
                 "asr_inputs": asr_inputs,
                 "asr_labels": asr_labels,
+                "source_token_lens": batch["source_token_lens"],
                 "text_inputs": text_inputs,
                 "text_labels": text_labels,
+                "target_token_lens": batch["target_token_lens"],
                 "audio_inputs": audio_inputs,
                 "audio_labels": audio_labels,
                 "source_encoded": source_encoded,
@@ -240,7 +247,7 @@ def prepare_labels(
                 # uuuuu
                 #    aaaaa --> uuuaaa
                 bos_in_target = (target_tokens_flat[i, user_bos_idx:user_eos_idx] == text_bos_id).nonzero(as_tuple=True)
-                if bos_in_target[0].numel() > 0 and cfg.get("allow_user_text_in_agent_turn", False):
+                if bos_in_target[0].numel() > 0:
                     bos_in_target_idx = bos_in_target[0][0].item() + user_bos_idx
                     user_eos_idx = min(user_eos_idx, bos_in_target_idx)
                 
@@ -279,7 +286,7 @@ def prepare_labels(
             source_tokens_flat_masked = source_tokens_flat[i] * (source_tokens_flat[i] != text_pad_id)
             print(f"source_tokens_flat[i]:", source_tokens_flat_masked)
             stacked = torch.stack([source_tokens_flat_masked, target_tokens_flat_masked], dim=1)
-            print("stacked[:500]:", stacked[:500])
+            print("ori_stacked[:500]:", stacked[:500])
         import pdb; pdb.set_trace()
 
     input_ids = torch.cat([target_codes, target_tokens[..., None]], dim=-1)
@@ -331,8 +338,6 @@ def prepare_labels(
     result["audio_labels"] = audio_labels
 
     if cfg.get("debug", False):
-        import pdb
-        pdb.set_trace()
         ori_stacked = torch.stack(
             [
                 batch['source_tokens'][0] * (batch['source_tokens'][0] != text_pad_id),
@@ -342,13 +347,15 @@ def prepare_labels(
         )
         print("ori_stacked[:500]:", ori_stacked)
         i = 0
-        asr_masked = result.get("asr_labels", result["text_labels"])[i][-1000:] * (
-            result.get("asr_labels", result["text_labels"])[i][-1000:] != text_pad_id
+        asr_masked = result.get("asr_labels", result["text_labels"])[i][:1000] * (
+            result.get("asr_labels", result["text_labels"])[i][:1000] != text_pad_id
         )
-        text_masked = result["text_labels"][i][-1000:] * (result["text_labels"][i][-1000:] != text_pad_id)
+        text_masked = result["text_labels"][i][:1000] * (result["text_labels"][i][:1000] != text_pad_id)
         stacked = torch.stack([asr_masked, text_masked], dim=1)
-        print("delayed stacked:", stacked[-200:])
+        print("delayed stacked[:500]:", stacked[:500])
+        import pdb; pdb.set_trace()
 
     result["source_encoded"] = source_encoded
+
     return result
 

@@ -76,6 +76,7 @@ class ResultsLogger:
         name: str,
         refs: list[str],
         hyps: list[str],
+        hyps_tokens: list[list[int]],
         src_refs: list[str],
         src_hyps: list[str],
         src_tokens: list[str],
@@ -120,6 +121,7 @@ class ResultsLogger:
             out_dict = {
                 "target_text": refs[i],
                 "pred_text": hyps[i],
+                # "pred_text_tokens": hyps_tokens[i],
                 "speech_pred_transcribed": asr_hyps[i],
                 "audio_path": os.path.relpath(out_audio_path, self.save_path),
                 "src_text": src_refs[i],

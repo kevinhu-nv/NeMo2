@@ -164,6 +164,31 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         # Load the pretrained streaming ASR model and copy its parameters into the audio perception module.
         setup_speech_encoder(self)
 
+        # Initialize ASR adapter similar to modality adapter in perception module
+        if self.cfg.get("early_fork_asr", False) and self.cfg.get("asr_adapter", None) is not None:
+            from nemo.core import NeuralModule
+            self.asr_adapter = NeuralModule.from_config_dict(self.cfg.asr_adapter)
+            asr_adapter_d_model = self.cfg.asr_adapter.get('d_model', self.cfg.asr_adapter.get('output_dim', None))
+            if asr_adapter_d_model is not None:
+                self.asr_adapter_proj = nn.Linear(asr_adapter_d_model, self.llm.config.hidden_size)
+            else:
+                self.asr_adapter_proj = nn.Identity()
+        else:
+            self.asr_adapter = None
+
+        # Initialize text adapter to process text hidden states before lm_head
+        if self.cfg.get("use_adapter_for_text_head", False) and self.cfg.get("text_adapter", None) is not None:
+            from nemo.core import NeuralModule
+            self.text_adapter = NeuralModule.from_config_dict(self.cfg.text_adapter)
+            text_adapter_d_model = self.cfg.text_adapter.get('d_model', self.cfg.text_adapter.get('output_dim', None))
+            # Only need projection if output dimension differs from LLM hidden size
+            if text_adapter_d_model is not None and text_adapter_d_model != self.llm.config.hidden_size:
+                self.text_adapter_proj = nn.Linear(text_adapter_d_model, self.llm.config.hidden_size)
+            else:
+                self.text_adapter_proj = nn.Identity()
+        else:
+            self.text_adapter = None
+
         if self.cfg.get("use_eou_decoder", None):
             if self.cfg.get("eou_decoder_from_wav", None):
                 self.eou_decoder = EOUDecoderFromWav(
@@ -403,13 +428,32 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 (1) llm cache depends on input cache is None or Not
                 (2) speech_generation cache relys on reset_input_and_kv_cache function.
         """
-        out = self.llm(
-            inputs_embeds=input_embeds, past_key_values=cache, use_cache=cache is not None, return_dict=True
-        )
+        if self.cfg.get("early_fork_asr", False):
+            out = self.llm(inputs_embeds=input_embeds, past_key_values=cache, use_cache=cache is not None, output_hidden_states=True, return_dict=True)
+            text_in = out['last_hidden_state']
+            asr_fork_layer = self.cfg.get("asr_fork_layer", -3)
+            asr_in = out["hidden_states"][asr_fork_layer]
+        else:
+            out = self.llm(
+                inputs_embeds=input_embeds, past_key_values=cache, use_cache=cache is not None, return_dict=True
+            )
+            text_in = out['last_hidden_state']
+            asr_in = out['last_hidden_state']
+
         B, T = input_embeds.shape[:2]
-        text_logits = self.lm_head(out['last_hidden_state'])  # (B, T, text_vocab_size)
+        
+        # Apply text adapter if configured
+        if self.cfg.get("use_adapter_for_text_head", False) and self.text_adapter is not None:
+            text_in_adapted, _ = self.text_adapter(audio_signal=text_in.transpose(1, 2), length=text_in.new_full((text_in.shape[0],), text_in.shape[1]))
+            text_in_adapted = self.text_adapter_proj(text_in_adapted.transpose(1, 2))
+            text_logits = self.lm_head(text_in_adapted)  # (B, T, text_vocab_size)
+        else:
+            text_logits = self.lm_head(text_in)  # (B, T, text_vocab_size)
         if self.cfg.get("use_separate_asr_head", False):
-            asr_logits = self.asr_head(out['last_hidden_state'])  # (B, T, asr_vocab_size)
+            if self.cfg.get("early_fork_asr", False):
+                asr_in, _ = self.asr_adapter(audio_signal=asr_in.transpose(1, 2), length=asr_in.new_full((asr_in.shape[0],), asr_in.shape[1]))
+                asr_in = self.asr_adapter_proj(asr_in.transpose(1, 2))
+            asr_logits = self.asr_head(asr_in)  # (B, T, asr_vocab_size)
 
         if seq_mask is not None:
             # This is training Mode
@@ -785,13 +829,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
         if self.cfg.get("mask_sequence_loss", True):
             # set the mask based on the target_token_lens to disconsider sequence padding in loss
-            for i in range(batch["target_token_lens"].size(0)):
-                speech_end_idx = batch["target_token_lens"][i]
+            for i in range(inputs["target_token_lens"].size(0)):
+                speech_end_idx = inputs["target_token_lens"][i]
                 seq_mask[i, speech_end_idx:, :] = 0
 
             # check new mask consistency
             mask_lengths = seq_mask[:, :, 0].sum(-1)
-            assert torch.allclose(batch["target_token_lens"].float(), mask_lengths.float(), atol=2.0)
+            assert torch.allclose(inputs["target_token_lens"].float(), mask_lengths.float(), atol=2.0)
 
         eou_logits = None
         eou_labels = None
@@ -836,6 +880,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         loss_scale = seq_mask.clone().float()
         asr_loss_scale = seq_mask.clone().float()
 
+        if self.cfg.get("debug", False):
+            import pdb; pdb.set_trace()
+
         if self.cfg.get("scale_loss_by") == 'non_sil_t':
             loss_scale[:, :, :1] = torch.where(
                 text_labels.unsqueeze(-1) != self.text_pad_id,
@@ -857,7 +904,23 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     for i, source_id in enumerate(batch['source_id']):
                         if source_id == 'pt':
                             asr_loss_scale[i, :, :1] = 0.0
-                    
+
+        if self.cfg.get("debug", False):
+            import pdb; pdb.set_trace()
+            i = 0
+            text_labels_masked = text_labels[i] * (text_labels[i] != self.text_pad_id)
+            text_labels_stacked = torch.stack([loss_scale[i,:,0].int(), text_labels_masked.int()], dim=1)
+            print("text_labels_stacked[:500]:", text_labels_stacked[:500])
+            
+            asr_labels_masked = asr_labels[i] * (asr_labels[i] != self.text_pad_id)
+            asr_labels_stacked = torch.stack([asr_loss_scale[i,:,0].int(), asr_labels_masked.int()], dim=1)
+            print("asr_labels_stacked[:500]:", asr_labels_stacked[:500])
+
+            stacked = torch.stack([asr_loss_scale[i,:,0].int(), asr_labels_masked, text_labels_masked, loss_scale[i,:,0].int()], dim=1)
+            print("stacked[:200]:", stacked[:200])
+            print("stacked[200:400]:", stacked[200:400])
+            print("stacked[400:600]:", stacked[400:600])
+            import pdb; pdb.set_trace()
 
         # debug samples:
         if (
@@ -1020,6 +1083,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         for m in (self.perception.preprocessor, self.perception.encoder, self.llm, self.speech_generation):
             if is_frozen(m):
                 m.eval()
+
+        if self.cfg.get("use_adapter_for_text_head", False) and self.text_adapter is not None:
+            if is_frozen(self.text_adapter):
+                self.text_adapter.eval()
 
         if self.cfg.get("use_eou_decoder", None):
             if is_frozen(self.eou_decoder):
@@ -1218,6 +1285,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     name=name,
                     refs=dataset_batch["target_texts"],
                     hyps=results["text"],
+                    hyps_tokens=results["tokens_text"],
                     src_refs=dataset_batch["source_texts"],
                     src_hyps=results["src_text"],
                     src_tokens=results["tokens_text_src"] if self.predict_user_text else None,
@@ -1866,6 +1934,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             self.llm = fully_shard(self.llm, **fsdp_config)
             self.lm_head = fully_shard(self.lm_head, **fsdp_config)
             self.perception = fully_shard(self.perception, **fsdp_config)
+            # if self.asr_adapter is not None:
+            #     self.asr_adapter = fully_shard(self.asr_adapter, **fsdp_config)
+            if self.cfg.get("use_adapter_for_text_head", False) and self.text_adapter is not None:
+                self.text_adapter = fully_shard(self.text_adapter, **fsdp_config)
             if self.cfg.get("use_eou_decoder", None):
                 self.eou_decoder = fully_shard(self.eou_decoder, **fsdp_config)
             if self.cfg.get("use_separate_asr_head", False):
