@@ -121,7 +121,7 @@ class ResultsLogger:
             out_dict = {
                 "target_text": refs[i],
                 "pred_text": hyps[i],
-                # "pred_text_tokens": hyps_tokens[i],
+                "hyps_tokens": hyps_tokens[i].tolist() if hyps_tokens is not None and hyps_tokens[i] is not None else [],
                 "speech_pred_transcribed": asr_hyps[i],
                 "audio_path": os.path.relpath(out_audio_path, self.save_path),
                 "src_text": src_refs[i],
@@ -130,16 +130,25 @@ class ResultsLogger:
                 "all_text": all_refs[i],
                 "pred_all_text": all_hyps[i],
             }
+
             if results is not None:
                 if tokenizer is not None:
                     out_dict['tokens_text'] = " ".join(tokenizer.ids_to_tokens(results['tokens_text'][i]))
                 else:
                     out_dict['tokens_text'] = results['tokens_text'][i].tolist()
             out_dicts.append(out_dict)
+
         # uses append here to avoid needs to cache
         with open(out_json_path, 'a+', encoding='utf-8') as fout:
             for out_dict in out_dicts:
-                json.dump(out_dict, fout, ensure_ascii=False)
+                # Remove hyps_tokens when writing to JSON
+                json_dict = {k: v for k, v in out_dict.items() if k != 'hyps_tokens'}
+                json.dump(json_dict, fout, ensure_ascii=False)
                 fout.write('\n')
+
+        if hyps_tokens is not None:
+            # Filter out audio_path and hyps_tokens from out_dicts before saving
+            filtered_dicts = [{k: v for k, v in d.items() if k in ['audio_path', 'hyps_tokens']} for d in out_dicts]
+            torch.save(filtered_dicts, os.path.join(self.matadata_save_path, f"{name}_hyps_tokens.pt"))
 
         logging.info(f"Metadata file for {name} dataset updated at: {out_json_path}")

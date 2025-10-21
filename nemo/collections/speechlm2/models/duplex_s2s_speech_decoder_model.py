@@ -1285,7 +1285,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     name=name,
                     refs=dataset_batch["target_texts"],
                     hyps=results["text"],
-                    hyps_tokens=results["tokens_text"],
+                    hyps_tokens=results["tokens_text"] if self.cfg.get("save_agent_text_tokens", False) else None,
                     src_refs=dataset_batch["source_texts"],
                     src_hyps=results["src_text"],
                     src_tokens=results["tokens_text_src"] if self.predict_user_text else None,
