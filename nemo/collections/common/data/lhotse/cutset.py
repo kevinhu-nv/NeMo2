@@ -1228,7 +1228,8 @@ def read_nemo_tarred_to_duplex(config) -> tuple[CutSet, bool]:
             cut.duration = new_audio.shape[1] / sr
         
         # Create user supervision (original speech)
-        user_dur = orig_user_duration + agent_silence_duration
+        # user_dur = orig_user_duration + agent_silence_duration
+        user_dur = orig_user_duration
         user_sup = SupervisionSegment(
             id=f"{cut.id}_user",
             recording_id=cut.recording_id,
