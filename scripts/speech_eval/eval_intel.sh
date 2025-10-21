@@ -17,7 +17,7 @@ eval_single() {
 }
 
 eval_voicebench() {
-    BASE_DIR=$ROOT_DIR/${EXP_NAME}/inf_all/${CKPT_NAME}/validation_logs/metadatas
+    BASE_DIR=$ROOT_DIR/${EXP_NAME}/inf_all_boost/${CKPT_NAME}/${INF_NAME}/validation_logs/metadatas
 
     # for d in alpacaeval commoneval openbookqa sdqa; do
     for d in alpacaeval commoneval openbookqa; do
@@ -29,4 +29,5 @@ ROOT_DIR=/lustre/fsw/portfolios/llmservice/users/kevinhu/s2s/exp
 
 EXP_NAME=$1
 CKPT_NAME=$2
+INF_NAME=$3
 eval_voicebench

@@ -5,7 +5,8 @@ EXP_NAME=IAD_qwen_1b_sft_pt_4nodes_pt0.9sft0.05st0.05_na0.5_snr0.5-30-60_ta0 && 
 TEST_NAME=kevin_20251017
 
 # INF_NAME="pad0_bos0_eos0"
-INF_NAME="pad-0.5_bos0_eos0"
+# INF_NAME="pad-0.5_bos0_eos0"
+INF_NAME="pad-0.5_bos0_eos0_hyptokens"
 # INF_NAME="pad-1_bos0_eos0"
 # INF_NAME="pad-2_bos1_eos1"
 # INF_NAME="pad-3_bos2_eos2"
