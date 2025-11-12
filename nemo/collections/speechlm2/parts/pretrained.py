@@ -83,7 +83,7 @@ def setup_audio_codec(model: torch.nn.Module):
     del model.audio_codec.discriminator  # free up some memory
 
 
-def setup_speech_encoder(model: torch.nn.Module):
+def setup_speech_encoder(model: torch.nn.Module, pretrained_weights: bool = True):
     """
     Sets up an ``AudioPerceptionModule``, initializing its ``encoder`` and ``preprocessor``
     with a pretrained NeMo ``ASRModel``.
