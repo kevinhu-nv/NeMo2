@@ -36,8 +36,16 @@ def inference(cfg):
     OmegaConf.save(cfg, log_dir / "exp_config.yaml")
 
     with trainer.init_module():
-        model_config = OmegaConf.to_container(cfg, resolve=True)
-        model = DuplexSTTModel(model_config)
+        # COMPATIBILITY FIX: Use from_pretrained() for HF checkpoints (like NeMo does)
+        # This ensures trained weights are loaded correctly from model.safetensors
+        if os.path.isdir(cfg.ckpt_path):
+            # Hugging Face format - load trained checkpoint
+            model = DuplexSTTModel.from_pretrained(cfg.ckpt_path)
+            model.validation_save_path = os.path.join(log_dir, "validation_logs")
+        else:
+            # PyTorch Lightning format or no checkpoint
+            model_config = OmegaConf.to_container(cfg, resolve=True)
+            model = DuplexSTTModel(model_config)
 
 
     dataset = DuplexS2SDataset(

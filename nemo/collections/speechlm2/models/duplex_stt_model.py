@@ -79,6 +79,8 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         self.predict_user_text = self.cfg.get("predict_user_text", False)
 
         # Load LLM first
+        # During inference (pretrained_weights=False), model is created on CPU to avoid OOM
+        # safetensors.load_model will load weights directly to the target device
         llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights).train()
 
         # Handle different model types with all their specific configurations
@@ -89,12 +91,26 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             self.tokenizer.eos_token = '</s>'
             self.tokenizer.pad_token = '<SPECIAL_12>'
 
+            self.user_bos_id = self.tokenizer.text_to_ids('^')[0]
+            self.user_eos_id = self.tokenizer.text_to_ids('$')[0]
+
             self.llm = getattr(llm, self.cfg.get("base_model_name", "backbone"))
             self.lm_head = llm.lm_head
+            
+            # COMPATIBILITY: Support both use_separate_asr_head (NeMo) and predict_user_text (NeMo2)
+            # NeMo uses use_separate_asr_head to create asr_head/embed_asr_tokens via deepcopy
+            if self.cfg.get("use_separate_asr_head", False):
+                self.asr_head = copy.deepcopy(self.lm_head)
+            
             embed_tokens_name = self.cfg.get("embed_tokens_name", "embeddings")
             self.embed_tokens = getattr(self.llm, embed_tokens_name)
+            
+            # COMPATIBILITY: Create embed_asr_tokens for NeMo-trained checkpoints
+            if self.cfg.get("use_separate_asr_head", False):
+                self.embed_asr_tokens = copy.deepcopy(self.embed_tokens)
 
             delattr(self.llm, embed_tokens_name)
+            
         elif 'Qwen2.5' in self.cfg.pretrained_llm:
             # ====== QWEN2.5-SPECIFIC HANDLING ======
             self.tokenizer = AutoTokenizer(self.cfg.pretrained_llm, use_fast=True)
@@ -105,33 +121,50 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             if self.cfg.get("use_extra_id_for_pad", False):
                 self.tokenizer.pad_token = '<|extra_1|>'
 
+            self.user_bos_id = self.tokenizer.text_to_ids('^')[0]
+            self.user_eos_id = self.tokenizer.text_to_ids('$')[0]
+
             self.llm = llm.model
             self.lm_head = llm.lm_head
+            
+            # COMPATIBILITY: Support both use_separate_asr_head (NeMo) and predict_user_text (NeMo2)
+            if self.cfg.get("use_separate_asr_head", False):
+                self.asr_head = copy.deepcopy(self.lm_head)
+            
             self.embed_tokens = self.llm.embed_tokens
+            
+            # COMPATIBILITY: Create embed_asr_tokens for NeMo-trained checkpoints
+            if self.cfg.get("use_separate_asr_head", False):
+                self.embed_asr_tokens = copy.deepcopy(self.llm.embed_tokens)
 
             del self.llm.embed_tokens
         else:
             self.tokenizer = AutoTokenizer(self.cfg.pretrained_llm, use_fast=True)
+            self.user_bos_id = self.tokenizer.text_to_ids('^')[0]
+            self.user_eos_id = self.tokenizer.text_to_ids('$')[0]
             self.llm = llm.model
             self.lm_head = llm.lm_head
             self.embed_tokens = self.llm.embed_tokens
             del self.llm.embed_tokens
 
-        if self.predict_user_text:
+        # NeMo2 logic: create asr_head/embed_asr_tokens if predict_user_text is set
+        # This ensures NeMo2-trained checkpoints also work correctly
+        if self.predict_user_text and not hasattr(self, 'asr_head'):
             self.asr_head = copy.deepcopy(self.lm_head)
             self.embed_asr_tokens = copy.deepcopy(self.embed_tokens)
-        self.user_bos_id = self.tokenizer.text_to_ids('^')[0]
-        self.user_eos_id = self.tokenizer.text_to_ids('$')[0]
 
         maybe_install_lora(self)
 
         # Load the pretrained streaming ASR model
-        setup_speech_encoder(self)
+        # ASR is loaded on CPU (default in setup_speech_encoder) to avoid OOM during inference
+        setup_speech_encoder(self, map_location='cpu')
 
         if self.cfg.get("pretrained_perception_from_s2s", None):
             self.init_perception_from_another_s2s_checkpoint(self.cfg.pretrained_perception_from_s2s)
 
-        if self.cfg.get("pretrained_s2s_model", None):
+        # COMPATIBILITY FIX: Only load pretrained_s2s_model during training initialization, not during inference
+        # During inference (pretrained_weights=False), safetensors.load_model handles weight loading
+        if self.cfg.get("pretrained_s2s_model", None) and self.cfg.get("pretrained_weights", True):
             logging.info(f"Loading pretrained s2s model from {self.cfg.pretrained_s2s_model}")
             if os.path.isdir(self.cfg.pretrained_s2s_model) and self.cfg.get("incremental_loading", False):
                 # Hugging Face format
@@ -185,7 +218,8 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     checkpoint_state = torch.load(checkpoint_path, map_location='cpu')
             elif os.path.isdir(checkpoint_path):
                 logging.info(f"Loading from HuggingFace format directory: {checkpoint_path}")
-                pretrained_model = self.__class__.from_pretrained(checkpoint_path)
+                # Load on CPU to avoid OOM during nested from_pretrained calls
+                pretrained_model = self.__class__.from_pretrained(checkpoint_path, map_location='cpu')
                 checkpoint_state = pretrained_model.state_dict()
                 del pretrained_model
             else:
@@ -206,7 +240,8 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     checkpoint_state = torch.load(checkpoint_path, map_location='cpu')
             elif os.path.isdir(checkpoint_path):
                 logging.info(f"Loading from HuggingFace format directory: {checkpoint_path}")
-                pretrained_model = self.__class__.from_pretrained(checkpoint_path)
+                # Load on CPU to avoid OOM during nested from_pretrained calls
+                pretrained_model = self.__class__.from_pretrained(checkpoint_path, map_location='cpu')
                 checkpoint_state = pretrained_model.state_dict()
                 del pretrained_model
             else:
@@ -1383,9 +1418,22 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             if self.predict_user_text:
                 gen_asr = gen_asr[:, :T_local]
 
+        # COMPATIBILITY FIX: Filter special tokens before converting to text (like NeMo does)
+        # This prevents <SPECIAL_12> (pad token) from appearing in the output text
+        def filter_tokens(token_ids, length=None):
+            """Filter out pad tokens and other special tokens before ids_to_text"""
+            if length is not None:
+                token_ids = token_ids[:length]
+            # Filter out pad tokens
+            token_ids = token_ids[token_ids != self.text_pad_id]
+            return token_ids
+
         if self.predict_user_text:
             gen_text_src = gen_asr
-            src_text_cleaned = [self.tokenizer.ids_to_text(gen_text_src[b]) for b in range(gen_text_src.shape[0])]
+            src_text_cleaned = [
+                self.tokenizer.ids_to_text(filter_tokens(gen_text_src[b], lengths[b].item()))
+                for b in range(gen_text_src.shape[0])
+            ]
         else:
             gen_text_src = None
             src_text_cleaned = None
@@ -1609,4 +1657,3 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             logging.info(f"Error loading model state_dict !! Retrying with partial initialization!")
             model_dict = set_model_dict_for_partial_init(state_dict, self.state_dict())
             return super().load_state_dict(model_dict, strict=False)
-
