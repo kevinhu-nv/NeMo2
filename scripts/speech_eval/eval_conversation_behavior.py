@@ -21,6 +21,16 @@ def parse_float_list(arg):
     return [float(x.strip()) for x in arg.split(',')]
 
 
+def remove_special_symbols(text):
+    """
+    Remove special symbols like <SPECIAL_12> from text.
+    """
+    import re
+    # Remove patterns like <SPECIAL_12>, <SPECIAL_1>, etc.
+    text = re.sub(r'<SPECIAL_\d+>', '', text)
+    return text.strip()
+
+
 def parse_timestamped_text(text_with_timestamps):
     import re
     
@@ -110,9 +120,10 @@ def load_jsonl(json_file, field_name='pred_text'):
             if line.strip():
                 data = json.loads(line)
                 audio_path = data.get('audio_path', '')
+                id = data.get('id', '')
                 pred_text = data.get(field_name, '')
                 
-                if audio_path and pred_text:
+                if audio_path or id:
                     if '/' in audio_path:
                         filename = audio_path.split('/')[-1]  # Get filename
                         # Remove .wav extension if present
@@ -121,6 +132,8 @@ def load_jsonl(json_file, field_name='pred_text'):
                         # Remove "demo_" prefix if present
                         if filename.startswith('demo_'):
                             filename = filename[5:]  # Remove "demo_" (5 characters)
+                    elif id:
+                        filename = id
                     else:
                         filename = audio_path
                     
@@ -450,7 +463,12 @@ def print_metrics(metrics_dict, verbose=False):
                     return f"   \033[94m{seg['type']:5s}\033[0m [{seg['start']:6.3f}s - {seg['end']:6.3f}s]{transcript}"
             else:  # Agent
                 if seg_key in agent_transcripts:
-                    transcript = f" ({agent_transcripts[seg_key]})"
+                    cleaned_text = remove_special_symbols(agent_transcripts[seg_key])
+                    # Estimate duration based on word count and a constant seconds per word
+                    words = cleaned_text.split()
+                    estimate_sec_per_word = 0.3
+                    estimated_duration = len(words) * estimate_sec_per_word
+                    transcript = f" ({cleaned_text}) [\033[95mest. {estimated_duration:.2f}s\033[0m]"
                 return f"   \033[92m{seg['type']:5s}\033[0m [{seg['start']:6.3f}s - {seg['end']:6.3f}s]{transcript}"
         
         segments_str = "\n".join(format_segment(seg) for seg in all_segments)
@@ -500,10 +518,12 @@ Evaluation metrics for conversation {metrics_dict['item_id']}:
 def get_pred_audio_path(pred_audio_dir, item_id, dataset_name):
     # Find a file in pred_audio_dir where item_id is a substring of the filename and the filename ends with .wav
     for fname in os.listdir(pred_audio_dir):
-        if item_id in fname and fname.endswith('.wav'):
+        if item_id in fname and fname.endswith('.wav') and 'dup' not in fname:
             # Remove the .wav suffix from the filename
             fname_no_wav = fname[:-4] if fname.lower().endswith('.wav') else fname
             return os.path.join(pred_audio_dir, f"{dataset_name}_{item_id}.wav").strip()
+        elif 'dup' in fname:
+            print(f"Skip duplicate file: {fname}")
     return None
 
 
@@ -512,6 +532,7 @@ def get_filtered_wav_keys(pred_audio_dir, validation_set_name):
     Returns a set of keys for wav files in pred_audio_dir that start with validation_set_name.
     The key is the filename with the prefix and '.wav' removed.
     """
+    import re
     wav_files = [f for f in os.listdir(pred_audio_dir) if f.startswith(validation_set_name) and f.endswith('.wav')]
     prefix_len = len(validation_set_name)
     filtered_wav_keys = set()
@@ -666,7 +687,7 @@ def main(args):
 
         for filtered_wav_key in filtered_wav_keys:
             pred_audio_file = get_pred_audio_path(pred_audio_dir, filtered_wav_key, val_set_name)
-            if not os.path.exists(pred_audio_file):
+            if pred_audio_file is None or not os.path.exists(pred_audio_file):
                 print(f"File not found: {pred_audio_file}")
                 continue
 
@@ -725,7 +746,10 @@ def main(args):
             
             # Use timestamped predictions for agent segments if available, otherwise use VAD or binary audio
             # Find the full key that contains filtered_wav_key as a substring
-            matching_key = next((k for k in timestamped_preds.keys() if filtered_wav_key in k), None) if timestamped_preds else None
+            filtered_wav_key_id = filtered_wav_key.split('_rank')[0] if '_rank' in filtered_wav_key else filtered_wav_key
+            matching_key = next((k for k in timestamped_preds.keys() if filtered_wav_key_id in k), None) if timestamped_preds else None
+
+            print("Eval audio: ", filtered_wav_key)
             
             if matching_key:
                 print(f"Using timestamped text predictions for {matching_key}")
@@ -884,7 +908,7 @@ def parse_args():
     parser.add_argument("--jsonl_with_timestamp", type=str, default=None, help="Path to JSONL file with timestamped text predictions. Each line should have 'pred_text' field with text containing <|timestamp|> markers.")
     parser.add_argument("--vad_min_silence_duration_ms", type=int, default=1500, help="Minimum silence duration in milliseconds for VAD.")
     parser.add_argument("--agent_binary_audio", action="store_true", default=False, help="Whether the agent audio is binary (0s and 1s) indicating active/inactive segments instead of actual speech audio.")
-    parser.add_argument("--enable_transcription", action="store_true", default=True, help="Enable transcription of user segments using ASR model. Agent text is automatically extracted from --jsonl_with_timestamp if provided.")
+    parser.add_argument("--enable_transcription", action="store_true", default=False, help="Enable transcription of user segments using ASR model. Agent text is automatically extracted from --jsonl_with_timestamp if provided.")
     parser.add_argument("--asr_model_name", type=str, default="nvidia/parakeet-tdt-0.6b-v2", help="Name of the ASR model to use for transcription of user segments.")
     return parser.parse_args()
 
