@@ -382,6 +382,164 @@ def compute_barge_in_metrics(success_barge_ins, failed_barge_ins):
     return metrics
 
 
+def print_detailed_utterance(metrics_dict):
+    """
+    Print detailed information for a single utterance including all segments and metrics.
+    
+    Args:
+        metrics_dict: Dictionary containing all metrics for the utterance
+    """
+    user_transcripts = metrics_dict.get('user_transcripts', {})
+    agent_transcripts = metrics_dict.get('agent_transcripts', {})
+    
+    # Build header
+    print(f"\n{'=' * 80}")
+    print(f"Utterance: {metrics_dict['item_id']}")
+    print(f"{'=' * 80}")
+    
+    # Print metrics
+    print(f"\nMetrics:")
+    print(f"  Turn-taking:")
+    print(f"    - Precision: {metrics_dict['tt_precision']:.3f}")
+    print(f"    - Recall: {metrics_dict['tt_recall']:.3f}")
+    print(f"    - F1: {metrics_dict['tt_f1']:.3f}")
+    print(f"    - Latency: {metrics_dict['tt_latency']:.3f}s ({metrics_dict['tt_latency']*1000:.1f}ms)")
+    
+    if metrics_dict['barge_in_metrics']['has_barge_ins']:
+        print(f"  Barge-in:")
+        print(f"    - Success rate: {metrics_dict['barge_in_metrics']['success_rate']:.1f}% ({metrics_dict['barge_in_metrics']['success_count']}/{metrics_dict['barge_in_metrics']['total_count']})")
+        if 'avg_latency_ms' in metrics_dict['barge_in_metrics']:
+            print(f"    - Average latency: {metrics_dict['barge_in_metrics']['avg_latency_ms']:.1f}ms")
+    else:
+        print(f"  Barge-in: No barge-ins detected")
+    
+    # Print all segments in chronological order
+    print(f"\nConversation flow:")
+    all_segments = []
+    for seg in metrics_dict['user_segments']:
+        all_segments.append({'type': 'User', 'start': seg['start'], 'end': seg['end']})
+    for seg in metrics_dict['agent_segments']:
+        all_segments.append({'type': 'Agent', 'start': seg['start'], 'end': seg['end']})
+    
+    all_segments.sort(key=lambda x: x['start'])
+    
+    for seg in all_segments:
+        seg_key = (seg['start'], seg['end'])
+        duration = seg['end'] - seg['start']
+        
+        if seg['type'] == 'User':
+            transcript = user_transcripts.get(seg_key, '')
+            if transcript:
+                print(f"  \033[94mUser\033[0m  [{seg['start']:7.3f}s - {seg['end']:7.3f}s] ({duration:.3f}s): {transcript}")
+            else:
+                print(f"  \033[94mUser\033[0m  [{seg['start']:7.3f}s - {seg['end']:7.3f}s] ({duration:.3f}s)")
+        else:  # Agent
+            transcript = agent_transcripts.get(seg_key, '')
+            if transcript:
+                cleaned_text = remove_special_symbols(transcript)
+                print(f"  \033[92mAgent\033[0m [{seg['start']:7.3f}s - {seg['end']:7.3f}s] ({duration:.3f}s): {cleaned_text}")
+            else:
+                print(f"  \033[92mAgent\033[0m [{seg['start']:7.3f}s - {seg['end']:7.3f}s] ({duration:.3f}s)")
+    
+    # Print barge-in details if any
+    if metrics_dict['barge_in_metrics']['has_barge_ins']:
+        print(f"\nBarge-in events:")
+        if metrics_dict['success_barge_ins']:
+            print(f"  Successful ({len(metrics_dict['success_barge_ins'])}):")
+            for bi in metrics_dict['success_barge_ins']:
+                print(f"    User barged in at {bi['user']['start']:.3f}s during agent speech")
+                print(f"    Agent stopped in {bi['stop_duration_ms']:.1f}ms")
+        
+        if metrics_dict['failed_barge_ins']:
+            print(f"  Failed ({len(metrics_dict['failed_barge_ins'])}):")
+            for bi in metrics_dict['failed_barge_ins']:
+                print(f"    User barged in at {bi['user']['start']:.3f}s during agent speech")
+                print(f"    Agent took {bi['stop_duration_ms']:.1f}ms to stop (too slow)")
+    
+    print(f"{'=' * 80}\n")
+
+
+def print_bottom_percentile_utterances(all_metrics, percentile=5):
+    """
+    Print utterances in the bottom percentile for barge-in accuracy and turn-taking recall.
+    
+    Args:
+        all_metrics: List of metrics dictionaries for all utterances
+        percentile: The percentile threshold (default 5 for bottom 5%)
+    """
+    import numpy as np
+    
+    if not all_metrics:
+        print("No metrics to analyze.")
+        return
+    
+    print(f"\n{'#' * 80}")
+    print(f"BOTTOM {percentile}% PERCENTILE ANALYSIS")
+    print(f"{'#' * 80}\n")
+    
+    # Extract metrics for percentile calculation
+    # For barge-in accuracy, only consider utterances that have barge-ins
+    utterances_with_barge_ins = [m for m in all_metrics if m['barge_in_metrics']['has_barge_ins']]
+    barge_in_rates = [m['barge_in_metrics']['success_rate'] for m in utterances_with_barge_ins]
+    
+    # For turn-taking recall, consider all utterances
+    tt_recalls = [m['tt_recall'] for m in all_metrics]
+    
+    # Calculate percentile thresholds
+    if barge_in_rates:
+        barge_in_threshold = np.percentile(barge_in_rates, percentile)
+        print(f"Barge-in success rate {percentile}th percentile threshold: {barge_in_threshold:.1f}%")
+        print(f"  (Based on {len(utterances_with_barge_ins)} utterances with barge-ins)\n")
+    else:
+        barge_in_threshold = None
+        print(f"No utterances with barge-ins detected.\n")
+    
+    tt_recall_threshold = np.percentile(tt_recalls, percentile)
+    print(f"Turn-taking recall {percentile}th percentile threshold: {tt_recall_threshold:.3f}")
+    print(f"  (Based on {len(all_metrics)} utterances)\n")
+    
+    # Find utterances below thresholds
+    low_barge_in_utterances = []
+    if barge_in_threshold is not None:
+        low_barge_in_utterances = [
+            m for m in utterances_with_barge_ins 
+            if m['barge_in_metrics']['success_rate'] <= barge_in_threshold
+        ]
+        # Sort by barge-in success rate (lowest first)
+        low_barge_in_utterances.sort(key=lambda m: m['barge_in_metrics']['success_rate'])
+    
+    low_tt_recall_utterances = [
+        m for m in all_metrics 
+        if m['tt_recall'] <= tt_recall_threshold
+    ]
+    # Sort by turn-taking recall (lowest first)
+    low_tt_recall_utterances.sort(key=lambda m: m['tt_recall'])
+    
+    # Print low barge-in accuracy utterances
+    if low_barge_in_utterances:
+        print(f"\n{'-' * 80}")
+        print(f"UTTERANCES WITH LOW BARGE-IN SUCCESS RATE (≤ {barge_in_threshold:.1f}%)")
+        print(f"Found {len(low_barge_in_utterances)} utterance(s)")
+        print(f"{'-' * 80}")
+        
+        for m in low_barge_in_utterances:
+            print_detailed_utterance(m)
+    
+    # Print low turn-taking recall utterances
+    if low_tt_recall_utterances:
+        print(f"\n{'-' * 80}")
+        print(f"UTTERANCES WITH LOW TURN-TAKING RECALL (≤ {tt_recall_threshold:.3f})")
+        print(f"Found {len(low_tt_recall_utterances)} utterance(s)")
+        print(f"{'-' * 80}")
+        
+        for m in low_tt_recall_utterances:
+            print_detailed_utterance(m)
+    
+    print(f"\n{'#' * 80}")
+    print(f"END OF BOTTOM {percentile}% PERCENTILE ANALYSIS")
+    print(f"{'#' * 80}\n")
+
+
 def print_metrics(metrics_dict, verbose=False):
     """
     Print all evaluation metrics for a conversation.
@@ -681,6 +839,9 @@ def main(args):
         all_barge_in_success_rates = []
         all_barge_in_latencies = []
         all_bc_accuracies = []
+        
+        # List to store all metrics dictionaries for percentile analysis
+        all_metrics_dicts = []
 
         # Eval a specific validation set
         filtered_wav_keys = get_filtered_wav_keys(pred_audio_dir, val_set_name)
@@ -846,6 +1007,9 @@ def main(args):
                 'agent_transcripts': agent_transcripts
             }
 
+            # Store metrics for percentile analysis
+            all_metrics_dicts.append(metrics_dict)
+
             # Print all metrics
             print_metrics(metrics_dict, verbose=args.verbose)
             
@@ -882,6 +1046,10 @@ def main(args):
     {'=' * 50}"""
 
         print(avg_metrics_str)
+        
+        # Print bottom 5% percentile utterances
+        if args.show_bottom_percentile:
+            print_bottom_percentile_utterances(all_metrics_dicts, percentile=args.percentile_threshold)
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -910,6 +1078,8 @@ def parse_args():
     parser.add_argument("--agent_binary_audio", action="store_true", default=False, help="Whether the agent audio is binary (0s and 1s) indicating active/inactive segments instead of actual speech audio.")
     parser.add_argument("--enable_transcription", action="store_true", default=False, help="Enable transcription of user segments using ASR model. Agent text is automatically extracted from --jsonl_with_timestamp if provided.")
     parser.add_argument("--asr_model_name", type=str, default="nvidia/parakeet-tdt-0.6b-v2", help="Name of the ASR model to use for transcription of user segments.")
+    parser.add_argument("--show_bottom_percentile", action="store_true", default=True, help="Show detailed analysis of utterances in the bottom percentile for barge-in accuracy and turn-taking recall.")
+    parser.add_argument("--percentile_threshold", type=float, default=5.0, help="Percentile threshold for identifying low-quality utterances (default: 5.0 for bottom 5%%).")
     return parser.parse_args()
 
 if __name__ == "__main__":
