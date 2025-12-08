@@ -31,7 +31,21 @@ def remove_special_symbols(text):
     return text.strip()
 
 
-def parse_timestamped_text(text_with_timestamps):
+def parse_timestamped_text(text_with_timestamps, estimate_sec_per_word=0.3, cutoff_threshold=2.0, user_segments=None, gap_threshold=2.0):
+    """
+    Parse timestamped text and detect potentially cut-off agent segments.
+    
+    Args:
+        text_with_timestamps: Text with <|timestamp|> BOS and <$timestamp$> EOS markers
+        estimate_sec_per_word: Estimated seconds per word for duration calculation (default: 0.3)
+        cutoff_threshold: Threshold in seconds to mark segment as cut off 
+                          If estimated_duration - actual_duration > cutoff_threshold, mark as cut off
+        user_segments: List of user segments with 'start' and 'end' times (optional)
+        gap_threshold: Minimum gap in seconds between estimated end and next user start to consider cutoff (default: 0.5)
+    
+    Returns:
+        List of agent segments with 'start', 'end', 'text', 'estimated_duration', and 'is_cutoff' fields
+    """
     import re
     
     # Parse both BOS and EOS timestamps
@@ -67,18 +81,51 @@ def parse_timestamped_text(text_with_timestamps):
                 eos_start_pos = eos_matches[eos_idx].start()
                 text = text_with_timestamps[bos_end_pos:eos_start_pos].strip()
             
+            # Calculate estimated duration based on word count
+            cleaned_text = remove_special_symbols(text)
+            words = cleaned_text.split()
+            estimated_duration = len(words) * estimate_sec_per_word if words else 0.0
+            
             if end_time is not None:
+                actual_duration = end_time - start_time
+                estimated_end = start_time + estimated_duration
+                
+                # Condition 1: Estimated duration is significantly longer than actual duration
+                is_cutoff_by_duration = estimated_duration - actual_duration > cutoff_threshold if estimated_duration > 0 else False
+                
+                # Condition 2: Estimated end time has a big gap to the following user start time
+                # This means agent was not barged in by user, but was cut off by the end of the audio
+                is_cutoff_by_gap = False
+                if user_segments and estimated_end > end_time:
+                    # Find the next user segment after this agent segment start time
+                    next_user_segments = [u for u in user_segments if u['start'] > start_time]
+                    if next_user_segments:
+                        next_user_start = min(u['start'] for u in next_user_segments)
+                        # If estimated end + gap_threshold < next user start, agent had room to continue
+                        if estimated_end + gap_threshold < next_user_start:
+                            is_cutoff_by_gap = True
+                
+                is_cutoff = is_cutoff_by_duration and is_cutoff_by_gap
+                
                 agent_segments.append({
                     'start': start_time,
                     'end': end_time,
-                    'text': text
+                    'text': text,
+                    'estimated_duration': estimated_duration,
+                    'is_cutoff': is_cutoff,
+                    'is_cutoff_by_duration': is_cutoff_by_duration,
+                    'is_cutoff_by_gap': is_cutoff_by_gap
                 })
             else:
                 # No corresponding EOS found, use default duration
                 agent_segments.append({
                     'start': start_time,
                     'end': start_time + 5.0,
-                    'text': text
+                    'text': text,
+                    'estimated_duration': estimated_duration,
+                    'is_cutoff': False,  # Can't determine if cut off without EOS
+                    'is_cutoff_by_duration': False,
+                    'is_cutoff_by_gap': False
                 })
     
     # Fallback: if only BOS timestamps are available, add default value
@@ -94,19 +141,50 @@ def parse_timestamped_text(text_with_timestamps):
                 else:
                     text = text_with_timestamps[bos_end_pos:].strip()
             
+            # Calculate estimated duration based on word count
+            cleaned_text = remove_special_symbols(text)
+            words = cleaned_text.split()
+            estimated_duration = len(words) * estimate_sec_per_word if words else 0.0
+            
             if i < len(bos_timestamps) - 1:
                 # Segment from current timestamp to next timestamp
+                end_time = bos_timestamps[i + 1]
+                actual_duration = end_time - timestamp
+                estimated_end = timestamp + estimated_duration
+                
+                # Condition 1: Estimated duration is significantly longer than actual duration
+                is_cutoff_by_duration = estimated_duration - actual_duration > cutoff_threshold if estimated_duration > 0 else False
+                
+                # Condition 2: Estimated end time has a big gap to the following user start time
+                is_cutoff_by_gap = False
+                if user_segments and estimated_end > end_time:
+                    next_user_segments = [u for u in user_segments if u['start'] > end_time]
+                    if next_user_segments:
+                        next_user_start = min(u['start'] for u in next_user_segments)
+                        if estimated_end + gap_threshold < next_user_start:
+                            is_cutoff_by_gap = True
+                
+                is_cutoff = is_cutoff_by_duration or is_cutoff_by_gap
+                
                 agent_segments.append({
                     'start': timestamp,
-                    'end': bos_timestamps[i + 1],
-                    'text': text
+                    'end': end_time,
+                    'text': text,
+                    'estimated_duration': estimated_duration,
+                    'is_cutoff': is_cutoff,
+                    'is_cutoff_by_duration': is_cutoff_by_duration,
+                    'is_cutoff_by_gap': is_cutoff_by_gap
                 })
             else:
                 # Last segment - assume it lasts for a reasonable duration
                 agent_segments.append({
                     'start': timestamp,
                     'end': timestamp + 5.0,
-                    'text': text
+                    'text': text,
+                    'estimated_duration': estimated_duration,
+                    'is_cutoff': False,  # Can't determine if cut off without next segment
+                    'is_cutoff_by_duration': False,
+                    'is_cutoff_by_gap': False
                 })
     
     return agent_segments
@@ -413,6 +491,10 @@ def print_detailed_utterance(metrics_dict):
     else:
         print(f"  Barge-in: No barge-ins detected")
     
+    if 'cutoff_count' in metrics_dict and metrics_dict['total_agent_segments_with_text'] > 0:
+        print(f"  Cutoff detection:")
+        print(f"    - Cutoff rate: {metrics_dict['cutoff_rate']:.1f}% ({metrics_dict['cutoff_count']}/{metrics_dict['total_agent_segments_with_text']})")
+    
     # Print all segments in chronological order
     print(f"\nConversation flow:")
     all_segments = []
@@ -434,10 +516,31 @@ def print_detailed_utterance(metrics_dict):
             else:
                 print(f"  \033[94mUser\033[0m  [{seg['start']:7.3f}s - {seg['end']:7.3f}s] ({duration:.3f}s)")
         else:  # Agent
-            transcript = agent_transcripts.get(seg_key, '')
-            if transcript:
-                cleaned_text = remove_special_symbols(transcript)
-                print(f"  \033[92mAgent\033[0m [{seg['start']:7.3f}s - {seg['end']:7.3f}s] ({duration:.3f}s): {cleaned_text}")
+            seg_info = agent_transcripts.get(seg_key, None)
+            if seg_info:
+                # seg_info can be either a dict (new format) or string (old format for backward compatibility)
+                if isinstance(seg_info, dict):
+                    text = seg_info.get('text', '')
+                    cleaned_text = remove_special_symbols(text)
+                    estimated_dur = seg_info.get('estimated_duration', 0.0)
+                    is_cutoff = seg_info.get('is_cutoff', False)
+                    is_cutoff_by_duration = seg_info.get('is_cutoff_by_duration', False)
+                    is_cutoff_by_gap = seg_info.get('is_cutoff_by_gap', False)
+                    
+                    cutoff_warning = ""
+                    if is_cutoff:
+                        if is_cutoff_by_duration and is_cutoff_by_gap:
+                            cutoff_warning = " \033[91m[CUTOFF: duration+gap]\033[0m"
+                        elif is_cutoff_by_duration:
+                            cutoff_warning = " \033[91m[CUTOFF: duration]\033[0m"
+                        elif is_cutoff_by_gap:
+                            cutoff_warning = " \033[91m[CUTOFF: gap]\033[0m"
+                    est_info = f" [est. {estimated_dur:.2f}s]" if estimated_dur > 0 else ""
+                    print(f"  \033[92mAgent\033[0m [{seg['start']:7.3f}s - {seg['end']:7.3f}s] ({duration:.3f}s){est_info}{cutoff_warning}: {cleaned_text}")
+                else:
+                    # Backward compatibility: seg_info is just the text string
+                    cleaned_text = remove_special_symbols(seg_info)
+                    print(f"  \033[92mAgent\033[0m [{seg['start']:7.3f}s - {seg['end']:7.3f}s] ({duration:.3f}s): {cleaned_text}")
             else:
                 print(f"  \033[92mAgent\033[0m [{seg['start']:7.3f}s - {seg['end']:7.3f}s] ({duration:.3f}s)")
     
@@ -621,12 +724,23 @@ def print_metrics(metrics_dict, verbose=False):
                     return f"   \033[94m{seg['type']:5s}\033[0m [{seg['start']:6.3f}s - {seg['end']:6.3f}s]{transcript}"
             else:  # Agent
                 if seg_key in agent_transcripts:
-                    cleaned_text = remove_special_symbols(agent_transcripts[seg_key])
-                    # Estimate duration based on word count and a constant seconds per word
-                    words = cleaned_text.split()
-                    estimate_sec_per_word = 0.3
-                    estimated_duration = len(words) * estimate_sec_per_word
-                    transcript = f" ({cleaned_text}) [\033[95mest. {estimated_duration:.2f}s\033[0m]"
+                    seg_info = agent_transcripts[seg_key]
+                    # seg_info can be either a dict (new format) or string (old format for backward compatibility)
+                    if isinstance(seg_info, dict):
+                        text = seg_info.get('text', '')
+                        cleaned_text = remove_special_symbols(text)
+                        estimated_duration = seg_info.get('estimated_duration', 0.0)
+                        is_cutoff = seg_info.get('is_cutoff', False)
+                        
+                        cutoff_warning = " \033[91m[CUTOFF]\033[0m" if is_cutoff else ""
+                        transcript = f" ({cleaned_text}) [\033[95mest. {estimated_duration:.2f}s\033[0m]{cutoff_warning}"
+                    else:
+                        # Backward compatibility: seg_info is just the text string
+                        cleaned_text = remove_special_symbols(seg_info)
+                        words = cleaned_text.split()
+                        estimate_sec_per_word = 0.3
+                        estimated_duration = len(words) * estimate_sec_per_word
+                        transcript = f" ({cleaned_text}) [\033[95mest. {estimated_duration:.2f}s\033[0m]"
                 return f"   \033[92m{seg['type']:5s}\033[0m [{seg['start']:6.3f}s - {seg['end']:6.3f}s]{transcript}"
         
         segments_str = "\n".join(format_segment(seg) for seg in all_segments)
@@ -912,10 +1026,21 @@ def main(args):
 
             print("Eval audio: ", filtered_wav_key)
             
+            # Extract user segments first (needed for agent cutoff detection)
+            user_vad_results = get_speech_timestamps(user_audio.to('cuda'), vad_model, sampling_rate=16000, min_silence_duration_ms=args.vad_min_silence_duration_ms)
+            user_segments = [{'start': s['start'] / 16000, 'end': s['end'] / 16000} for s in user_vad_results]
+            
+            # Extract agent segments (with cutoff detection if using timestamped text)
             if matching_key:
                 print(f"Using timestamped text predictions for {matching_key}")
                 timestamped_text = timestamped_preds[matching_key]
-                agent_segments = parse_timestamped_text(timestamped_text)
+                agent_segments = parse_timestamped_text(
+                    timestamped_text, 
+                    estimate_sec_per_word=args.estimate_sec_per_word,
+                    cutoff_threshold=args.cutoff_duration_threshold_sec,
+                    user_segments=user_segments,
+                    gap_threshold=args.cutoff_gap_threshold_sec
+                )
                 print(f"Parsed {len(agent_segments)} agent segments from timestamped text")
             elif args.agent_binary_audio:
                 # Extract segments from binary audio (0s and 1s)
@@ -926,9 +1051,6 @@ def main(args):
                 # Fallback to VAD-based segmentation
                 agent_vad_results = get_speech_timestamps(agent_audio.to('cuda'), vad_model, sampling_rate=16000, min_silence_duration_ms=args.vad_min_silence_duration_ms)
                 agent_segments = [{'start': s['start'] / 16000, 'end': s['end'] / 16000} for s in agent_vad_results]
-
-            user_vad_results = get_speech_timestamps(user_audio.to('cuda'), vad_model, sampling_rate=16000, min_silence_duration_ms=args.vad_min_silence_duration_ms)
-            user_segments = [{'start': s['start'] / 16000, 'end': s['end'] / 16000} for s in user_vad_results]
 
             #################
             # Compute eval Metrics 
@@ -973,9 +1095,15 @@ def main(args):
             # Extract agent text from timestamped predictions if available
             if timestamped_preds and matching_key:
                 timestamped_text = timestamped_preds[matching_key]
-                agent_segments_with_text = parse_timestamped_text(timestamped_text)
-                # Convert list to dict with (start, end) tuples as keys
-                agent_transcripts = {(seg['start'], seg['end']): seg.get('text', '') for seg in agent_segments_with_text}
+                agent_segments_with_text = parse_timestamped_text(
+                    timestamped_text,
+                    estimate_sec_per_word=args.estimate_sec_per_word,
+                    cutoff_threshold=args.cutoff_duration_threshold_sec,
+                    user_segments=user_segments,
+                    gap_threshold=args.cutoff_gap_threshold_sec
+                )
+                # Convert list to dict with (start, end) tuples as keys, storing full segment info
+                agent_transcripts = {(seg['start'], seg['end']): seg for seg in agent_segments_with_text}
             
             # Transcribe user segments with ASR if enabled
             if asr_model is not None:
@@ -989,6 +1117,17 @@ def main(args):
                     )
                     user_transcripts[(seg['start'], seg['end'])] = transcript
 
+            # Compute cutoff metrics from agent_transcripts
+            cutoff_segments = []
+            total_agent_segments_with_text = 0
+            for seg_info in agent_transcripts.values():
+                if isinstance(seg_info, dict):
+                    total_agent_segments_with_text += 1
+                    if seg_info.get('is_cutoff', False):
+                        cutoff_segments.append(seg_info)
+            
+            cutoff_rate = (len(cutoff_segments) / total_agent_segments_with_text * 100) if total_agent_segments_with_text > 0 else 0.0
+            
             # Collect all metrics in a dictionary
             metrics_dict = {
                 'item_id': filtered_wav_key,
@@ -1004,7 +1143,10 @@ def main(args):
                 'success_barge_ins': success_barge_ins,
                 'failed_barge_ins': failed_barge_ins,
                 'user_transcripts': user_transcripts,
-                'agent_transcripts': agent_transcripts
+                'agent_transcripts': agent_transcripts,
+                'cutoff_count': len(cutoff_segments),
+                'cutoff_rate': cutoff_rate,
+                'total_agent_segments_with_text': total_agent_segments_with_text
             }
 
             # Store metrics for percentile analysis
@@ -1017,6 +1159,12 @@ def main(args):
 
         # Compute and print average metrics
         _valid_tt_latencies = [x for x in all_tt_latencies if x != INF_LATENCY]
+        
+        # Compute cutoff statistics
+        total_cutoffs = sum(m.get('cutoff_count', 0) for m in all_metrics_dicts)
+        total_agent_segs_with_text = sum(m.get('total_agent_segments_with_text', 0) for m in all_metrics_dicts)
+        avg_cutoff_rate = (total_cutoffs / total_agent_segs_with_text * 100) if total_agent_segs_with_text > 0 else 0.0
+        
         avg_metrics = {
             'avg_tt_latency': sum(_valid_tt_latencies) / len(_valid_tt_latencies) if _valid_tt_latencies else 0,
             'avg_tt_accuracy': sum(all_tt_accuracies) / len(all_tt_accuracies) * 100 if all_tt_accuracies else 0,
@@ -1027,6 +1175,9 @@ def main(args):
             'avg_barge_in_latency': sum(all_barge_in_latencies) / len(all_barge_in_latencies) if all_barge_in_latencies else 0,
             'avg_bc_accuracy': sum(all_bc_accuracies) / len(all_bc_accuracies) * 100 if all_bc_accuracies else 0,
             'num_audios_evaluated': count,
+            'total_cutoffs': total_cutoffs,
+            'total_agent_segments_with_text': total_agent_segs_with_text,
+            'avg_cutoff_rate': avg_cutoff_rate,
         }
 
         avg_metrics_str = f"""
@@ -1042,7 +1193,9 @@ def main(args):
     - Average latency: {avg_metrics['avg_barge_in_latency']:.1f} ms
     3. Back-channeling:
     - Average accuracy: {avg_metrics['avg_bc_accuracy']:.1f}%
-    4. Number of audios evaluated: {avg_metrics['num_audios_evaluated']}
+    4. Agent cutoff detection:
+    - Cutoff rate: {avg_metrics['avg_cutoff_rate']:.1f}% ({avg_metrics['total_cutoffs']}/{avg_metrics['total_agent_segments_with_text']})
+    5. Number of audios evaluated: {avg_metrics['num_audios_evaluated']}
     {'=' * 50}"""
 
         print(avg_metrics_str)
@@ -1080,6 +1233,9 @@ def parse_args():
     parser.add_argument("--asr_model_name", type=str, default="nvidia/parakeet-tdt-0.6b-v2", help="Name of the ASR model to use for transcription of user segments.")
     parser.add_argument("--show_bottom_percentile", action="store_true", default=True, help="Show detailed analysis of utterances in the bottom percentile for barge-in accuracy and turn-taking recall.")
     parser.add_argument("--percentile_threshold", type=float, default=5.0, help="Percentile threshold for identifying low-quality utterances (default: 5.0 for bottom 5%%).")
+    parser.add_argument("--cutoff_duration_threshold_sec", type=float, default=2, help="Threshold in seconds for marking agent segment as cut off based on duration mismatch (estimated vs actual).")
+    parser.add_argument("--cutoff_gap_threshold_sec", type=float, default=2, help="Minimum gap in seconds between estimated agent end and next user start to consider agent segment as cut off.")
+    parser.add_argument("--estimate_sec_per_word", type=float, default=0.3, help="Estimated seconds per word for duration calculation when detecting cutoffs.")
     return parser.parse_args()
 
 if __name__ == "__main__":
