@@ -8,6 +8,7 @@ import gzip
 import json, os, re
 import argparse
 from nemo.collections import asr as nemo_asr
+from openai import OpenAI
 
 INF_LATENCY = 9999.0
 
@@ -495,6 +496,12 @@ def print_detailed_utterance(metrics_dict):
         print(f"  Cutoff detection:")
         print(f"    - Cutoff rate: {metrics_dict['cutoff_rate']:.1f}% ({metrics_dict['cutoff_count']}/{metrics_dict['total_agent_segments_with_text']})")
     
+    if 'gpt_scores' in metrics_dict and metrics_dict['gpt_scores']:
+        gpt_scores = metrics_dict['gpt_scores']
+        avg_gpt_score = sum(s.get('avg_score', 0.0) for s in gpt_scores) / len(gpt_scores)
+        print(f"  GPT Quality Score:")
+        print(f"    - Average: {avg_gpt_score:.2f}/5.0 ({len(gpt_scores)} pairs)")
+    
     # Print all segments in chronological order
     print(f"\nConversation flow:")
     all_segments = []
@@ -504,6 +511,14 @@ def print_detailed_utterance(metrics_dict):
         all_segments.append({'type': 'Agent', 'start': seg['start'], 'end': seg['end']})
     
     all_segments.sort(key=lambda x: x['start'])
+    
+    # Create a lookup for GPT scores by agent segment
+    gpt_scores_by_agent = {}
+    if 'gpt_scores' in metrics_dict:
+        for gpt_score_info in metrics_dict['gpt_scores']:
+            agent_seg = gpt_score_info['agent_segment']
+            agent_key = (agent_seg['start'], agent_seg['end'])
+            gpt_scores_by_agent[agent_key] = gpt_score_info
     
     for seg in all_segments:
         seg_key = (seg['start'], seg['end'])
@@ -517,6 +532,8 @@ def print_detailed_utterance(metrics_dict):
                 print(f"  \033[94mUser\033[0m  [{seg['start']:7.3f}s - {seg['end']:7.3f}s] ({duration:.3f}s)")
         else:  # Agent
             seg_info = agent_transcripts.get(seg_key, None)
+            gpt_score_info = gpt_scores_by_agent.get(seg_key, None)
+            
             if seg_info:
                 # seg_info can be either a dict (new format) or string (old format for backward compatibility)
                 if isinstance(seg_info, dict):
@@ -536,11 +553,27 @@ def print_detailed_utterance(metrics_dict):
                         elif is_cutoff_by_gap:
                             cutoff_warning = " \033[91m[CUTOFF: gap]\033[0m"
                     est_info = f" [est. {estimated_dur:.2f}s]" if estimated_dur > 0 else ""
-                    print(f"  \033[92mAgent\033[0m [{seg['start']:7.3f}s - {seg['end']:7.3f}s] ({duration:.3f}s){est_info}{cutoff_warning}: {cleaned_text}")
+                    gpt_info = ""
+                    if gpt_score_info:
+                        avg_score = gpt_score_info.get('avg_score', 0.0)
+                        user_seg = gpt_score_info.get('user_segment', {})
+                        user_start = user_seg.get('start', 0.0)
+                        # Use red color for scores <= 2, yellow for others
+                        color_code = "\033[91m" if avg_score <= 2.0 else "\033[93m"
+                        gpt_info = f" {color_code}[GPT: {avg_score:.2f}/5.0 from User: {user_start:.3f}s]\033[0m"
+                    print(f"  \033[92mAgent\033[0m [{seg['start']:7.3f}s - {seg['end']:7.3f}s] ({duration:.3f}s){est_info}{cutoff_warning}{gpt_info}: {cleaned_text}")
                 else:
                     # Backward compatibility: seg_info is just the text string
                     cleaned_text = remove_special_symbols(seg_info)
-                    print(f"  \033[92mAgent\033[0m [{seg['start']:7.3f}s - {seg['end']:7.3f}s] ({duration:.3f}s): {cleaned_text}")
+                    gpt_info = ""
+                    if gpt_score_info:
+                        avg_score = gpt_score_info.get('avg_score', 0.0)
+                        user_seg = gpt_score_info.get('user_segment', {})
+                        user_start = user_seg.get('start', 0.0)
+                        # Use red color for scores <= 2, yellow for others
+                        color_code = "\033[91m" if avg_score <= 2.0 else "\033[93m"
+                        gpt_info = f" {color_code}[GPT: {avg_score:.2f}/5.0 from User: {user_start:.3f}s]\033[0m"
+                    print(f"  \033[92mAgent\033[0m [{seg['start']:7.3f}s - {seg['end']:7.3f}s] ({duration:.3f}s){gpt_info}: {cleaned_text}")
             else:
                 print(f"  \033[92mAgent\033[0m [{seg['start']:7.3f}s - {seg['end']:7.3f}s] ({duration:.3f}s)")
     
@@ -606,14 +639,14 @@ def print_bottom_percentile_utterances(all_metrics, percentile=5):
     if barge_in_threshold is not None:
         low_barge_in_utterances = [
             m for m in utterances_with_barge_ins 
-            if m['barge_in_metrics']['success_rate'] <= barge_in_threshold
+            if m['barge_in_metrics']['success_rate'] < barge_in_threshold
         ]
         # Sort by barge-in success rate (lowest first)
         low_barge_in_utterances.sort(key=lambda m: m['barge_in_metrics']['success_rate'])
     
     low_tt_recall_utterances = [
         m for m in all_metrics 
-        if m['tt_recall'] <= tt_recall_threshold
+        if m['tt_recall'] < tt_recall_threshold
     ]
     # Sort by turn-taking recall (lowest first)
     low_tt_recall_utterances.sort(key=lambda m: m['tt_recall'])
@@ -621,7 +654,7 @@ def print_bottom_percentile_utterances(all_metrics, percentile=5):
     # Print low barge-in accuracy utterances
     if low_barge_in_utterances:
         print(f"\n{'-' * 80}")
-        print(f"UTTERANCES WITH LOW BARGE-IN SUCCESS RATE (≤ {barge_in_threshold:.1f}%)")
+        print(f"UTTERANCES WITH LOW BARGE-IN SUCCESS RATE (< {barge_in_threshold:.1f}%)")
         print(f"Found {len(low_barge_in_utterances)} utterance(s)")
         print(f"{'-' * 80}")
         
@@ -631,7 +664,7 @@ def print_bottom_percentile_utterances(all_metrics, percentile=5):
     # Print low turn-taking recall utterances
     if low_tt_recall_utterances:
         print(f"\n{'-' * 80}")
-        print(f"UTTERANCES WITH LOW TURN-TAKING RECALL (≤ {tt_recall_threshold:.3f})")
+        print(f"UTTERANCES WITH LOW TURN-TAKING RECALL (< {tt_recall_threshold:.3f})")
         print(f"Found {len(low_tt_recall_utterances)} utterance(s)")
         print(f"{'-' * 80}")
         
@@ -707,6 +740,14 @@ def print_metrics(metrics_dict, verbose=False):
                 # Use a tuple of (start, end) as key to uniquely identify the segment
                 user_to_agent_latencies[(user_seg['start'], user_seg['end'])] = min_latency
         
+        # Create GPT score lookup by agent segment
+        gpt_scores_by_agent = {}
+        if 'gpt_scores' in metrics_dict:
+            for gpt_score_info in metrics_dict['gpt_scores']:
+                agent_seg = gpt_score_info['agent_segment']
+                agent_key = (agent_seg['start'], agent_seg['end'])
+                gpt_scores_by_agent[agent_key] = gpt_score_info
+        
         # Format segments in chronological order with colors and latencies
         # ANSI color codes: \033[94m = Blue (User), \033[92m = Green (Agent), \033[0m = Reset
         def format_segment(seg):
@@ -723,6 +764,16 @@ def print_metrics(metrics_dict, verbose=False):
                 else:
                     return f"   \033[94m{seg['type']:5s}\033[0m [{seg['start']:6.3f}s - {seg['end']:6.3f}s]{transcript}"
             else:  # Agent
+                gpt_score_info = gpt_scores_by_agent.get(seg_key, None)
+                gpt_info = ""
+                if gpt_score_info:
+                    avg_score = gpt_score_info.get('avg_score', 0.0)
+                    user_seg = gpt_score_info.get('user_segment', {})
+                    user_start = user_seg.get('start', 0.0)
+                    # Use red color for scores <= 2, yellow for others
+                    color_code = "\033[91m" if avg_score <= 2.0 else "\033[93m"
+                    gpt_info = f" {color_code}[GPT: {avg_score:.2f}/5.0 from User: {user_start:.3f}s]\033[0m"
+                
                 if seg_key in agent_transcripts:
                     seg_info = agent_transcripts[seg_key]
                     # seg_info can be either a dict (new format) or string (old format for backward compatibility)
@@ -733,14 +784,14 @@ def print_metrics(metrics_dict, verbose=False):
                         is_cutoff = seg_info.get('is_cutoff', False)
                         
                         cutoff_warning = " \033[91m[CUTOFF]\033[0m" if is_cutoff else ""
-                        transcript = f" ({cleaned_text}) [\033[95mest. {estimated_duration:.2f}s\033[0m]{cutoff_warning}"
+                        transcript = f" ({cleaned_text}) [\033[95mest. {estimated_duration:.2f}s\033[0m]{cutoff_warning}{gpt_info}"
                     else:
                         # Backward compatibility: seg_info is just the text string
                         cleaned_text = remove_special_symbols(seg_info)
                         words = cleaned_text.split()
                         estimate_sec_per_word = 0.3
                         estimated_duration = len(words) * estimate_sec_per_word
-                        transcript = f" ({cleaned_text}) [\033[95mest. {estimated_duration:.2f}s\033[0m]"
+                        transcript = f" ({cleaned_text}) [\033[95mest. {estimated_duration:.2f}s\033[0m]{gpt_info}"
                 return f"   \033[92m{seg['type']:5s}\033[0m [{seg['start']:6.3f}s - {seg['end']:6.3f}s]{transcript}"
         
         segments_str = "\n".join(format_segment(seg) for seg in all_segments)
@@ -824,9 +875,152 @@ def get_filtered_wav_keys(pred_audio_dir, validation_set_name):
     return filtered_wav_keys    
 
 
-def compute_turn_taking_metrics(agent_segments, user_segments, tt_latency_threshold_sec, tt_precision_buffer_sec, tt_recall_buffer_sec):
+def mark(prompt, client, model="gpt-4o-mini"):
     """
-    Compute turn-taking metrics using precision and recall.
+    Score a response using GPT.
+    
+    Args:
+        prompt: The prompt to send to GPT
+        client: OpenAI client instance
+        model: Model name to use (default: gpt-4o-mini)
+    
+    Returns:
+        List of scores from GPT (3 attempts)
+    """
+    try:
+        scores = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=1024,
+            frequency_penalty=0,
+            presence_penalty=0,
+            stop=None,
+            temperature=0.5,
+            top_p=0.95,
+            n=3,
+        )
+    except Exception as e:
+        print(f"Error in mark function: {e}")
+        return [0, 0, 0]
+    else:
+        return [choice.message.content for choice in scores.choices]
+
+
+def compute_gpt_scores_for_turn_pairs(user_segments, agent_segments, user_transcripts, agent_transcripts, openai_client, gpt_model="gpt-4o-mini"):
+    """
+    Compute GPT scores for user-agent turn pairs.
+    
+    Args:
+        user_segments: List of dicts with 'start' and 'end' times of user speech
+        agent_segments: List of dicts with 'start' and 'end' times of agent speech
+        user_transcripts: Dict mapping (start, end) tuples to user transcripts
+        agent_transcripts: Dict mapping (start, end) tuples to agent transcripts or segment info dicts
+        openai_client: OpenAI client for GPT scoring
+        gpt_model: Model name to use for GPT scoring (default: gpt-4o-mini)
+    
+    Returns:
+        List of dicts containing GPT scores for each user-agent turn pair
+    """
+    gpt_scores = []
+    
+    # Prompt template for GPT evaluation
+    prompt_template = """
+I need your help to evaluate the performance of several models in the speech interaction scenario. The models will receive a speech input from the user, which they need to understand and respond to with a speech output.
+
+Your task is to rate the model's responses based on the provided user input transcription [Instruction] and the model's output transcription [Response].
+
+Please evaluate the response on a scale of 1 to 5:
+
+1 point: The response is largely irrelevant, incorrect, or fails to address the user's query. It may be off-topic or provide incorrect information.
+
+2 points: The response is somewhat relevant but lacks accuracy or completeness. It may only partially answer the user's question or include extraneous information.
+
+3 points: The response is relevant and mostly accurate, but it may lack conciseness or include unnecessary details that don't contribute to the main point.
+
+4 points: The response is relevant, accurate, and concise, providing a clear answer to the user's question without unnecessary elaboration.
+
+5 points: The response is exceptionally relevant, accurate, and to the point. It directly addresses the user's query in a highly effective and efficient manner, providing exactly the information needed.
+
+Below are the transcription of user's instruction and models' response:
+
+### [Instruction]
+
+{question}
+
+### [Response]
+
+{answer}
+
+After evaluating, please output the score only without anything else.
+
+You don't need to provide any explanations.
+""".strip()
+    
+    # Create user-agent turn pairs (user turn followed by the next agent turn)
+    # Sort segments by start time
+    sorted_user_segments = sorted(user_segments, key=lambda x: x['start'])
+    sorted_agent_segments = sorted(agent_segments, key=lambda x: x['start'])
+    
+    for user_seg in sorted_user_segments:
+        # Find the next agent segment that starts after this user segment ends
+        next_agent_seg = None
+        for agent_seg in sorted_agent_segments:
+            if agent_seg['start'] >= user_seg['start']:
+                next_agent_seg = agent_seg
+                break
+        
+        if next_agent_seg is not None:
+            # Get transcripts
+            user_key = (user_seg['start'], user_seg['end'])
+            agent_key = (next_agent_seg['start'], next_agent_seg['end'])
+            
+            user_text = user_transcripts.get(user_key, "")
+            
+            # Extract agent text (handle both dict and string formats)
+            agent_info = agent_transcripts.get(agent_key, "")
+            if isinstance(agent_info, dict):
+                agent_text = remove_special_symbols(agent_info.get('text', ''))
+            else:
+                agent_text = remove_special_symbols(agent_info)
+            
+            # Only compute GPT score if both transcripts are available
+            if user_text.strip() and agent_text.strip():
+                prompt = prompt_template.format(question=user_text, answer=agent_text)
+                try:
+                    scores = mark(prompt, openai_client, model=gpt_model)
+                    # Parse scores from the responses
+                    parsed_scores = []
+                    for score_text in scores:
+                        try:
+                            # Extract numeric score from response
+                            score_value = float(score_text.strip())
+                            parsed_scores.append(score_value)
+                        except ValueError:
+                            print(f"Warning: Could not parse score from GPT response: {score_text}")
+                            parsed_scores.append(0.0)
+                    
+                    avg_score = sum(parsed_scores) / len(parsed_scores) if parsed_scores else 0.0
+                    gpt_scores.append({
+                        'user_segment': user_seg,
+                        'agent_segment': next_agent_seg,
+                        'user_text': user_text,
+                        'agent_text': agent_text,
+                        'scores': parsed_scores,
+                        'avg_score': avg_score
+                    })
+                    print(f"GPT score for pair [User: {user_seg['start']:.3f}s -> Agent: {next_agent_seg['start']:.3f}s]: {parsed_scores} (avg: {avg_score:.2f})")
+                except Exception as e:
+                    print(f"Error computing GPT score for pair [User: {user_seg['start']:.3f}s -> Agent: {next_agent_seg['start']:.3f}s]: {e}")
+    
+    return gpt_scores
+
+
+def compute_turn_taking_metrics(agent_segments, user_segments, tt_latency_threshold_sec, tt_precision_buffer_sec, tt_recall_buffer_sec, user_transcripts=None, agent_transcripts=None, openai_client=None, gpt_model="gpt-4o-mini"):
+    """
+    Compute turn-taking metrics using precision and recall, and optionally compute GPT scores for user-agent turn pairs.
     
     Args:
         agent_segments: List of dicts with 'start' and 'end' times of agent speech
@@ -834,8 +1028,12 @@ def compute_turn_taking_metrics(agent_segments, user_segments, tt_latency_thresh
         tt_latency_threshold_sec: Threshold in seconds for considering turn-taking to be accurate
         tt_precision_buffer_sec: Buffer time in seconds for precision calculation (agent segments)
         tt_recall_buffer_sec: Buffer time in seconds for recall calculation (user segments)
+        user_transcripts: Optional dict mapping (start, end) tuples to user transcripts
+        agent_transcripts: Optional dict mapping (start, end) tuples to agent transcripts or segment info dicts
+        openai_client: Optional OpenAI client for GPT scoring
+        gpt_model: Model name to use for GPT scoring (default: gpt-4o-mini)
     Returns:
-        dict: Contains precision, recall, f1, and latency metrics
+        dict: Contains precision, recall, f1, latency metrics, and optionally gpt_scores
     """
     if not agent_segments or not user_segments:
         return {
@@ -845,7 +1043,8 @@ def compute_turn_taking_metrics(agent_segments, user_segments, tt_latency_thresh
             'avg_latency': INF_LATENCY,
             'true_positives': 0,
             'false_positives': 0,
-            'false_negatives': 0
+            'false_negatives': 0,
+            'gpt_scores': []
         }
     
     # Calculate true positives (tp), false positives (fp), and false negatives (fn)
@@ -909,6 +1108,18 @@ def compute_turn_taking_metrics(agent_segments, user_segments, tt_latency_thresh
     if tp + fp != num_agent_segments:
         print(f"WARNING: tp + fp ({tp + fp}) != agent segments ({num_agent_segments})")
     
+    # Compute GPT scores for user-agent turn pairs if transcripts and client are provided
+    gpt_scores = []
+    if user_transcripts is not None and agent_transcripts is not None and openai_client is not None:
+        gpt_scores = compute_gpt_scores_for_turn_pairs(
+            user_segments, 
+            agent_segments, 
+            user_transcripts, 
+            agent_transcripts, 
+            openai_client, 
+            gpt_model
+        )
+    
     return {
         'precision': precision,
         'recall': recall,
@@ -916,7 +1127,8 @@ def compute_turn_taking_metrics(agent_segments, user_segments, tt_latency_thresh
         'avg_latency': avg_latency,
         'true_positives': tp,
         'false_positives': fp,
-        'false_negatives': fn
+        'false_negatives': fn,
+        'gpt_scores': gpt_scores
     }
 
 
@@ -1056,11 +1268,6 @@ def main(args):
             # Compute eval Metrics 
             # So far, we mesaure three types of conversation behaviors: Turn-taking, barge-in, and user backchanneling
 
-            # Turn-taking
-            tt_metrics = compute_turn_taking_metrics(agent_segments, user_segments, args.tt_latency_threshold_sec, args.tt_precision_buffer_sec, args.tt_recall_buffer_sec)
-            tt_latency = tt_metrics['avg_latency']
-            tt_accuracy = tt_metrics['f1']  # Use F1 as overall accuracy metric
-
             # Barge-in: find the overlap and return the overlap duration and segments
             success_barge_ins, failed_barge_ins = find_user_barge_ins(user_segments, agent_segments, args.barge_in_threshold_sec)
             barge_in_metrics = compute_barge_in_metrics(success_barge_ins, failed_barge_ins)
@@ -1072,23 +1279,7 @@ def main(args):
             else:
                 bc_failure = []
 
-            # Store metrics for averaging
-            all_tt_latencies.append(tt_latency)
-            all_tt_accuracies.append(1 if tt_accuracy else 0)
-            all_tt_precisions.append(tt_metrics['precision'])
-            all_tt_recalls.append(tt_metrics['recall'])
-            all_tt_f1s.append(tt_metrics['f1'])
-            
-            if barge_in_metrics['has_barge_ins']:
-                all_barge_in_success_rates.append(barge_in_metrics['success_rate'])
-                if 'avg_latency_ms' in barge_in_metrics:
-                    all_barge_in_latencies.append(barge_in_metrics['avg_latency_ms'])
-            
-            # Calculate backchannel accuracy (percentage of successful backchannels)
-            bc_accuracy = sum(1 for x in bc_failure if not x) / len(bc_failure) if bc_failure else 0
-            all_bc_accuracies.append(bc_accuracy)
-
-            # Transcribe/extract text for segments
+            # Transcribe/extract text for segments (assuming user transcription is ready by default)
             user_transcripts = {}
             agent_transcripts = {}
             
@@ -1116,6 +1307,49 @@ def main(args):
                         16000, asr_model
                     )
                     user_transcripts[(seg['start'], seg['end'])] = transcript
+
+            # Initialize OpenAI client for GPT scoring if API key is available
+            openai_client = None
+            if args.openai_key:
+                try:
+                    openai_client = OpenAI(api_key=args.openai_key)
+                except Exception as e:
+                    print(f"Warning: Could not initialize OpenAI client: {e}")
+            
+            # Turn-taking metrics - compute once with optional GPT scoring if transcripts are available
+            tt_metrics = compute_turn_taking_metrics(
+                agent_segments, 
+                user_segments, 
+                args.tt_latency_threshold_sec, 
+                args.tt_precision_buffer_sec, 
+                args.tt_recall_buffer_sec,
+                user_transcripts=user_transcripts if user_transcripts else None,
+                agent_transcripts=agent_transcripts if agent_transcripts else None,
+                openai_client=openai_client,
+                gpt_model=args.gpt_model
+            )
+            tt_latency = tt_metrics['avg_latency']
+            tt_accuracy = tt_metrics['f1']  # Use F1 as overall accuracy metric
+            gpt_scores = tt_metrics.get('gpt_scores', [])
+            
+            if gpt_scores:
+                print(f"Computed {len(gpt_scores)} GPT scores")
+
+            # Store metrics for averaging
+            all_tt_latencies.append(tt_latency)
+            all_tt_accuracies.append(1 if tt_accuracy else 0)
+            all_tt_precisions.append(tt_metrics['precision'])
+            all_tt_recalls.append(tt_metrics['recall'])
+            all_tt_f1s.append(tt_metrics['f1'])
+            
+            if barge_in_metrics['has_barge_ins']:
+                all_barge_in_success_rates.append(barge_in_metrics['success_rate'])
+                if 'avg_latency_ms' in barge_in_metrics:
+                    all_barge_in_latencies.append(barge_in_metrics['avg_latency_ms'])
+            
+            # Calculate backchannel accuracy (percentage of successful backchannels)
+            bc_accuracy = sum(1 for x in bc_failure if not x) / len(bc_failure) if bc_failure else 0
+            all_bc_accuracies.append(bc_accuracy)
 
             # Compute cutoff metrics from agent_transcripts
             cutoff_segments = []
@@ -1146,7 +1380,8 @@ def main(args):
                 'agent_transcripts': agent_transcripts,
                 'cutoff_count': len(cutoff_segments),
                 'cutoff_rate': cutoff_rate,
-                'total_agent_segments_with_text': total_agent_segments_with_text
+                'total_agent_segments_with_text': total_agent_segments_with_text,
+                'gpt_scores': gpt_scores
             }
 
             # Store metrics for percentile analysis
@@ -1165,6 +1400,14 @@ def main(args):
         total_agent_segs_with_text = sum(m.get('total_agent_segments_with_text', 0) for m in all_metrics_dicts)
         avg_cutoff_rate = (total_cutoffs / total_agent_segs_with_text * 100) if total_agent_segs_with_text > 0 else 0.0
         
+        # Compute GPT score statistics
+        all_gpt_avg_scores = []
+        for m in all_metrics_dicts:
+            gpt_scores = m.get('gpt_scores', [])
+            for score_info in gpt_scores:
+                all_gpt_avg_scores.append(score_info.get('avg_score', 0.0))
+        avg_gpt_score = sum(all_gpt_avg_scores) / len(all_gpt_avg_scores) if all_gpt_avg_scores else 0.0
+        
         avg_metrics = {
             'avg_tt_latency': sum(_valid_tt_latencies) / len(_valid_tt_latencies) if _valid_tt_latencies else 0,
             'avg_tt_accuracy': sum(all_tt_accuracies) / len(all_tt_accuracies) * 100 if all_tt_accuracies else 0,
@@ -1178,8 +1421,17 @@ def main(args):
             'total_cutoffs': total_cutoffs,
             'total_agent_segments_with_text': total_agent_segs_with_text,
             'avg_cutoff_rate': avg_cutoff_rate,
+            'avg_gpt_score': avg_gpt_score,
+            'num_gpt_scores': len(all_gpt_avg_scores),
         }
 
+        gpt_score_str = ""
+        if avg_metrics['num_gpt_scores'] > 0:
+            gpt_score_str = f"""
+    5. GPT Quality Score:
+    - Average score: {avg_metrics['avg_gpt_score']:.2f}/5.0
+    - Number of scored pairs: {avg_metrics['num_gpt_scores']}"""
+        
         avg_metrics_str = f"""
     {'=' * 50}
     Average Metrics for \033[92m{val_set_name}\033[0m:
@@ -1194,8 +1446,8 @@ def main(args):
     3. Back-channeling:
     - Average accuracy: {avg_metrics['avg_bc_accuracy']:.1f}%
     4. Agent cutoff detection:
-    - Cutoff rate: {avg_metrics['avg_cutoff_rate']:.1f}% ({avg_metrics['total_cutoffs']}/{avg_metrics['total_agent_segments_with_text']})
-    5. Number of audios evaluated: {avg_metrics['num_audios_evaluated']}
+    - Cutoff rate: {avg_metrics['avg_cutoff_rate']:.1f}% ({avg_metrics['total_cutoffs']}/{avg_metrics['total_agent_segments_with_text']}){gpt_score_str}
+    6. Number of audios evaluated: {avg_metrics['num_audios_evaluated']}
     {'=' * 50}"""
 
         print(avg_metrics_str)
@@ -1207,11 +1459,22 @@ def main(args):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pred_audio_dir", type=str, default="/lustre/fsw/portfolios/convai/users/cchen1/results/s2s_rl/uc_samples")
-    parser.add_argument("--manifest_dir", type=str, default=None, required=False, help="Path to manifest directory. Optional.")
+    parser.add_argument("--manifest_dir", type=str, default=None, nargs='?', help="Path to manifest directory. Optional.")
     parser.add_argument("--barge_in_threshold_sec", type=float, default=1.5, help="Buffering time for the agent to stop after user barges in.")
     parser.add_argument("--tt_latency_threshold_sec", type=float, default=0.64, help="Threshold in seconds for considering a turn-taking to be accurate.")
     parser.add_argument("--tt_precision_buffer_sec", type=float, default=0.5, help="Buffer time in seconds for precision calculation (agent segments).")
     parser.add_argument("--tt_recall_buffer_sec", type=float, default=0.5, help="Buffer time in seconds for recall calculation (user segments).")
+    
+    # Read default OpenAI API key from file
+    default_openai_key = None
+    try:
+        with open('/lustre/fsw/portfolios/llmservice/users/kevinhu/HFCACHE/zh_openai_key.txt', 'r') as f:
+            default_openai_key = f.read().strip()
+    except Exception:
+        pass
+    
+    parser.add_argument("--openai_key", type=str, default=default_openai_key, help="API key for OpenAI authentication. Defaults to reading from zh_openai_key.txt file.")
+    parser.add_argument("--gpt_model", type=str, default="gpt-4o-mini", help="GPT model name to use for scoring user-agent turn pairs. Works with --openai_key.")
     parser.add_argument(
         "--end_time",
         type=lambda x: None if x is None or x.lower() == "none" else parse_float_list(x),
