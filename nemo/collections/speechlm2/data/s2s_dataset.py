@@ -408,7 +408,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 all_cuts_combined = cuts
             
             prompt_tokens, prompt_token_lens = collate_system_prompt(
-                all_cuts_combined, self.tokenizer
+                all_cuts_combined, self.tokenizer, force_add_prompt=self.model_cfg.get('model', {}).get('force_add_prompt', None)
             )
             source_audio, source_audio_lens = collate_audio(all_cuts_combined.resample(self.source_sample_rate))
             target_audio, target_audio_lens = collate_audio(
@@ -764,16 +764,29 @@ def collate_token_channel(
 def collate_system_prompt(
     cuts: CutSet,
     tokenizer: TokenizerSpec,
+    force_add_prompt: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Collate system prompts from cuts.
     System prompts should be stored in cut.custom['system_prompt'].
+    
+    Args:
+        cuts: CutSet containing the cuts to collate
+        tokenizer: Tokenizer for converting text to tokens
+        force_add_prompt: Optional string to force as system prompt for all cuts,
+                          overriding any existing system_prompt in cut.custom
     """
     pad_id = get_pad_id(tokenizer)
     tokens = []
     for c in cuts:
-        # Check if system prompt exists in custom field
-        if c.custom and c.custom.get("system_prompt", None):
+        # Use force_add_prompt if provided, otherwise check custom field
+        if force_add_prompt:
+            prompt_text = force_add_prompt
+            tokens.append(torch.as_tensor(
+                [tokenizer.bos] + tokenizer.text_to_ids(prompt_text) + [tokenizer.eos],
+                dtype=torch.long
+            ))
+        elif c.custom and c.custom.get("system_prompt", None):
             prompt_text = c.custom["system_prompt"]
             tokens.append(torch.as_tensor(
                 [tokenizer.bos] + tokenizer.text_to_ids(prompt_text) + [tokenizer.eos],

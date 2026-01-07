@@ -1196,10 +1196,15 @@ def guess_parse_cutset(inp: Union[str, dict, omegaconf.DictConfig]) -> CutSet:
         raise RuntimeError(f'Unsupported input type: {type(inp)} (expected a dict or a string)')
 
 
-def _convert_tarred_to_duplex(cut, agent_silence_duration):
+def _convert_tarred_to_duplex(cut, agent_silence_duration, prompt=None):
     """Helper function to convert single supervision to duplex format.
     
     This is a module-level function (not nested) so it can be pickled for multiprocessing.
+    
+    Args:
+        cut: The cut to convert
+        agent_silence_duration: Duration of agent silence
+        prompt: If provided, adds this string as system_prompt to cut.custom
     """
     if len(cut.supervisions) != 1:
         # Skip cuts that don't have exactly one supervision
@@ -1208,23 +1213,25 @@ def _convert_tarred_to_duplex(cut, agent_silence_duration):
     original_sup = cut.supervisions[0]
     orig_user_duration = cut.duration
 
-    # Note here we use the last part of the audio as agent silence, which may cut user text, but this avoid using synthetic silence
-    # TODO(kevinhu): Evaluate how this impacts user EOU
-
     # Append agent_silence_duration of silence to the original recording
     if agent_silence_duration > 0:
-        sr = cut.recording.sampling_rate
-        user_sil_samples = int(agent_silence_duration * sr)
-        silence_audio = np.zeros((1, user_sil_samples), dtype=np.float32)
-        # Concatenate silence to the end of the original audio
-        orig_audio = cut.recording.load_audio()
-        if orig_audio.ndim == 1:
-            orig_audio = orig_audio[None, :]
-        new_audio = np.concatenate([orig_audio, silence_audio], axis=1)
-        # Create a new Recording with the extended audio
-        new_recording = create_recording_from_array(new_audio, sr, cut.recording.id)
-        cut.recording = new_recording
-        cut.duration = new_audio.shape[1] / sr
+        try:
+            sr = cut.recording.sampling_rate
+            user_sil_samples = int(agent_silence_duration * sr)
+            silence_audio = np.zeros((1, user_sil_samples), dtype=np.float32)
+            # Concatenate silence to the end of the original audio
+            orig_audio = cut.recording.load_audio()
+            if orig_audio.ndim == 1:
+                orig_audio = orig_audio[None, :]
+            new_audio = np.concatenate([orig_audio, silence_audio], axis=1)
+            # Create a new Recording with the extended audio
+            new_recording = create_recording_from_array(new_audio, sr, cut.recording.id)
+            cut.recording = new_recording
+            cut.duration = new_audio.shape[1] / sr
+        except Exception as e:
+            # Skip cuts with bad/corrupted audio
+            logging.warning(f"Skipping cut {cut.id} due to audio loading error: {e}")
+            return None
     
     # Create user supervision (original speech)
     user_dur = orig_user_duration
@@ -1268,6 +1275,10 @@ def _convert_tarred_to_duplex(cut, agent_silence_duration):
         cut.custom = {}
     cut.custom["target_audio"] = silence_recording
     
+    # Add system_prompt if prompt is provided
+    if prompt is not None:
+        cut.custom["system_prompt"] = prompt
+    
     return cut
 
 
@@ -1277,6 +1288,8 @@ def read_nemo_tarred_to_duplex(config) -> tuple[CutSet, bool]:
     
     # by default, use the last part of user audio as agent silence duration
     agent_silence_duration = config.get("agent_silence_duration", -0.08)
+    # read system prompt from config if provided
+    prompt = config.get("prompt", None)
 
     # Reuse the existing nemo_tarred parser by creating a config with type: nemo_tarred
     nemo_config = DictConfig(config)
@@ -1286,7 +1299,7 @@ def read_nemo_tarred_to_duplex(config) -> tuple[CutSet, bool]:
     cuts, is_tarred = read_nemo_manifest(nemo_config)
     
     # Apply the conversion using functools.partial to make it picklable
-    convert_fn = partial(_convert_tarred_to_duplex, agent_silence_duration=agent_silence_duration)
+    convert_fn = partial(_convert_tarred_to_duplex, agent_silence_duration=agent_silence_duration, prompt=prompt)
     cuts = cuts.map(convert_fn)
     
     return cuts, is_tarred
