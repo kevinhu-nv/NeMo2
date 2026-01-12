@@ -9,6 +9,8 @@ import json, os, re
 import argparse
 from nemo.collections import asr as nemo_asr
 from openai import OpenAI
+from jiwer import wer
+from whisper_normalizer.english import EnglishTextNormalizer
 
 INF_LATENCY = 9999.0
 
@@ -30,6 +32,105 @@ def remove_special_symbols(text):
     # Remove patterns like <SPECIAL_12>, <SPECIAL_1>, etc.
     text = re.sub(r'<SPECIAL_\d+>', '', text)
     return text.strip()
+
+
+def clean_predicted_text(text):
+    """
+    Clean predicted text by removing timestamps and special markers.
+    """
+    import re
+    # Remove all caret characters
+    text = text.replace('^', '')
+    # Remove all occurrences of <|...|>
+    text = re.sub(r'<\|.*?\|>', '', text)
+    # Remove all occurrences of <$...$>
+    text = re.sub(r'<\$.*?\$>', '', text)
+    # Remove all occurrences of <SPECIAL_12>
+    text = text.replace('<SPECIAL_12>', '')
+    return text.strip()
+
+
+def compute_wer_for_text(reference, hypothesis, normalizer=None):
+    """
+    Compute WER between reference and hypothesis text.
+    
+    Args:
+        reference: Ground truth text
+        hypothesis: Predicted text
+        normalizer: Optional text normalizer (e.g., EnglishTextNormalizer)
+    
+    Returns:
+        WER as a float (0.0 to 1.0+)
+    """
+    if not reference or not hypothesis:
+        return 0.0
+    
+    try:
+        # Normalize texts if normalizer is provided
+        if normalizer:
+            reference = normalizer(reference)
+            hypothesis = normalizer(hypothesis)
+        
+        wer_score = wer(reference, hypothesis)
+        return wer_score
+    except Exception as e:
+        print(f"Error computing WER: {e}")
+        return 0.0
+
+
+def parse_user_timestamped_text(text_with_timestamps):
+    """
+    Parse user timestamped text to extract segments.
+    
+    Args:
+        text_with_timestamps: Text with <|timestamp|> BOS and <$timestamp$> EOS markers for user speech
+                              Example: ' <|1.12|> hello what is the best way <$6.96$>  <|11.36|> can you provide <$15.84$>'
+    
+    Returns:
+        List of user segments with 'start', 'end', and 'text' fields
+    """
+    import re
+    
+    # Parse both BOS and EOS timestamps for user speech
+    bos_pattern = r'<\|([\d\.]+)\|>'
+    eos_pattern = r'<\$([\d\.]+)\$>'
+    
+    # Find all BOS and EOS markers with their positions
+    bos_matches = list(re.finditer(bos_pattern, text_with_timestamps))
+    eos_matches = list(re.finditer(eos_pattern, text_with_timestamps))
+    
+    bos_timestamps = [float(match.group(1)) for match in bos_matches]
+    eos_timestamps = [float(match.group(1)) for match in eos_matches]
+    
+    user_segments = []
+    
+    # Pair up BOS and EOS timestamps
+    if bos_timestamps and eos_timestamps:
+        for i, start_time in enumerate(bos_timestamps):
+            # Find the corresponding EOS timestamp (next EOS after this BOS)
+            end_time = None
+            eos_idx = None
+            for j, eos_time in enumerate(eos_timestamps):
+                if eos_time > start_time:
+                    end_time = eos_time
+                    eos_idx = j
+                    break
+            
+            # Extract text between BOS and EOS markers
+            text = ""
+            if end_time is not None and i < len(bos_matches) and eos_idx < len(eos_matches):
+                bos_end_pos = bos_matches[i].end()
+                eos_start_pos = eos_matches[eos_idx].start()
+                text = text_with_timestamps[bos_end_pos:eos_start_pos].strip()
+            
+            if end_time is not None:
+                user_segments.append({
+                    'start': start_time,
+                    'end': end_time,
+                    'text': text
+                })
+    
+    return user_segments
 
 
 def parse_timestamped_text(text_with_timestamps, estimate_sec_per_word=0.3, cutoff_threshold=2.0, user_segments=None, gap_threshold=2.0):
@@ -191,7 +292,19 @@ def parse_timestamped_text(text_with_timestamps, estimate_sec_per_word=0.3, cuto
     return agent_segments
 
 
-def load_jsonl(json_file, field_name='pred_text'):
+def load_jsonl(json_file, field_name='pred_text', additional_fields=None):
+    """
+    Load JSONL file and extract specified fields.
+    
+    Args:
+        json_file: Path to JSONL file
+        field_name: Primary field to extract (default: 'pred_text')
+        additional_fields: List of additional field names to extract (optional)
+    
+    Returns:
+        If additional_fields is None: dict mapping filename to field value
+        If additional_fields is provided: dict mapping filename to dict of {field_name: value, additional_field1: value1, ...}
+    """
     output = {}
     
     with open(json_file, 'r', encoding='utf-8') as f:
@@ -216,7 +329,13 @@ def load_jsonl(json_file, field_name='pred_text'):
                     else:
                         filename = audio_path
                     
-                    output[filename] = pred_text
+                    # If additional fields are requested, store as dict
+                    if additional_fields:
+                        output[filename] = {field_name: pred_text}
+                        for field in additional_fields:
+                            output[filename][field] = data.get(field, '')
+                    else:
+                        output[filename] = pred_text
     return output
 
 
@@ -470,6 +589,8 @@ def print_detailed_utterance(metrics_dict):
     """
     user_transcripts = metrics_dict.get('user_transcripts', {})
     agent_transcripts = metrics_dict.get('agent_transcripts', {})
+    predicted_user_transcripts = metrics_dict.get('predicted_user_transcripts', {})
+    user_wer_scores = metrics_dict.get('user_wer_scores', {})
     
     # Build header
     print(f"\n{'=' * 80}")
@@ -502,6 +623,15 @@ def print_detailed_utterance(metrics_dict):
         print(f"  GPT Quality Score:")
         print(f"    - Average: {avg_gpt_score:.2f}/5.0 ({len(gpt_scores)} pairs)")
     
+    if 'user_eou_metrics' in metrics_dict and metrics_dict['user_eou_metrics']:
+        user_eou = metrics_dict['user_eou_metrics']
+        print(f"  User EOU Detection:")
+        print(f"    - Precision: {user_eou['precision']:.3f}")
+        print(f"    - Recall: {user_eou['recall']:.3f}")
+        print(f"    - F1: {user_eou['f1']:.3f}")
+        print(f"    - Avg EOU latency: {user_eou['avg_eou_latency']:.3f}s ({user_eou['avg_eou_latency']*1000:.1f}ms)")
+        print(f"    - Early/Late/On-time: {user_eou['early_eou_count']}/{user_eou['late_eou_count']}/{user_eou['true_positives'] - user_eou['early_eou_count'] - user_eou['late_eou_count']}")
+    
     # Print all segments in chronological order
     print(f"\nConversation flow:")
     all_segments = []
@@ -526,10 +656,21 @@ def print_detailed_utterance(metrics_dict):
         
         if seg['type'] == 'User':
             transcript = user_transcripts.get(seg_key, '')
+            predicted_transcript = predicted_user_transcripts.get(seg_key, '')
+            wer_score = user_wer_scores.get(seg_key, None)
+            
+            wer_info = ""
+            if wer_score is not None:
+                color_code = "\033[91m" if wer_score > 0.3 else "\033[93m" if wer_score > 0.1 else "\033[92m"
+                wer_info = f" {color_code}[WER: {wer_score:.1%}]\033[0m"
+            
             if transcript:
-                print(f"  \033[94mUser\033[0m  [{seg['start']:7.3f}s - {seg['end']:7.3f}s] ({duration:.3f}s): {transcript}")
+                transcript_info = f": GT: '{transcript}'"
+                if predicted_transcript:
+                    transcript_info += f" | Pred: '{predicted_transcript}'"
+                print(f"  \033[94mUser\033[0m  [{seg['start']:7.3f}s - {seg['end']:7.3f}s] ({duration:.3f}s){wer_info}{transcript_info}")
             else:
-                print(f"  \033[94mUser\033[0m  [{seg['start']:7.3f}s - {seg['end']:7.3f}s] ({duration:.3f}s)")
+                print(f"  \033[94mUser\033[0m  [{seg['start']:7.3f}s - {seg['end']:7.3f}s] ({duration:.3f}s){wer_info}")
         else:  # Agent
             seg_info = agent_transcripts.get(seg_key, None)
             gpt_score_info = gpt_scores_by_agent.get(seg_key, None)
@@ -712,6 +853,8 @@ def print_metrics(metrics_dict, verbose=False):
         # Get transcripts if available
         user_transcripts = metrics_dict.get('user_transcripts', {})
         agent_transcripts = metrics_dict.get('agent_transcripts', {})
+        predicted_user_transcripts = metrics_dict.get('predicted_user_transcripts', {})
+        user_wer_scores = metrics_dict.get('user_wer_scores', {})
         
         # General speech segments - combine and sort by start time
         all_segments = []
@@ -755,14 +898,22 @@ def print_metrics(metrics_dict, verbose=False):
             transcript = ""
             
             if seg['type'] == 'User':
+                wer_score = user_wer_scores.get(seg_key, None)
+                wer_info = ""
+                if wer_score is not None:
+                    color_code = "\033[91m" if wer_score > 0.3 else "\033[93m" if wer_score > 0.1 else "\033[92m"
+                    wer_info = f" {color_code}[WER: {wer_score:.1%}]\033[0m"
+                
                 if seg_key in user_transcripts:
-                    transcript = f" ({user_transcripts[seg_key]})"
+                    transcript = f" (GT: {user_transcripts[seg_key]})"
+                    if seg_key in predicted_user_transcripts:
+                        transcript += f" (Pred: {predicted_user_transcripts[seg_key]})"
                 
                 if seg_key in user_to_agent_latencies:
                     latency = user_to_agent_latencies[seg_key]
-                    return f"   \033[94m{seg['type']:5s}\033[0m [{seg['start']:6.3f}s - {seg['end']:6.3f}s], \033[93m{latency:.3f}s\033[0m{transcript}"
+                    return f"   \033[94m{seg['type']:5s}\033[0m [{seg['start']:6.3f}s - {seg['end']:6.3f}s], \033[93m{latency:.3f}s\033[0m{wer_info}{transcript}"
                 else:
-                    return f"   \033[94m{seg['type']:5s}\033[0m [{seg['start']:6.3f}s - {seg['end']:6.3f}s]{transcript}"
+                    return f"   \033[94m{seg['type']:5s}\033[0m [{seg['start']:6.3f}s - {seg['end']:6.3f}s]{wer_info}{transcript}"
             else:  # Agent
                 gpt_score_info = gpt_scores_by_agent.get(seg_key, None)
                 gpt_info = ""
@@ -817,6 +968,19 @@ def print_metrics(metrics_dict, verbose=False):
                     barge_in_segments.append(f"     Agent: [{bi['agent']['start']:.3f}s - {bi['agent']['end']:.3f}s]")
                     barge_in_segments.append(f"     Stop duration: {bi['stop_duration_ms']:.3f} ms")
 
+        # EOU metrics
+        eou_info = ""
+        if 'user_eou_metrics' in metrics_dict and metrics_dict['user_eou_metrics']:
+            user_eou = metrics_dict['user_eou_metrics']
+            on_time_count = user_eou['true_positives'] - user_eou['early_eou_count'] - user_eou['late_eou_count']
+            eou_info = f"""
+6. User EOU Detection:
+   - Precision: {user_eou['precision']:.3f}
+   - Recall: {user_eou['recall']:.3f}
+   - F1: {user_eou['f1']:.3f}
+   - Avg EOU latency: {user_eou['avg_eou_latency']:.3f}s ({user_eou['avg_eou_latency']*1000:.1f}ms)
+   - Early/Late/On-time: {user_eou['early_eou_count']}/{user_eou['late_eou_count']}/{on_time_count}"""
+
         segment_info = f"""
 4. Speech segments (chronological order):
 {segments_str}
@@ -833,7 +997,7 @@ Evaluation metrics for conversation {metrics_dict['item_id']}:
    - F1: {metrics_dict['tt_f1']:.3f}
 2. Barge-in statistics:
 {chr(10).join(barge_in_stats)}
-3. Backchanneling failures: {metrics_dict['bc_failure']}{segment_info}
+3. Backchanneling failures: {metrics_dict['bc_failure']}{segment_info}{eou_info}
 {'-' * 50}"""
 
     print(output)
@@ -1018,6 +1182,148 @@ You don't need to provide any explanations.
     return gpt_scores
 
 
+def compute_user_eou_metrics(predicted_user_segments, gt_user_segments, match_threshold_sec=2.0):
+    """
+    Compute user EOU (End-of-Utterance) detection metrics by comparing predicted segments with ground truth.
+    
+    Args:
+        predicted_user_segments: List of predicted user segments with 'start' and 'end' times
+        gt_user_segments: List of ground truth user segments (from VAD) with 'start' and 'end' times
+        match_threshold_sec: Threshold in seconds for matching start and end times (default: 2.0)
+    
+    Returns:
+        dict: Contains precision, recall, f1, matched segments info, and EOU latency statistics
+    """
+    if not predicted_user_segments or not gt_user_segments:
+        return {
+            'precision': 0.0,
+            'recall': 0.0,
+            'f1': 0.0,
+            'true_positives': 0,
+            'false_positives': 0,
+            'false_negatives': 0,
+            'eou_latencies': [],
+            'avg_eou_latency': 0.0,
+            'early_eou_count': 0,
+            'late_eou_count': 0,
+            'matched_pairs': []
+        }
+    
+    # Track which segments have been matched
+    matched_pred_indices = set()
+    matched_gt_indices = set()
+    matched_pairs = []
+    eou_latencies = []
+    
+    # For each predicted segment, try to find a matching GT segment
+    for i, pred_seg in enumerate(predicted_user_segments):
+        best_match_idx = None
+        best_match_score = float('inf')
+        
+        for j, gt_seg in enumerate(gt_user_segments):
+            if j in matched_gt_indices:
+                continue
+            
+            # Check if start and end times are within threshold
+            start_diff = abs(pred_seg['start'] - gt_seg['start'])
+            end_diff = abs(pred_seg['end'] - gt_seg['end'])
+            
+            if start_diff <= match_threshold_sec and end_diff <= match_threshold_sec:
+                # Score based on combined difference (lower is better)
+                match_score = start_diff + end_diff
+                if match_score < best_match_score:
+                    best_match_score = match_score
+                    best_match_idx = j
+        
+        # If found a match, record it
+        if best_match_idx is not None:
+            matched_pred_indices.add(i)
+            matched_gt_indices.add(best_match_idx)
+            
+            gt_seg = gt_user_segments[best_match_idx]
+            eou_latency = pred_seg['end'] - gt_seg['end']  # Positive = late, Negative = early
+            eou_latencies.append(eou_latency)
+            
+            matched_pairs.append({
+                'predicted': pred_seg,
+                'ground_truth': gt_seg,
+                'eou_latency': eou_latency,
+                'start_diff': abs(pred_seg['start'] - gt_seg['start']),
+                'end_diff': abs(pred_seg['end'] - gt_seg['end'])
+            })
+    
+    # Calculate metrics
+    tp = len(matched_pred_indices)
+    fp = len(predicted_user_segments) - tp
+    fn = len(gt_user_segments) - len(matched_gt_indices)
+    
+    # Visualize segment matching
+    print("\n" + "="*80)
+    print("SEGMENT MATCHING VISUALIZATION")
+    print("="*80)
+    
+    # Show matched pairs (True Positives)
+    if matched_pairs:
+        print(f"\n✓ MATCHED SEGMENTS (True Positives: {tp}):")
+        print("-" * 80)
+        for i, pair in enumerate(matched_pairs, 1):
+            pred = pair['predicted']
+            gt = pair['ground_truth']
+            print(f"  Match #{i}:")
+            print(f"    Predicted:     [{pred['start']:.2f}s - {pred['end']:.2f}s] (duration: {pred['end']-pred['start']:.2f}s)")
+            print(f"    Ground Truth:  [{gt['start']:.2f}s - {gt['end']:.2f}s] (duration: {gt['end']-gt['start']:.2f}s)")
+            print(f"    Differences:   start_diff={pair['start_diff']:.3f}s, end_diff={pair['end_diff']:.3f}s, eou_latency={pair['eou_latency']:.3f}s")
+            print()
+    
+    # Show false positives (predicted but no match)
+    fp_segments = [seg for i, seg in enumerate(predicted_user_segments) if i not in matched_pred_indices]
+    if fp_segments:
+        print(f"\n✗ FALSE POSITIVES (Predicted but no GT match: {fp}):")
+        print("-" * 80)
+        for i, seg in enumerate(fp_segments, 1):
+            print(f"  FP #{i}: [{seg['start']:.2f}s - {seg['end']:.2f}s] (duration: {seg['end']-seg['start']:.2f}s)")
+        print()
+    
+    # Show false negatives (GT but no match)
+    fn_segments = [seg for i, seg in enumerate(gt_user_segments) if i not in matched_gt_indices]
+    if fn_segments:
+        print(f"\n✗ FALSE NEGATIVES (GT but no prediction match: {fn}):")
+        print("-" * 80)
+        for i, seg in enumerate(fn_segments, 1):
+            print(f"  FN #{i}: [{seg['start']:.2f}s - {seg['end']:.2f}s] (duration: {seg['end']-seg['start']:.2f}s)")
+        print()
+    
+    print("="*80 + "\n")
+    
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+    
+    # Calculate EOU latency statistics
+    avg_eou_latency = sum(eou_latencies) / len(eou_latencies) if eou_latencies else 0.0
+    early_eou_count = sum(1 for lat in eou_latencies if lat <= -2.0)
+    late_eou_count = sum(1 for lat in eou_latencies if lat > 0)
+    
+    print(f"User EOU Detection - TP: {tp}, FP: {fp}, FN: {fn}")
+    print(f"User EOU Detection - Precision: {precision:.3f}, Recall: {recall:.3f}, F1: {f1:.3f}")
+    print(f"User EOU Detection - Avg EOU Latency: {avg_eou_latency:.3f}s ({avg_eou_latency*1000:.1f}ms)")
+    print(f"User EOU Detection - Early: {early_eou_count}, Late: {late_eou_count}, On-time: {len(eou_latencies) - early_eou_count - late_eou_count}")
+    
+    return {
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'true_positives': tp,
+        'false_positives': fp,
+        'false_negatives': fn,
+        'eou_latencies': eou_latencies,
+        'avg_eou_latency': avg_eou_latency,
+        'early_eou_count': early_eou_count,
+        'late_eou_count': late_eou_count,
+        'matched_pairs': matched_pairs
+    }
+
+
 def compute_turn_taking_metrics(agent_segments, user_segments, tt_latency_threshold_sec, tt_precision_buffer_sec, tt_recall_buffer_sec, user_transcripts=None, agent_transcripts=None, openai_client=None, gpt_model="gpt-4o-mini"):
     """
     Compute turn-taking metrics using precision and recall, and optionally compute GPT scores for user-agent turn pairs.
@@ -1139,6 +1445,9 @@ def main(args):
     asr_model = None
     if args.enable_transcription:
         asr_model = init_asr_model(args.asr_model_name)
+    
+    # Initialize text normalizer for WER computation
+    text_normalizer = EnglishTextNormalizer() if args.enable_transcription else None
 
     manifest_dir = args.manifest_dir
     pred_audio_dir= args.pred_audio_dir
@@ -1147,8 +1456,14 @@ def main(args):
     timestamped_preds = None
     if args.jsonl_with_timestamp:
         print(f"Loading timestamped predictions from: {args.jsonl_with_timestamp}")
-        timestamped_preds = load_jsonl(args.jsonl_with_timestamp, field_name='pred_text')
-        print(f"Loaded {len(timestamped_preds)} timestamped predictions")
+        
+        # If compute_user_eou is enabled, also load pred_src_text field
+        if args.compute_user_eou:
+            timestamped_preds = load_jsonl(args.jsonl_with_timestamp, field_name='pred_text', additional_fields=['pred_src_text'])
+            print(f"Loaded {len(timestamped_preds)} timestamped predictions (including pred_src_text for user EOU)")
+        else:
+            timestamped_preds = load_jsonl(args.jsonl_with_timestamp, field_name='pred_text')
+            print(f"Loaded {len(timestamped_preds)} timestamped predictions")
 
     validation_set_names = getattr(args, "validation_set_names", None)
     if isinstance(validation_set_names, str):
@@ -1165,6 +1480,15 @@ def main(args):
         all_barge_in_success_rates = []
         all_barge_in_latencies = []
         all_bc_accuracies = []
+        
+        # Lists for user EOU metrics
+        all_user_eou_precisions = []
+        all_user_eou_recalls = []
+        all_user_eou_f1s = []
+        all_user_eou_latencies = []
+        
+        # List for user WER metrics
+        all_user_wer_scores = []
         
         # List to store all metrics dictionaries for percentile analysis
         all_metrics_dicts = []
@@ -1242,10 +1566,40 @@ def main(args):
             user_vad_results = get_speech_timestamps(user_audio.to('cuda'), vad_model, sampling_rate=16000, min_silence_duration_ms=args.vad_min_silence_duration_ms)
             user_segments = [{'start': s['start'] / 16000, 'end': s['end'] / 16000} for s in user_vad_results]
             
+            # Extract predicted user segments from pred_src_text if compute_user_eou is enabled
+            predicted_user_segments = None
+            user_eou_metrics = None
+            predicted_user_transcripts = {}
+            user_wer_scores = {}
+            
+            if args.compute_user_eou and matching_key and isinstance(timestamped_preds.get(matching_key), dict):
+                pred_src_text = timestamped_preds[matching_key].get('pred_src_text', '')
+                if pred_src_text:
+                    print(f"Parsing predicted user segments from pred_src_text for {matching_key}")
+                    predicted_user_segments = parse_user_timestamped_text(pred_src_text)
+                    print(f"Parsed {len(predicted_user_segments)} predicted user segments")
+                    
+                    # Store predicted user transcripts
+                    for seg in predicted_user_segments:
+                        seg_key = (seg['start'], seg['end'])
+                        predicted_user_transcripts[seg_key] = seg['text']
+                    
+                    # Compute user EOU metrics
+                    user_eou_metrics = compute_user_eou_metrics(
+                        predicted_user_segments,
+                        user_segments,
+                        match_threshold_sec=args.user_eou_match_threshold_sec
+                    )
+            
             # Extract agent segments (with cutoff detection if using timestamped text)
             if matching_key:
                 print(f"Using timestamped text predictions for {matching_key}")
-                timestamped_text = timestamped_preds[matching_key]
+                # Handle both dict and string formats for timestamped_preds
+                if isinstance(timestamped_preds[matching_key], dict):
+                    timestamped_text = timestamped_preds[matching_key]['pred_text']
+                else:
+                    timestamped_text = timestamped_preds[matching_key]
+                
                 agent_segments = parse_timestamped_text(
                     timestamped_text, 
                     estimate_sec_per_word=args.estimate_sec_per_word,
@@ -1285,7 +1639,12 @@ def main(args):
             
             # Extract agent text from timestamped predictions if available
             if timestamped_preds and matching_key:
-                timestamped_text = timestamped_preds[matching_key]
+                # Handle both dict and string formats for timestamped_preds
+                if isinstance(timestamped_preds[matching_key], dict):
+                    timestamped_text = timestamped_preds[matching_key]['pred_text']
+                else:
+                    timestamped_text = timestamped_preds[matching_key]
+                
                 agent_segments_with_text = parse_timestamped_text(
                     timestamped_text,
                     estimate_sec_per_word=args.estimate_sec_per_word,
@@ -1307,6 +1666,38 @@ def main(args):
                         16000, asr_model
                     )
                     user_transcripts[(seg['start'], seg['end'])] = transcript
+                
+                # Compute WER for matched predicted and transcribed user segments
+                # Use the matched pairs from EOU computation to ensure consistency
+                if predicted_user_transcripts and user_transcripts and user_eou_metrics:
+                    matched_pairs = user_eou_metrics.get('matched_pairs', [])
+                    print(f"Computing WER for {len(matched_pairs)} matched user segments (from EOU pairs)...")
+                    
+                    for pair in matched_pairs:
+                        gt_seg = pair['ground_truth']
+                        pred_seg = pair['predicted']
+                        
+                        gt_key = (gt_seg['start'], gt_seg['end'])
+                        pred_key = (pred_seg['start'], pred_seg['end'])
+                        
+                        gt_text = user_transcripts.get(gt_key, '')
+                        pred_text_raw = predicted_user_transcripts.get(pred_key, '')
+                        
+                        if gt_text and pred_text_raw:
+                            pred_text = clean_predicted_text(pred_text_raw)
+                            wer_score = compute_wer_for_text(gt_text, pred_text, normalizer=text_normalizer)
+                            user_wer_scores[gt_key] = wer_score
+                            print(f"  User segment GT:[{gt_seg['start']:.3f}s - {gt_seg['end']:.3f}s] Pred:[{pred_seg['start']:.3f}s - {pred_seg['end']:.3f}s]: WER = {wer_score:.1%}")
+                            if text_normalizer:
+                                normalized_gt = text_normalizer(gt_text)
+                                normalized_pred = text_normalizer(pred_text)
+                                print(f"    GT (raw):        '{gt_text}'")
+                                print(f"    Pred (raw):      '{pred_text}'")
+                                print(f"    GT (norm):       '{normalized_gt}'")
+                                print(f"    Pred (norm):     '{normalized_pred}'")
+                            else:
+                                print(f"    GT:   '{gt_text}'")
+                                print(f"    Pred: '{pred_text}'")
 
             # Initialize OpenAI client for GPT scoring if API key is available
             openai_client = None
@@ -1350,6 +1741,18 @@ def main(args):
             # Calculate backchannel accuracy (percentage of successful backchannels)
             bc_accuracy = sum(1 for x in bc_failure if not x) / len(bc_failure) if bc_failure else 0
             all_bc_accuracies.append(bc_accuracy)
+            
+            # Store user EOU metrics if computed
+            if user_eou_metrics is not None:
+                all_user_eou_precisions.append(user_eou_metrics['precision'])
+                all_user_eou_recalls.append(user_eou_metrics['recall'])
+                all_user_eou_f1s.append(user_eou_metrics['f1'])
+                if user_eou_metrics['eou_latencies']:
+                    all_user_eou_latencies.extend(user_eou_metrics['eou_latencies'])
+            
+            # Store user WER scores
+            if user_wer_scores:
+                all_user_wer_scores.extend(user_wer_scores.values())
 
             # Compute cutoff metrics from agent_transcripts
             cutoff_segments = []
@@ -1378,10 +1781,13 @@ def main(args):
                 'failed_barge_ins': failed_barge_ins,
                 'user_transcripts': user_transcripts,
                 'agent_transcripts': agent_transcripts,
+                'predicted_user_transcripts': predicted_user_transcripts,
+                'user_wer_scores': user_wer_scores,
                 'cutoff_count': len(cutoff_segments),
                 'cutoff_rate': cutoff_rate,
                 'total_agent_segments_with_text': total_agent_segments_with_text,
-                'gpt_scores': gpt_scores
+                'gpt_scores': gpt_scores,
+                'user_eou_metrics': user_eou_metrics
             }
 
             # Store metrics for percentile analysis
@@ -1423,6 +1829,13 @@ def main(args):
             'avg_cutoff_rate': avg_cutoff_rate,
             'avg_gpt_score': avg_gpt_score,
             'num_gpt_scores': len(all_gpt_avg_scores),
+            'avg_user_eou_precision': sum(all_user_eou_precisions) / len(all_user_eou_precisions) * 100 if all_user_eou_precisions else 0,
+            'avg_user_eou_recall': sum(all_user_eou_recalls) / len(all_user_eou_recalls) * 100 if all_user_eou_recalls else 0,
+            'avg_user_eou_f1': sum(all_user_eou_f1s) / len(all_user_eou_f1s) * 100 if all_user_eou_f1s else 0,
+            'avg_user_eou_latency': sum(all_user_eou_latencies) / len(all_user_eou_latencies) if all_user_eou_latencies else 0,
+            'num_user_eou_evaluated': len(all_user_eou_precisions),
+            'avg_user_wer': sum(all_user_wer_scores) / len(all_user_wer_scores) if all_user_wer_scores else 0,
+            'num_user_wer_evaluated': len(all_user_wer_scores),
         }
 
         gpt_score_str = ""
@@ -1431,6 +1844,26 @@ def main(args):
     5. GPT Quality Score:
     - Average score: {avg_metrics['avg_gpt_score']:.2f}/5.0
     - Number of scored pairs: {avg_metrics['num_gpt_scores']}"""
+        
+        user_eou_str = ""
+        if avg_metrics['num_user_eou_evaluated'] > 0:
+            user_eou_str = f"""
+    6. User EOU Detection:
+    - Precision: {avg_metrics['avg_user_eou_precision']:.1f}%
+    - Recall: {avg_metrics['avg_user_eou_recall']:.1f}%
+    - F1: {avg_metrics['avg_user_eou_f1']:.1f}%
+    - Average EOU latency: {avg_metrics['avg_user_eou_latency'] * 1000:.1f} ms
+    - Number of samples: {avg_metrics['num_user_eou_evaluated']}"""
+        
+        user_wer_str = ""
+        if avg_metrics['num_user_wer_evaluated'] > 0:
+            wer_section_num = 7 if user_eou_str else 6
+            user_wer_str = f"""
+    {wer_section_num}. User Speech Recognition (WER):
+    - Average WER: {avg_metrics['avg_user_wer']:.1%}
+    - Number of segments evaluated: {avg_metrics['num_user_wer_evaluated']}"""
+        
+        num_section = 8 if (user_eou_str and user_wer_str) else (7 if (user_eou_str or user_wer_str) else 6)
         
         avg_metrics_str = f"""
     {'=' * 50}
@@ -1446,8 +1879,8 @@ def main(args):
     3. Back-channeling:
     - Average accuracy: {avg_metrics['avg_bc_accuracy']:.1f}%
     4. Agent cutoff detection:
-    - Cutoff rate: {avg_metrics['avg_cutoff_rate']:.1f}% ({avg_metrics['total_cutoffs']}/{avg_metrics['total_agent_segments_with_text']}){gpt_score_str}
-    6. Number of audios evaluated: {avg_metrics['num_audios_evaluated']}
+    - Cutoff rate: {avg_metrics['avg_cutoff_rate']:.1f}% ({avg_metrics['total_cutoffs']}/{avg_metrics['total_agent_segments_with_text']}){gpt_score_str}{user_eou_str}{user_wer_str}
+    {num_section}. Number of audios evaluated: {avg_metrics['num_audios_evaluated']}
     {'=' * 50}"""
 
         print(avg_metrics_str)
@@ -1499,6 +1932,8 @@ def parse_args():
     parser.add_argument("--cutoff_duration_threshold_sec", type=float, default=2, help="Threshold in seconds for marking agent segment as cut off based on duration mismatch (estimated vs actual).")
     parser.add_argument("--cutoff_gap_threshold_sec", type=float, default=2, help="Minimum gap in seconds between estimated agent end and next user start to consider agent segment as cut off.")
     parser.add_argument("--estimate_sec_per_word", type=float, default=0.3, help="Estimated seconds per word for duration calculation when detecting cutoffs.")
+    parser.add_argument("--compute_user_eou", action="store_true", default=False, help="Compute user EOU (End-of-Utterance) detection metrics by comparing predicted user segments from pred_src_text with ground truth VAD segments.")
+    parser.add_argument("--user_eou_match_threshold_sec", type=float, default=2.0, help="Threshold in seconds for matching predicted and ground truth user segment start/end times when computing EOU metrics.")
     return parser.parse_args()
 
 if __name__ == "__main__":
