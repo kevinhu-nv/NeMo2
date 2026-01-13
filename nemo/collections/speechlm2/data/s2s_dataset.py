@@ -197,6 +197,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.force_align_user_text = model_cfg.get("force_align_user_text", False) if model_cfg is not None else None
         # Default to CPU for force alignment to avoid OOM during training/validation when main model is on GPU
         self.force_align_device = model_cfg.get("force_align_device", "cpu") if model_cfg is not None else "cpu"
+        self.force_add_eos_for_every_turn = cfg.get("force_add_eos_for_every_turn", False) if cfg is not None else False
 
         self.cfg = cfg
         self.model_cfg = model_cfg
@@ -420,7 +421,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             )
 
             # Only run force alignment during training (when gradients are enabled)
-            if self.force_align_user_text and torch.is_grad_enabled():
+            if self.force_align_user_text:
                 logging.info(f"Force aligning user text for {len(all_cuts_combined)} cuts on device {self.force_align_device}")
                 all_cuts_combined = self.force_aligner.batch_force_align_user_audio(all_cuts_combined, source_sample_rate=self.source_sample_rate)
                 
@@ -437,7 +438,8 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 word_align_position=self.word_align_position, 
                 remove_timestamps=not self.predict_user_text, 
                 user_bos_id=self.user_bos_id, 
-                agent_bos_id=self.tokenizer.bos
+                agent_bos_id=self.tokenizer.bos,
+                force_add_eos_for_every_turn=self.force_add_eos_for_every_turn
             )
 
             # Early interruption augmentation
@@ -469,7 +471,6 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 print("First non-pad token index in target_tokens[0]:", first_non_pad_idx)
                 # print('Agent start timestamp: ', int(cuts[0].supervisions[1].start / 0.08))
                 import pdb; pdb.set_trace()
-
 
             audio_data = {
                 "sample_id": [str(cut.id) for cut in all_cuts_combined],
@@ -750,10 +751,11 @@ def collate_token_channel(
     user_bos_id: int = None,
     agent_bos_id: int = None,
     use_numbers_norm: bool = False,
+    force_add_eos_for_every_turn: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     pad_id = get_pad_id(tokenizer)
     tokens = [
-        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id, bos_id=bos_id, eos_id=eos_id, word_align_position=word_align_position, remove_timestamps=remove_timestamps, user_bos_id=user_bos_id, agent_bos_id=agent_bos_id, use_numbers_norm=use_numbers_norm)
+        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id, bos_id=bos_id, eos_id=eos_id, word_align_position=word_align_position, remove_timestamps=remove_timestamps, user_bos_id=user_bos_id, agent_bos_id=agent_bos_id, use_numbers_norm=use_numbers_norm, force_add_eos_for_every_turn=force_add_eos_for_every_turn)
         for c in cuts
     ]
     token_lens = torch.tensor([len(tt) for tt in tokens])
@@ -814,6 +816,7 @@ def build_token_channel(
         agent_bos_id: int = None,
         add_eos_for_interruption: bool = False,
         use_numbers_norm: bool = False,
+        force_add_eos_for_every_turn: bool = False,
 ) -> torch.Tensor:
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
@@ -863,7 +866,7 @@ def build_token_channel(
                 raise RuntimeError(f"{tokens.shape=} {pos=} {endpos=} {text_ids.shape=} {diagnostic}") from e
 
             # Place EOS token - critical for turn-taking behavior
-            if eospos < len(tokens) and eos_id is not None:
+            if (eospos < len(tokens) and eos_id is not None) or force_add_eos_for_every_turn:
                 # Normal case: place EOS at the intended position
                 tokens[eospos] = eos_id
             elif add_eos_for_interruption:
