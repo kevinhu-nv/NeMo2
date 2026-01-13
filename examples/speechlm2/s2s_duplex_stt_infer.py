@@ -39,7 +39,6 @@ def inference(cfg):
         model_config = OmegaConf.to_container(cfg, resolve=True)
         model = DuplexSTTModel(model_config)
 
-
     dataset = DuplexS2SDataset(
         tokenizer=model.tokenizer,
         frame_length=cfg.data.frame_length,
@@ -48,7 +47,8 @@ def inference(cfg):
         input_roles=cfg.data.input_roles,
         output_roles=cfg.data.output_roles,
         include_turn_metadata=True,  # Enable detailed turn metadata for validation
-        model_cfg=model_config,
+        cfg=cfg.data,
+        model_cfg=model_config['model'],
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 
