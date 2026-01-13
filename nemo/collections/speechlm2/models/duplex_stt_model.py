@@ -49,7 +49,7 @@ from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.metrics.bleu import BLEU
 from nemo.collections.speechlm2.parts.metrics.text_wer import TextWER
 from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
-from nemo.collections.speechlm2.parts.metrics.token_accuracy import TurnTakingMetrics
+from nemo.collections.speechlm2.parts.metrics.token_accuracy import TurnTakingMetrics, TokenLevelLatency
 from nemo.collections.speechlm2.parts.metrics.empty_text import EmptyTextMetric
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
 from nemo.collections.speechlm2.parts.pretrained import (
@@ -756,6 +756,12 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             self.src_bleu = BLEU().reset()
             self.src_wer = TextWER().reset()
             self.empty_user_text = EmptyTextMetric().reset()
+        
+        # Initialize Token Level Latency metrics
+        if self.cfg.get("compute_token_level_latency", False):
+            self.token_level_latency = TokenLevelLatency(
+                pad_token_id=self.tokenizer.pad_id
+            ).reset()
 
     def on_validation_epoch_end(self, prefix="val") -> None:
         bleu = self.bleu.compute()
@@ -776,6 +782,12 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         turn_taking_metrics = self.turn_taking_metrics.compute()
         for k, m in turn_taking_metrics.items():
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+        
+        # Compute and log Token Level Latency metrics
+        if self.cfg.get("compute_token_level_latency", False) and hasattr(self, 'token_level_latency'):
+            token_level_latency_metrics = self.token_level_latency.compute()
+            for k, m in token_level_latency_metrics.items():
+                self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
 
         if self.predict_user_text:
             src_bleu = self.src_bleu.compute()
@@ -811,6 +823,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     dataset_batch["source_audio_lens"],
                     prompt_tokens=prompt_tokens,
                     prompt_token_lens=prompt_token_lens,
+                    extra_decode_steps=self.cfg.get("extra_decode_steps", 0),
                 )
             else:
                 results = self.offline_inference(
@@ -819,6 +832,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     prompt_tokens=prompt_tokens,
                     prompt_token_lens=prompt_token_lens,
                     sample_id=dataset_batch.get("sample_id", None),
+                    extra_decode_steps=self.cfg.get("extra_decode_steps", 0),
                 )
 
             self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
@@ -829,6 +843,14 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     source_tokens=dataset_batch["source_tokens"],
                     pred_tokens=results["tokens_text"]
                 )
+            
+            # Compute Token Level Latency if enabled
+            if self.cfg.get("compute_token_level_latency", False) and "source_tokens" in dataset_batch and results["tokens_text_src"] is not None:
+                self.token_level_latency.update(
+                    name=name,
+                    source_tokens=dataset_batch["source_tokens"],
+                    pred_tokens=results["tokens_text_src"]
+                )                
 
             fake_pred_audio, fake_audio_len = self._generate_fake_audio_from_tokens(results["tokens_text"])
 
@@ -900,6 +922,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             prompt_tokens=prompt_tokens,
             prompt_token_lens=prompt_token_lens,
             sample_id=batch.get("sample_id", None),
+            extra_decode_steps=self.cfg.get("extra_decode_steps", 0),
         )
         prediction["sample_id"] = batch["sample_id"]
         return prediction
@@ -1193,6 +1216,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             prompt_tokens: torch.Tensor,
             prompt_token_lens: torch.Tensor,
             sample_id=None,
+            extra_decode_steps: int = 0,
     ):
         """Initialize inference resources and prepare inputs."""
         sil_id = None
@@ -1251,6 +1275,17 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             T_local = source_encoded.shape[1]
 
         B, T_local, H = source_encoded.shape
+
+        # Add extra decode steps if requested
+        if extra_decode_steps > 0:
+            T_local = T_local + extra_decode_steps
+            # Pad source_encoded and asr_emb with the last frame repeated
+            last_frame_source = source_encoded[:, -1:, :]
+            pad_source = last_frame_source.repeat(1, extra_decode_steps, 1)
+            source_encoded = torch.cat([source_encoded, pad_source], dim=1)
+            last_frame_asr = asr_emb[:, -1:, :]
+            pad_asr = last_frame_asr.repeat(1, extra_decode_steps, 1)
+            asr_emb = torch.cat([asr_emb, pad_asr], dim=1)
 
         if self._use_fsdp:
             T_tensor = torch.tensor([T_local], device=source_encoded.device)
@@ -1481,6 +1516,26 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     gen_text_src = gen_asr
                 lengths = lengths_trimmed
 
+        # Remove non-pad tokens between user BOS (id 2) and EOS (id 1094) if flag is set
+        if self.cfg.get("remove_ids_between_user_bos_and_eos", False):
+            gen_asr_modified = gen_asr.clone()
+            for batch_idx in range(gen_asr.size(0)):
+                i = 0
+                while i < gen_asr.size(1):
+                    if gen_asr[batch_idx, i] == self.text_eos_id:
+                        # Found BOS token, look for EOS token 1094
+                        j = i + 1
+                        while j < gen_asr.size(1):
+                            if gen_asr[batch_idx, j] == self.user_bos_id:
+                                # Replace non-pad tokens in interval (i, j) with pad tokens
+                                for k in range(i + 1, j):
+                                    if gen_asr[batch_idx, k] != self.text_pad_id:
+                                        gen_asr_modified[batch_idx, k] = self.text_pad_id
+                                break
+                            j += 1
+                    i += 1
+            gen_asr = gen_asr_modified
+
         ans = {
             "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, user_bos_id=self.user_bos_id, eval_text_turn_taking=self.cfg.get("eval_text_turn_taking", True), sil_id=inference_state["sil_id"]),
             "src_text": src_text_cleaned,
@@ -1505,13 +1560,14 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             prompt_tokens: torch.Tensor = None,
             prompt_token_lens: torch.Tensor = None,
             sample_id=None,
+            extra_decode_steps: int = 0,
     ) -> dict[str, torch.Tensor]:
         """
         Autoregressive prediction (text only).
         """
         inference_state = self._init_inference(
             input_signal, input_signal_lens, input_pad_len,
-            force_bos_positions, prompt_tokens, prompt_token_lens, sample_id
+            force_bos_positions, prompt_tokens, prompt_token_lens, sample_id, extra_decode_steps
         )
 
         ans, inference_state = self._step_zero(inference_state)
@@ -1586,6 +1642,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             force_bos_positions=None,
             prompt_tokens: torch.Tensor = None,
             prompt_token_lens: torch.Tensor = None,
+            extra_decode_steps: int = 0,
     ) -> dict[str, torch.Tensor]:
         """
         Online inference simulating real-time microphone input with sliding window.
@@ -1619,7 +1676,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         # This handles prompts, cache setup, buffer allocation, etc.
         inference_state = self._init_inference(
             input_signal, input_signal_lens, input_pad_len,
-            force_bos_positions, prompt_tokens, prompt_token_lens
+            force_bos_positions, prompt_tokens, prompt_token_lens, None, extra_decode_steps
         )
         # Reset 'input_embeds' to zeros to ensure it starts fresh in online mode
         if "input_embeds" in inference_state:

@@ -13,13 +13,15 @@
 # limitations under the License.
 from .asr_bleu import ASRBLEU
 from .bleu import BLEU
-from .token_accuracy import TurnTakingMetrics
+from .token_accuracy import TurnTakingMetrics, EOUMetrics
 from .results_logger import ResultsLogger
 from .perplexity import Perplexity, ValidationLoss
 __all__ = [
     'ASRBLEU',
     'BLEU',
     'TokenAccuracy',
+    'TurnTakingMetrics',
+    'EOUMetrics',
     'ResultsLogger',
     'Perplexity',
     'ValidationLoss',
