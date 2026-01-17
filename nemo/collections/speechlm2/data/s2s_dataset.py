@@ -199,6 +199,8 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.force_align_device = model_cfg.get("force_align_device", "cpu") if model_cfg is not None else "cpu"
         self.force_add_eos_for_every_turn = cfg.get("force_add_eos_for_every_turn", False) if cfg is not None else False
 
+        self.early_interruption_prob = cfg.get("early_interruption_prob", 0.0) if cfg is not None else 0.0
+
         self.cfg = cfg
         self.model_cfg = model_cfg
         self.use_numbers_norm = model_cfg.get("use_numbers_norm", False)
@@ -231,9 +233,11 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self,
         target_tokens: torch.Tensor,
         target_audio: torch.Tensor,
+        target_token_lens: torch.Tensor,
         target_audio_lens: torch.Tensor,
         source_tokens: torch.Tensor,
         source_audio: torch.Tensor,
+        source_token_lens: torch.Tensor,
         source_audio_lens: torch.Tensor,
         batch_idx: int,
     ) -> None:
@@ -300,7 +304,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         
         # Agent stops at cutoff_pos + overlap_tokens to create overlap period
         new_eos_pos = min(cutoff_pos + overlap_tokens, original_eos_pos)
-        frames_to_remove = original_eos_pos - new_eos_pos
+        frames_to_remove = original_eos_pos - cutoff_pos
         if frames_to_remove <= 0:
             return
         
@@ -312,40 +316,48 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         if tail_length > 0:
             target_tokens[batch_idx, new_eos_pos+1:new_eos_pos+1+tail_length] = target_tokens[batch_idx, cont_start_pos+1:cont_start_pos+1+tail_length].clone()
         target_tokens[batch_idx, -frames_to_remove:] = pad_id
+        target_token_lens[batch_idx] -= frames_to_remove
 
         # Update source_tokens: shift tail (from cutoff_pos)
-        src_frames_to_remove = original_eos_pos - cutoff_pos
         source_seq_len = source_tokens.shape[1]
         source_tail_length = source_seq_len - (original_eos_pos + 1)
         if source_tail_length > 0:
             source_tokens[batch_idx, cutoff_pos+1:cutoff_pos+1+source_tail_length] = source_tokens[batch_idx, original_eos_pos+1:original_eos_pos+1+source_tail_length].clone()
-        source_tokens[batch_idx, -src_frames_to_remove:] = pad_id
+        source_tokens[batch_idx, -frames_to_remove:] = pad_id
+        source_token_lens[batch_idx] -= frames_to_remove
         
-        # Update target_audio: shift and pad with silence
+        # Update audio: shift and pad with silence
         old_target_len = target_audio_lens[batch_idx].item()
-        new_eos_sample = min(int(new_eos_pos * self.frame_length * self.target_sample_rate), old_target_len)
-        original_eos_sample = min(int(original_eos_pos * self.frame_length * self.target_sample_rate), old_target_len)
+        old_source_len = source_audio_lens[batch_idx].item()
+        if old_target_len != old_source_len:
+            logging.warning(f"old_target_len != old_source_len: {old_target_len} != {old_source_len}")
+        assert self.target_sample_rate == self.source_sample_rate, "This function assumes target and source sample rates are the same"
+        old_conv_audio_len = min(old_target_len, old_source_len)
+
+        new_eos_sample = min(int((new_eos_pos+1) * self.frame_length * self.target_sample_rate), old_conv_audio_len)
+        original_eos_sample = min(int((original_eos_pos+1) * self.frame_length * self.target_sample_rate), old_conv_audio_len)
+        cont_start_sample = min(int((cont_start_pos+1) * self.frame_length * self.target_sample_rate), old_conv_audio_len)
+        cutoff_sample = min(int((cutoff_pos+1) * self.frame_length * self.source_sample_rate), old_conv_audio_len)
         
-        tail_audio_length = old_target_len - original_eos_sample
+        samples_to_remove = original_eos_sample - cutoff_sample
+        
+        # Update target audio: shift and pad with silence
+        tail_audio_length = old_conv_audio_len - cont_start_sample
         if tail_audio_length > 0:
-            target_audio[batch_idx, new_eos_sample:new_eos_sample+tail_audio_length] = target_audio[batch_idx, original_eos_sample:old_target_len].clone()
+            target_audio[batch_idx, new_eos_sample:new_eos_sample+tail_audio_length] = target_audio[batch_idx, cont_start_sample:old_conv_audio_len].clone()
         
-        samples_to_remove = original_eos_sample - new_eos_sample
         if new_eos_sample + tail_audio_length < target_audio.shape[1]:
             target_audio[batch_idx, new_eos_sample+tail_audio_length:new_eos_sample+tail_audio_length+samples_to_remove] = 0
+        target_audio_lens[batch_idx] = old_conv_audio_len - samples_to_remove
         
         # Update source_audio: shift and pad with silence
-        old_source_len = source_audio_lens[batch_idx].item()
-        new_bos_source_sample = min(int(cutoff_pos * self.frame_length * self.source_sample_rate), old_source_len)
-        original_eos_source_sample = min(int(original_eos_pos * self.frame_length * self.source_sample_rate), old_source_len)
-        
-        source_tail_audio_length = old_source_len - original_eos_source_sample
+        source_tail_audio_length = old_conv_audio_len - original_eos_sample
         if source_tail_audio_length > 0:
-            source_audio[batch_idx, new_bos_source_sample:new_bos_source_sample+source_tail_audio_length] = source_audio[batch_idx, original_eos_source_sample:old_source_len].clone()
+            source_audio[batch_idx, cutoff_sample:cutoff_sample+source_tail_audio_length] = source_audio[batch_idx, original_eos_sample:old_conv_audio_len].clone()
         
-        source_samples_to_remove = original_eos_source_sample - new_bos_source_sample
-        if new_bos_source_sample + source_tail_audio_length < source_audio.shape[1]:
-            source_audio[batch_idx, new_bos_source_sample+source_tail_audio_length:new_bos_source_sample+source_tail_audio_length+source_samples_to_remove] = 0
+        if cutoff_sample + source_tail_audio_length < source_audio.shape[1]:
+            source_audio[batch_idx, cutoff_sample+source_tail_audio_length:cutoff_sample+source_tail_audio_length+samples_to_remove] = 0
+        source_audio_lens[batch_idx] = old_conv_audio_len - samples_to_remove
 
     def _create_minimal_batch(self) -> dict:
         """Create a minimal valid batch when all cuts are filtered out."""
@@ -416,8 +428,8 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 all_cuts_combined.resample(self.target_sample_rate), recording_field="target_audio"
             )
 
-            target_tokens, target_token_lens = collate_token_channel(
-                all_cuts_combined, self.tokenizer, self.frame_length, roles=self.output_roles, bos_id=self.tokenizer.bos, eos_id=self.tokenizer.eos, remove_timestamps=True, use_numbers_norm=self.use_numbers_norm,
+            target_tokens, target_token_lens, ei_flags = collate_token_channel(
+                all_cuts_combined, self.tokenizer, self.frame_length, roles=self.output_roles, bos_id=self.tokenizer.bos, eos_id=self.tokenizer.eos, remove_timestamps=True, use_numbers_norm=self.use_numbers_norm, early_interruption_flag_from_cfg=self.early_interruption_prob > 0,
             )
 
             # Only run force alignment during training (when gradients are enabled)
@@ -430,7 +442,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                     logging.warning("All cuts filtered out due to force alignment failures, returning minimal valid batch to continue training.")
                     return self._create_minimal_batch()
 
-            source_tokens, source_token_lens = collate_token_channel(
+            source_tokens, source_token_lens, _ = collate_token_channel(
                 all_cuts_combined, self.tokenizer, self.frame_length,
                 roles=self.input_roles,
                 bos_id=self.user_bos_id, 
@@ -439,17 +451,16 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 remove_timestamps=not self.predict_user_text, 
                 user_bos_id=self.user_bos_id, 
                 agent_bos_id=self.tokenizer.bos,
-                force_add_eos_for_every_turn=self.force_add_eos_for_every_turn
+                force_add_eos_for_every_turn=self.force_add_eos_for_every_turn,
             )
 
             # Early interruption augmentation
-            early_interruption_prob = self.cfg.get("early_interruption_prob", 0.0) if self.cfg is not None else 0.0
-            if early_interruption_prob > 0 and torch.is_grad_enabled():
+            if self.early_interruption_prob > 0 and torch.is_grad_enabled():
                 for batch_idx in range(target_tokens.shape[0]):
-                    if random.random() < early_interruption_prob:
+                    if ei_flags[batch_idx] and random.random() < self.early_interruption_prob:
                         self._apply_early_interruption_augmentation(
-                            target_tokens, target_audio, target_audio_lens,
-                            source_tokens, source_audio, source_audio_lens,
+                            target_tokens, target_audio, target_token_lens, target_audio_lens,
+                            source_tokens, source_audio, source_token_lens, source_audio_lens,
                             batch_idx
                         )
                 
@@ -751,6 +762,7 @@ def collate_token_channel(
     user_bos_id: int = None,
     agent_bos_id: int = None,
     use_numbers_norm: bool = False,
+    early_interruption_flag_from_cfg: bool = None,
     force_add_eos_for_every_turn: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     pad_id = get_pad_id(tokenizer)
@@ -758,9 +770,11 @@ def collate_token_channel(
         build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id, bos_id=bos_id, eos_id=eos_id, word_align_position=word_align_position, remove_timestamps=remove_timestamps, user_bos_id=user_bos_id, agent_bos_id=agent_bos_id, use_numbers_norm=use_numbers_norm, force_add_eos_for_every_turn=force_add_eos_for_every_turn)
         for c in cuts
     ]
+    ei_flags = [getattr(c, 'otf_interruption', early_interruption_flag_from_cfg) for c in cuts]
+
     token_lens = torch.tensor([len(tt) for tt in tokens])
     tokens = collate_vectors(tokens, padding_value=pad_id)
-    return tokens, token_lens
+    return tokens, token_lens, ei_flags
 
 
 def collate_system_prompt(
