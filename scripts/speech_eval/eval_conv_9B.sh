@@ -32,15 +32,17 @@ PW=${7:-1}
 # log_dir=/lustre/fsw/portfolios/llmservice/users/kevinhu/code/s2s_pretrain_20251022/exp_SFT_9b/${EXP_NAME}/${INF_NAME}_step-${STEP_NAME}/${BOOST_NAME}/validation_logs
 log_dir=/lustre/fsw/portfolios/llmservice/users/kevinhu/code/s2s_pretrain_20251022_merge/exp_SFT_9b/${EXP_NAME}/${INF_NAME}_step-${STEP_NAME}/${BOOST_NAME}/validation_logs
 # log_dir=/lustre/fsw/portfolios/llmservice/users/kevinhu/code/s2s_pretrain_20251022_merge_rebase2/exp_SFT_9b/${EXP_NAME}/${INF_NAME}_step-${STEP_NAME}/${BOOST_NAME}/validation_logs
-# log_dir=/lustre/fsw/portfolios/llmservice/users/kevinhu/code/s2s_pretrain_20251022_merge/exp_SFT_9b/IAD_Nano-9B_SFT_Parakeet600m_asr_sp_from_checkpoints_hf_32002_64gpu_PT0.65_SFT0.05_QA0.02_TEXT0.1_MCQ0.03_ASR0.01_SP0.05-b200_LR5e-5_na0.5-30-60_ci_sa15_la2_tls10.0_facuda_val200.v2/results/inf/infer_nano_9b_step_6354/pad0_bos0_eos0/validation_logs
 log_dir=/lustre/fsw/portfolios/llmservice/users/kevinhu/code/s2s_pretrain_20251022_merge/exp_SFT_9b/${EXP_NAME}/results/inf_rebase/${INF_NAME}_step_${STEP_NAME}/${BOOST_NAME}/validation_logs/
 # log_dir=/lustre/fsw/portfolios/llmservice/users/kevinhu/code/s2s_nov/exp_SFT-nano9b/${EXP_NAME}/results/inf/${INF_NAME}_step_${STEP_NAME}/${BOOST_NAME}/validation_logs/
+# log_dir=/lustre/fsw/portfolios/llmservice/users/kevinhu/code/s2s_pretrain_20251022_merge/exp_SFT_9b/${EXP_NAME}/results/inf/${INF_NAME}_step_${STEP_NAME}/${BOOST_NAME}/ftt_${FTT}_pw${PW}_upad0_ubos0_ueos0/validation_logs/
 # log_dir=/lustre/fsw/portfolios/convai/users/kevinhu/S2S-Duplex-new-codebase/results/exp/nov25/exp_SFT_9b/${EXP_NAME}/results/inf_rebase/${INF_NAME}_step_${STEP_NAME}/${BOOST_NAME}/validation_logs/
 # log_dir=/lustre/fsw/portfolios/llmservice/users/kevinhu/code/s2s_nov/exp_SFT-nano9b/${EXP_NAME}/results/inf_rebase_squash/${INF_NAME}_step_${STEP_NAME}/${BOOST_NAME}/validation_logs/
 # log_dir=/lustre/fsw/portfolios/llmservice/users/kevinhu/code/s2s_nov/exp_SFT-nano9b/${EXP_NAME}/results/inf2/${INF_NAME}_step_${STEP_NAME}/${BOOST_NAME}/validation_logs/
 # log_dir=/lustre/fsw/portfolios/llmservice/users/kevinhu/code/s2s_pretrain_20251022_merge/exp_SFT_9b/${EXP_NAME}/results/inf/${INF_NAME}_step_${STEP_NAME}/${BOOST_NAME}/validation_logs/
 # log_dir=/lustre/fsw/portfolios/llmservice/users/kevinhu/code/s2s_pretrain_20251022_merge/exp_SFT_9b/${EXP_NAME}/results/inf/${INF_NAME}_step_${STEP_NAME}/${BOOST_NAME}/ftt_${FTT}_pw${PW}/validation_logs/
-# log_dir=/lustre/fsw/portfolios/convai/users/ecasanova/S2S-Duplex-new-codebase/results/exp/nov25/exp_SFT_9b/${EXP_NAME}/results/inf/${INF_NAME}_step_${STEP_NAME}/${BOOST_NAME}/ftt_${FTT}_pw${PW}_upad--local_ubos0_ueos0/validation_logs/
+# log_dir=/lustre/fsw/portfolios/convai/users/ecasanova/S2S-Duplex-new-codebase/results/exp/nov25/exp_SFT_9b/${EXP_NAME}/results/inf/${INF_NAME}_step_${STEP_NAME}/${BOOST_NAME}/ftt_${FTT}_pw${PW}_upad0_ubos0_ueos0/validation_logs/
+# log_dir=/lustre/fsw/portfolios/llmservice/users/kevinhu/code/s2s_pretrain_20251022_merge/exp_SFT_9b/${EXP_NAME}/results/inf/${INF_NAME}_step_${STEP_NAME}/${BOOST_NAME}/ftt_${FTT}_pw${PW}_upad0_ubos0_ueos0/validation_logs/
+# log_dir=/lustre/fsw/portfolios/llmservice/users/kevinhu/code/s2s_pretrain_20260114/exp_SFT_9b/${EXP_NAME}/results/inf_rebase/${INF_NAME}_step_${STEP_NAME}/${BOOST_NAME}/validation_logs/
 
 pred_audio_dir=${log_dir}/pred_wavs/
 
@@ -48,12 +50,12 @@ jsonl_with_timestamp=${log_dir}/metadatas/${DATASET_NAME}.json
 cat ${log_dir}/metadatas/${DATASET_NAME}_rank{0..31}.json > $jsonl_with_timestamp
 
 output_log=${jsonl_with_timestamp}.log
-barge_in_threshold_sec=3.2
+barge_in_threshold_sec=1.5
 end_time=None  # Note that this comes from predefined values when creating backchanneling data
-tt_latency_threshold_sec=3.2
+tt_latency_threshold_sec=1.5
 tt_recall_buffer_sec=20
-tt_precision_buffer_sec=3.2
+tt_precision_buffer_sec=1
 vad_min_silence_duration_ms=2000
 validation_set_name="${DATASET_NAME}"
-eval_conv "--verbose --jsonl_with_timestamp $jsonl_with_timestamp --vad_min_silence_duration_ms $vad_min_silence_duration_ms --enable_transcription"
+eval_conv "--verbose --jsonl_with_timestamp $jsonl_with_timestamp --vad_min_silence_duration_ms $vad_min_silence_duration_ms --enable_transcription --compute_user_eou"
 echo "Output log: $output_log"
