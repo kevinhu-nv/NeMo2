@@ -93,6 +93,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             # self.user_eos_id = self.tokenizer.text_to_ids('<SPECIAL_14>')[0]
             self.user_bos_id = self.tokenizer.text_to_ids('^')[0]
             self.user_eos_id = self.tokenizer.text_to_ids('$')[0]
+            self.epad_id = self.tokenizer.text_to_ids('<SPECIAL_13>')[0]
 
             self.llm = getattr(llm, self.cfg.get("base_model_name", "backbone"))
             self.lm_head = llm.lm_head
@@ -109,8 +110,8 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             self.user_bos_id = self.tokenizer.text_to_ids('^')[0]
             self.user_eos_id = self.tokenizer.text_to_ids('$')[0]
 
-            if self.cfg.get("use_extra_id_for_pad", False):
-                self.tokenizer.pad_token = '<|extra_1|>'
+            if self.cfg.get("use_epad_for_asr", False):
+                self.epad_id = self.tokenizer.text_to_ids('<|extra_1|>')[0]
 
             self.llm = llm.model
             self.lm_head = llm.lm_head
@@ -372,17 +373,17 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
     def prepare_inputs(self, batch: dict):     
 
-        if self.cfg.get('debug', False):
-            import soundfile as sf
-            import os
-            output_dir = "/lustre/fsw/portfolios/llmservice/users/kevinhu/debug"
-            os.makedirs(output_dir, exist_ok=True)
-            wav_path = os.path.join(output_dir, f"{batch['sample_id'][0]}_clean.wav")
-            # Try best to select a valid sampling rate from config or fallback
-            sample_rate = self.cfg.get('source_sample_rate', 16000)
-            src_audio_np = batch["source_audio"][0].detach().cpu().numpy()
-            sf.write(wav_path, src_audio_np, sample_rate)
-            print(f"Wrote batch 0 source_audio to {wav_path}")
+        # if self.cfg.get('debug', False):
+        #     import soundfile as sf
+        #     import os
+        #     output_dir = "/lustre/fsw/portfolios/llmservice/users/kevinhu/debug"
+        #     os.makedirs(output_dir, exist_ok=True)
+        #     wav_path = os.path.join(output_dir, f"{batch['sample_id'][0]}_clean.wav")
+        #     # Try best to select a valid sampling rate from config or fallback
+        #     sample_rate = self.cfg.get('source_sample_rate', 16000)
+        #     src_audio_np = batch["source_audio"][0].detach().cpu().numpy()
+        #     sf.write(wav_path, src_audio_np, sample_rate)
+        #     print(f"Wrote batch 0 source_audio to {wav_path}")
 
         # Apply augmentations in order: noise -> room IR -> mic IR -> codec
         # Each augmentation has its own independent condition and flag
@@ -450,17 +451,17 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     codec_settings,
                 )
 
-        if self.cfg.get('debug', False):
-            import soundfile as sf
-            import os
-            output_dir = "/lustre/fsw/portfolios/llmservice/users/kevinhu/debug"
-            os.makedirs(output_dir, exist_ok=True)
-            wav_path = os.path.join(output_dir, f"{batch['sample_id'][0]}.wav")
-            sample_rate = self.cfg.get('source_sample_rate', 16000)
-            src_audio_np = batch["source_audio"][0].detach().cpu().numpy()
-            sf.write(wav_path, src_audio_np, sample_rate)
-            print(f"Wrote batch 0 source_audio to {wav_path}")
-            import pdb; pdb.set_trace()
+        # if self.cfg.get('debug', False):
+        #     import soundfile as sf
+        #     import os
+        #     output_dir = "/lustre/fsw/portfolios/llmservice/users/kevinhu/debug"
+        #     os.makedirs(output_dir, exist_ok=True)
+        #     wav_path = os.path.join(output_dir, f"{batch['sample_id'][0]}.wav")
+        #     sample_rate = self.cfg.get('source_sample_rate', 16000)
+        #     src_audio_np = batch["source_audio"][0].detach().cpu().numpy()
+        #     sf.write(wav_path, src_audio_np, sample_rate)
+        #     print(f"Wrote batch 0 source_audio to {wav_path}")
+        #     import pdb; pdb.set_trace()
 
         
         source_encoded, source_encoded_lens, asr_emb = self.perception(
@@ -1385,7 +1386,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         """Apply forced turn-taking rules based on ASR channel tokens."""
         if not self.cfg.get("force_turn_taking", False):
             return
-        
+
         threshold = self.cfg.get("force_turn_taking_threshold", 40)
         pad_window_steps = self.cfg.get("force_turn_taking_pad_window", 25)
         

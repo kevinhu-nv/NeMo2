@@ -199,6 +199,9 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.force_align_device = model_cfg.get("force_align_device", "cpu") if model_cfg is not None else "cpu"
         self.force_add_eos_for_every_turn = cfg.get("force_add_eos_for_every_turn", False) if cfg is not None else False
 
+        self.early_interruption_prob = cfg.get("early_interruption_prob", 0.0) if cfg is not None else 0.0
+        self.fix_frames_to_remove = cfg.get("fix_frames_to_remove", False) if cfg is not None else False
+
         self.cfg = cfg
         self.model_cfg = model_cfg
         self.use_numbers_norm = model_cfg.get("use_numbers_norm", False)
@@ -209,15 +212,22 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             # user_eos_token = '<SPECIAL_14>'
             user_bos_token = '^'
             user_eos_token = '$'
+            epad_token = '<SPECIAL_13>'
         elif self.model_cfg is not None and 'Qwen2.5' in self.model_cfg.get('pretrained_llm', ''):
             user_bos_token = '^'
             user_eos_token = '$'
+            epad_token = '<|extra_1|>'
         else:
             user_bos_token = '^'
             user_eos_token = '$'
+            epad_token = None
         
         self.user_bos_id = self.tokenizer.text_to_ids(user_bos_token)[0]
         self.user_eos_id = self.tokenizer.text_to_ids(user_eos_token)[0]
+        
+        # Set epad_id if use_epad_for_asr is enabled
+        self.use_epad_for_asr = model_cfg.get("use_epad_for_asr", False) if model_cfg is not None else False
+        self.user_epad_id = self.tokenizer.text_to_ids(epad_token)[0] if self.use_epad_for_asr else None
 
         # Initialize force aligner if needed
         self.force_aligner = None
@@ -231,11 +241,14 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self,
         target_tokens: torch.Tensor,
         target_audio: torch.Tensor,
+        target_token_lens: torch.Tensor,
         target_audio_lens: torch.Tensor,
         source_tokens: torch.Tensor,
         source_audio: torch.Tensor,
+        source_token_lens: torch.Tensor,
         source_audio_lens: torch.Tensor,
         batch_idx: int,
+        fix_frames_to_remove: bool = False,
     ) -> None:
         """Simulate early interruption by randomly truncating an agent turn with overlap.
         
@@ -300,7 +313,10 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         
         # Agent stops at cutoff_pos + overlap_tokens to create overlap period
         new_eos_pos = min(cutoff_pos + overlap_tokens, original_eos_pos)
-        frames_to_remove = original_eos_pos - new_eos_pos
+        if fix_frames_to_remove:
+            frames_to_remove = original_eos_pos - cutoff_pos
+        else:
+            frames_to_remove = original_eos_pos - new_eos_pos
         if frames_to_remove <= 0:
             return
         
@@ -416,8 +432,8 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 all_cuts_combined.resample(self.target_sample_rate), recording_field="target_audio"
             )
 
-            target_tokens, target_token_lens = collate_token_channel(
-                all_cuts_combined, self.tokenizer, self.frame_length, roles=self.output_roles, bos_id=self.tokenizer.bos, eos_id=self.tokenizer.eos, remove_timestamps=True, use_numbers_norm=self.use_numbers_norm,
+            target_tokens, target_token_lens, ei_flags = collate_token_channel(
+                all_cuts_combined, self.tokenizer, self.frame_length, roles=self.output_roles, bos_id=self.tokenizer.bos, eos_id=self.tokenizer.eos, remove_timestamps=True, use_numbers_norm=self.use_numbers_norm, early_interruption_flag_from_cfg=self.early_interruption_prob > 0, epad_id=self.user_epad_id,
             )
 
             # Only run force alignment during training (when gradients are enabled)
@@ -430,7 +446,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                     logging.warning("All cuts filtered out due to force alignment failures, returning minimal valid batch to continue training.")
                     return self._create_minimal_batch()
 
-            source_tokens, source_token_lens = collate_token_channel(
+            source_tokens, source_token_lens, _ = collate_token_channel(
                 all_cuts_combined, self.tokenizer, self.frame_length,
                 roles=self.input_roles,
                 bos_id=self.user_bos_id, 
@@ -439,18 +455,19 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 remove_timestamps=not self.predict_user_text, 
                 user_bos_id=self.user_bos_id, 
                 agent_bos_id=self.tokenizer.bos,
-                force_add_eos_for_every_turn=self.force_add_eos_for_every_turn
+                force_add_eos_for_every_turn=self.force_add_eos_for_every_turn,
+                epad_id=self.user_epad_id,
             )
 
             # Early interruption augmentation
-            early_interruption_prob = self.cfg.get("early_interruption_prob", 0.0) if self.cfg is not None else 0.0
-            if early_interruption_prob > 0 and torch.is_grad_enabled():
+            if self.early_interruption_prob > 0 and torch.is_grad_enabled():
                 for batch_idx in range(target_tokens.shape[0]):
-                    if random.random() < early_interruption_prob:
+                    if ei_flags[batch_idx] and random.random() < self.early_interruption_prob:
                         self._apply_early_interruption_augmentation(
-                            target_tokens, target_audio, target_audio_lens,
-                            source_tokens, source_audio, source_audio_lens,
-                            batch_idx
+                            target_tokens, target_audio, target_token_lens, target_audio_lens,
+                            source_tokens, source_audio, source_token_lens, source_audio_lens,
+                            batch_idx,
+                            fix_frames_to_remove=self.fix_frames_to_remove
                         )
                 
             try:
@@ -751,16 +768,20 @@ def collate_token_channel(
     user_bos_id: int = None,
     agent_bos_id: int = None,
     use_numbers_norm: bool = False,
+    early_interruption_flag_from_cfg: bool = None,
     force_add_eos_for_every_turn: bool = False,
+    epad_id: int = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     pad_id = get_pad_id(tokenizer)
     tokens = [
-        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id, bos_id=bos_id, eos_id=eos_id, word_align_position=word_align_position, remove_timestamps=remove_timestamps, user_bos_id=user_bos_id, agent_bos_id=agent_bos_id, use_numbers_norm=use_numbers_norm, force_add_eos_for_every_turn=force_add_eos_for_every_turn)
+        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id, bos_id=bos_id, eos_id=eos_id, word_align_position=word_align_position, remove_timestamps=remove_timestamps, user_bos_id=user_bos_id, agent_bos_id=agent_bos_id, use_numbers_norm=use_numbers_norm, force_add_eos_for_every_turn=force_add_eos_for_every_turn, epad_id=epad_id)
         for c in cuts
     ]
+    ei_flags = [getattr(c, 'otf_interruption', early_interruption_flag_from_cfg) for c in cuts]
+
     token_lens = torch.tensor([len(tt) for tt in tokens])
     tokens = collate_vectors(tokens, padding_value=pad_id)
-    return tokens, token_lens
+    return tokens, token_lens, ei_flags
 
 
 def collate_system_prompt(
@@ -817,6 +838,7 @@ def build_token_channel(
         add_eos_for_interruption: bool = False,
         use_numbers_norm: bool = False,
         force_add_eos_for_every_turn: bool = False,
+        epad_id: int = None,
 ) -> torch.Tensor:
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
@@ -842,7 +864,7 @@ def build_token_channel(
                 text = normalize_numbers(text)
 
             # Use different bos_id for user and agent
-            text_ids = torch.as_tensor([bos_id] + _text_to_ids(text, tokenizer, available_frames_for_text=available_frames_for_text, word_align_position=word_align_position, remove_timestamps=remove_timestamps))
+            text_ids = torch.as_tensor([bos_id] + _text_to_ids(text, tokenizer, available_frames_for_text=available_frames_for_text, word_align_position=word_align_position, remove_timestamps=remove_timestamps, epad_id=epad_id))
 
             if available_frames_for_text > 0 and len(text_ids) > available_frames_for_text:
                 # Truncate text_ids to fit before the eos position.
@@ -906,9 +928,10 @@ def _text_to_ids(text: str, tokenizer: TokenizerSpec,
                  _TIMESTAMP_PATTERN_STR=r"<\|(\d+)\|>",
                  available_frames_for_text=None,
                  word_align_position='left',
-                 remove_timestamps=False):
+                 remove_timestamps=False,
+                 epad_id=None):
     if not remove_timestamps and re.compile(_TIMESTAMP_PATTERN_STR).search(text):
-        text_ids = _text_with_timestamps_to_ids(text, tokenizer, _TIMESTAMP_PATTERN_STR, available_frames_for_text, word_align_position)
+        text_ids = _text_with_timestamps_to_ids(text, tokenizer, _TIMESTAMP_PATTERN_STR, available_frames_for_text, word_align_position, epad_id=epad_id)
     else:
         _TIMESTAMP_PATTERN = re.compile(_TIMESTAMP_PATTERN_STR)
         text = _TIMESTAMP_PATTERN.sub("", text)
@@ -921,10 +944,11 @@ def _text_to_ids(text: str, tokenizer: TokenizerSpec,
 def _text_with_timestamps_to_ids(text: str, tokenizer: TokenizerSpec,
                                  _TIMESTAMP_PATTERN_STR=r"<\|(\d+)\|>",
                                  available_frames_for_text=None,
-                                 word_align_position='left') -> list[int]:
+                                 word_align_position='left',
+                                 epad_id=None) -> list[int]:
     text_ids = []
     text_ids, start_times, end_times, word_lens = _extract_text_and_time_tokens(text, tokenizer, _TIMESTAMP_PATTERN_STR)
-    text_ids_with_timestamps = _expand_text_with_timestamps_and_word_lengths(text_ids, word_lens, start_times, end_times, available_frames_for_text, frame_rate=0.08, pad_id=get_pad_id(tokenizer), word_align_position=word_align_position)
+    text_ids_with_timestamps = _expand_text_with_timestamps_and_word_lengths(text_ids, word_lens, start_times, end_times, available_frames_for_text, frame_rate=0.08, pad_id=get_pad_id(tokenizer), word_align_position=word_align_position, epad_id=epad_id)
     
     if random.random() < 0.1:
         logging.info(f'text_ids_with_timestamps: {text_ids_with_timestamps}')
@@ -956,7 +980,7 @@ def _extract_text_and_time_tokens(text, tokenizer: TokenizerSpec,
 
 
 def _expand_text_with_timestamps_and_word_lengths(
-        text_ids, word_lens, start_time, end_time, available_frames_for_text, frame_rate=0.08, pad_id=None, word_align_position='left'
+        text_ids, word_lens, start_time, end_time, available_frames_for_text, frame_rate=0.08, pad_id=None, word_align_position='left', epad_id=None
     ):    
     """
     Expand word tokens according to start time tokens and word lengths for a batch of sequences.
@@ -969,6 +993,7 @@ def _expand_text_with_timestamps_and_word_lengths(
     - available_frames_for_text: Maximum number of frames for text
     - frame_rate: Frame rate resolution
     - pad_id: Padding ID to use for empty positions in the tensor
+    - epad_id: If not None, insert this special padding ID before the start of each word
 
     Returns:
     - text ids with word-level timestamps
@@ -996,6 +1021,12 @@ def _expand_text_with_timestamps_and_word_lengths(
             start_idx = max(start_idx, end_idx - word_len)
         else:
             raise ValueError(f"Unknown word_align_position: {word_align_position}")
+
+        # Insert epad before the word if epad_id is provided
+        if epad_id is not None and start_idx > 0 and start_idx < max_length:
+            # Only insert epad if the position is still a pad token (avoid overwriting actual tokens)
+            if text_ids_with_timestamps[start_idx - 1] == pad_id:
+                text_ids_with_timestamps[start_idx - 1] = epad_id
 
         # Get ids of a single word
         word_ids = text_ids[cur_word_idx : cur_word_idx + word_len]
