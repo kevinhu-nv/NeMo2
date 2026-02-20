@@ -201,6 +201,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
 
         self.early_interruption_prob = cfg.get("early_interruption_prob", 0.0) if cfg is not None else 0.0
         self.fix_frames_to_remove = cfg.get("fix_frames_to_remove", False) if cfg is not None else False
+        self.fix_eos_placement = cfg.get("fix_eos_placement", False) if cfg is not None else False
 
         self.cfg = cfg
         self.model_cfg = model_cfg
@@ -433,7 +434,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             )
 
             target_tokens, target_token_lens, ei_flags = collate_token_channel(
-                all_cuts_combined, self.tokenizer, self.frame_length, roles=self.output_roles, bos_id=self.tokenizer.bos, eos_id=self.tokenizer.eos, remove_timestamps=True, use_numbers_norm=self.use_numbers_norm, early_interruption_flag_from_cfg=self.early_interruption_prob > 0, epad_id=self.user_epad_id,
+                all_cuts_combined, self.tokenizer, self.frame_length, roles=self.output_roles, bos_id=self.tokenizer.bos, eos_id=self.tokenizer.eos, remove_timestamps=True, use_numbers_norm=self.use_numbers_norm, early_interruption_flag_from_cfg=self.early_interruption_prob > 0, epad_id=self.user_epad_id, skip_eos=self.fix_eos_placement,
             )
 
             # Only run force alignment during training (when gradients are enabled)
@@ -449,14 +450,17 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             source_tokens, source_token_lens, _ = collate_token_channel(
                 all_cuts_combined, self.tokenizer, self.frame_length,
                 roles=self.input_roles,
-                bos_id=self.user_bos_id, 
-                eos_id=self.user_eos_id, 
-                word_align_position=self.word_align_position, 
-                remove_timestamps=not self.predict_user_text, 
-                user_bos_id=self.user_bos_id, 
+                bos_id=self.user_bos_id,
+                eos_id=self.user_eos_id,
+                word_align_position=self.word_align_position,
+                remove_timestamps=not self.predict_user_text,
+                user_bos_id=self.user_bos_id,
                 agent_bos_id=self.tokenizer.bos,
                 force_add_eos_for_every_turn=self.force_add_eos_for_every_turn,
                 epad_id=self.user_epad_id,
+                agent_token_channel=target_tokens if self.fix_eos_placement else None,
+                agent_token_channel_lengths=target_token_lens if self.fix_eos_placement else None,
+                agent_eos_id=self.tokenizer.eos if self.fix_eos_placement else None,
             )
 
             # Early interruption augmentation
@@ -771,11 +775,15 @@ def collate_token_channel(
     early_interruption_flag_from_cfg: bool = None,
     force_add_eos_for_every_turn: bool = False,
     epad_id: int = None,
+    skip_eos: bool = False,
+    agent_token_channel: torch.Tensor = None,
+    agent_token_channel_lengths: torch.Tensor = None,
+    agent_eos_id: int = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     pad_id = get_pad_id(tokenizer)
     tokens = [
-        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id, bos_id=bos_id, eos_id=eos_id, word_align_position=word_align_position, remove_timestamps=remove_timestamps, user_bos_id=user_bos_id, agent_bos_id=agent_bos_id, use_numbers_norm=use_numbers_norm, force_add_eos_for_every_turn=force_add_eos_for_every_turn, epad_id=epad_id)
-        for c in cuts
+        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id, bos_id=bos_id, eos_id=eos_id, word_align_position=word_align_position, remove_timestamps=remove_timestamps, user_bos_id=user_bos_id, agent_bos_id=agent_bos_id, use_numbers_norm=use_numbers_norm, force_add_eos_for_every_turn=force_add_eos_for_every_turn, epad_id=epad_id, skip_eos=skip_eos, cut_agent_token_channel=agent_token_channel[cut_idx] if agent_token_channel is not None else None, cut_agent_token_channel_length=agent_token_channel_lengths[cut_idx] if agent_token_channel_lengths is not None else None, agent_eos_id=agent_eos_id)
+        for cut_idx, c in enumerate(cuts)
     ]
     ei_flags = [getattr(c, 'otf_interruption', early_interruption_flag_from_cfg) for c in cuts]
 
@@ -839,6 +847,11 @@ def build_token_channel(
         use_numbers_norm: bool = False,
         force_add_eos_for_every_turn: bool = False,
         epad_id: int = None,
+        skip_eos: bool = False,
+        cut_agent_token_channel: torch.Tensor = None,
+        cut_agent_token_channel_length: torch.Tensor = None,
+        eos_offset_frames: int = 8,
+        agent_eos_id: int = None,
 ) -> torch.Tensor:
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
@@ -846,6 +859,11 @@ def build_token_channel(
 
     total = compute_num_frames(cut.duration, frame_length, cut.sampling_rate)
     tokens = torch.ones(total, dtype=torch.long) * pad_id
+    if cut_agent_token_channel is not None:
+        try:
+            assert cut_agent_token_channel_length.item() == total, "Mismatch between agent token and source token lengths"
+        except:
+            logging.error(f"Mismatch between agent token and source token lengths: {cut_agent_token_channel_length.item()} != {total}")
     for supervision in cut.supervisions:
         if supervision.speaker in roles:
 
@@ -887,26 +905,36 @@ def build_token_channel(
             except Exception as e:
                 raise RuntimeError(f"{tokens.shape=} {pos=} {endpos=} {text_ids.shape=} {diagnostic}") from e
 
-            # Place EOS token - critical for turn-taking behavior
-            if (eospos < len(tokens) and eos_id is not None) or force_add_eos_for_every_turn:
-                # Normal case: place EOS at the intended position
-                tokens[eospos] = eos_id
-            elif add_eos_for_interruption:
-                # Interruption case: place EOS at the last valid position
-                # This ensures the model learns to stop when interrupted by user
-                if endpos < len(tokens):
-                    # Case 1: text finished, interrupted during sil/audio generation
-                    # Place EOS right after the last text token (or at sequence end if closer)
-                    actual_eos_pos = min(endpos, len(tokens) - 1)
-                    tokens[actual_eos_pos] = eos_id
-                elif len(tokens) > 0:
-                    # Case 2: text truncated due to interruption
-                    # Place EOS at the very end of the sequence
-                    tokens[-1] = eos_id
-                logging.warning(
-                    f"Supervision was likely interrupted: {eospos=} >= {len(tokens)=}. "
-                    f"Placed EOS at fallback position to ensure proper turn-taking training. {diagnostic}"
-                )
+            if not skip_eos:
+                if cut_agent_token_channel is not None:
+                    # Fix EOS placement mode: place agent EOS based on user BOS position
+                    assert agent_eos_id is not None, "Agent EOS ID is not set"
+                    user_bospos = compute_num_frames(supervision.start, frame_length, cut.sampling_rate)
+                    agent_eospos = user_bospos + eos_offset_frames
+                    if agent_eospos < cut_agent_token_channel_length.item():
+                        cut_agent_token_channel[agent_eospos] = agent_eos_id
+                    else:
+                        logging.warning(f"Agent EOS position {agent_eospos} is out of bounds for agent token channel {cut_agent_token_channel.shape}")
+                # Place EOS token - critical for turn-taking behavior
+                if (eospos < len(tokens) and eos_id is not None) or force_add_eos_for_every_turn:
+                    # Normal case: place EOS at the intended position
+                    tokens[eospos] = eos_id
+                elif add_eos_for_interruption:
+                    # Interruption case: place EOS at the last valid position
+                    # This ensures the model learns to stop when interrupted by user
+                    if endpos < len(tokens):
+                        # Case 1: text finished, interrupted during sil/audio generation
+                        # Place EOS right after the last text token (or at sequence end if closer)
+                        actual_eos_pos = min(endpos, len(tokens) - 1)
+                        tokens[actual_eos_pos] = eos_id
+                    elif len(tokens) > 0:
+                        # Case 2: text truncated due to interruption
+                        # Place EOS at the very end of the sequence
+                        tokens[-1] = eos_id
+                    logging.warning(
+                        f"Supervision was likely interrupted: {eospos=} >= {len(tokens)=}. "
+                        f"Placed EOS at fallback position to ensure proper turn-taking training. {diagnostic}"
+                    )
 
     return tokens
 
