@@ -49,7 +49,7 @@ from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.metrics.bleu import BLEU
 from nemo.collections.speechlm2.parts.metrics.text_wer import TextWER
 from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
-from nemo.collections.speechlm2.parts.metrics.token_accuracy import TurnTakingMetrics, TokenLevelLatency
+from nemo.collections.speechlm2.parts.metrics.token_accuracy import TurnTakingMetrics, TokenLevelLatency, TimestampAccuracy
 from nemo.collections.speechlm2.parts.metrics.empty_text import EmptyTextMetric
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
 from nemo.collections.speechlm2.parts.pretrained import (
@@ -763,6 +763,15 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             self.token_level_latency = TokenLevelLatency(
                 pad_token_id=self.tokenizer.pad_id
             ).reset()
+        
+        # Initialize Timestamp Accuracy metrics
+        if self.cfg.get("compute_timestamp_accuracy", False):
+            self.timestamp_accuracy = TimestampAccuracy(
+                pad_token_id=self.tokenizer.pad_id,
+                user_bos_id=self.user_bos_id,
+                user_eos_id=self.user_eos_id,
+                tokenizer=self.tokenizer
+            ).reset()
 
     def on_validation_epoch_end(self, prefix="val") -> None:
         bleu = self.bleu.compute()
@@ -788,6 +797,12 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         if self.cfg.get("compute_token_level_latency", False) and hasattr(self, 'token_level_latency'):
             token_level_latency_metrics = self.token_level_latency.compute()
             for k, m in token_level_latency_metrics.items():
+                self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+        
+        # Compute and log Timestamp Accuracy metrics
+        if self.cfg.get("compute_timestamp_accuracy", False) and hasattr(self, 'timestamp_accuracy'):
+            timestamp_accuracy_metrics = self.timestamp_accuracy.compute()
+            for k, m in timestamp_accuracy_metrics.items():
                 self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
 
         if self.predict_user_text:
@@ -848,6 +863,14 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             # Compute Token Level Latency if enabled
             if self.cfg.get("compute_token_level_latency", False) and "source_tokens" in dataset_batch and results["tokens_text_src"] is not None:
                 self.token_level_latency.update(
+                    name=name,
+                    source_tokens=dataset_batch["source_tokens"],
+                    pred_tokens=results["tokens_text_src"]
+                )
+            
+            # Compute Timestamp Accuracy if enabled
+            if self.cfg.get("compute_timestamp_accuracy", False) and "source_tokens" in dataset_batch and results["tokens_text_src"] is not None:
+                self.timestamp_accuracy.update(
                     name=name,
                     source_tokens=dataset_batch["source_tokens"],
                     pred_tokens=results["tokens_text_src"]
