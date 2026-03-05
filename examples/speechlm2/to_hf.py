@@ -16,6 +16,7 @@ from pathlib import Path
 
 import torch
 from omegaconf import OmegaConf
+from peft import PeftModel
 
 from nemo.core.config import hydra_runner
 from nemo.utils.model_utils import import_class_by_path
@@ -64,6 +65,11 @@ def main(cfg: HfExportConfig):
     cls = import_class_by_path(cfg.class_path)
     model = cls(model_cfg)
     load_checkpoint(model, cfg.ckpt_path)
+
+    # Merge LoRA weights into base LLM and remove PeftModel wrapper
+    if isinstance(model.llm, PeftModel):
+        model.llm = model.llm.merge_and_unload()
+
     model = model.to(getattr(torch, cfg.dtype))
     model.save_pretrained(cfg.output_dir)
 
