@@ -120,6 +120,7 @@ data:
   target_sample_rate: 22050
   input_roles: ["user", "User"]
   output_roles: ["agent", "Assistant"]
+  augment_naturalness_prob: 0.0        # Probability of applying naturalness augmentation (0-1)
 
   train_ds:
     sample_rate: ${data.target_sample_rate}

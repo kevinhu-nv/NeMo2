@@ -48,6 +48,7 @@ ASR_SYSTEM_PROMPT = "Transcribe the following speech to text."
 MCQ_SYSTEM_PROMPT_DELAY = "Think longer to give a more accurate answer"
 MCQ_SYSTEM_PROMPT_MCQ = "Answer the following multiple choice question."
 MCQ_SYSTEM_PROMPT_THINK = "Answer the following multiple choice question with an explanation for the answer."
+NATURALNESS_SYSTEM_PROMPT = "Respond naturally and conversationally."
 
 
 def _roman_to_int(s):
@@ -106,6 +107,43 @@ def normalize_numbers(text):
 
     except Exception:
         return text   # fallback: return input unchanged
+
+
+_FILLERS = ["um,", "uh,", "well,", "like,", "you know,", "I mean,", "so,"]
+_HESITATIONS = ["um,", "uh,"]
+
+
+class NaturalnessAugmenter:
+    """Rule-based augmenter that inserts natural hesitations and fillers into agent text."""
+
+    def __init__(self, max_insertions=3, **kwargs):
+        self.max_insertions = max_insertions
+
+    def augment(self, text: str) -> str:
+        """Add natural hesitations to text, preserving the beginning and meaning."""
+        words = text.split()
+        if len(words) <= 3:
+            return text  # too short to augment
+
+        # Number of fillers to insert: 1 to max_insertions
+        n_insertions = random.randint(1, min(self.max_insertions, len(words) // 3))
+
+        # Pick random insertion points, avoiding position 0 (preserve start)
+        # and avoiding consecutive positions
+        candidates = list(range(2, len(words)))
+        random.shuffle(candidates)
+        insert_positions = sorted(candidates[:n_insertions], reverse=True)
+
+        for pos in insert_positions:
+            # Choose filler type: full filler phrase or simple hesitation
+            filler = random.choice(_FILLERS)
+            # Optionally add a word repetition instead (~20% chance)
+            if random.random() < 0.2 and pos < len(words):
+                filler = words[pos] + "..."
+            words.insert(pos, filler)
+
+        return " ".join(words)
+
 
 class DuplexS2SDataset(torch.utils.data.Dataset):
     """
@@ -190,6 +228,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         model_cfg: dict = None,
         force_align_user_text: bool = None,
         early_interruption_prob: float = None,
+        augment_naturalness_prob: float = None,
     ):
         self.tokenizer = tokenizer
         self.frame_length = frame_length
@@ -228,7 +267,12 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.cfg = cfg
         self.model_cfg = model_cfg
         self.use_numbers_norm = model_cfg.get("use_numbers_norm", False)
-        
+        if augment_naturalness_prob is not None:
+            self.augment_naturalness_prob = augment_naturalness_prob
+        else:
+            self.augment_naturalness_prob = cfg.get("augment_naturalness_prob", 0.0) if cfg is not None else 0.0
+        self._naturalness_augmenter = None  # lazy loaded
+
         # Set user tokens based on pretrained LLM type (consistent with duplex_stt_model.py)
         if self.model_cfg is not None and 'Nemotron' in self.model_cfg.get('pretrained_llm', ''):
             # user_bos_token = '<SPECIAL_13>'
@@ -610,18 +654,30 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             delay_text_channel_by = self.model_cfg.get("delay_text_channel_by", 0) if self.model_cfg is not None else 0
             mcq_agent_text_delay = max(0, mcq_agent_text_delay_cfg - delay_text_channel_by)
             
+            # Pre-decide naturalness augmentation per cut
+            # This must happen before collate_system_prompt so the prompt is consistent
+            naturalness_augmenter = None
+            if self.augment_naturalness_prob > 0:
+                if self._naturalness_augmenter is None:
+                    logging.info("Initializing rule-based NaturalnessAugmenter")
+                    self._naturalness_augmenter = NaturalnessAugmenter()
+                naturalness_augmenter = self._naturalness_augmenter
+                for c in all_cuts_combined:
+                    c.apply_naturalness_aug = random.random() < self.augment_naturalness_prob
+
             prompt_tokens, prompt_token_lens = collate_system_prompt(
-                all_cuts_combined, self.tokenizer, self.pad_id, 
+                all_cuts_combined, self.tokenizer, self.pad_id,
                 force_add_prompt=force_add_prompt,
                 mcq_agent_text_delay=mcq_agent_text_delay,
                 add_val_prompt=self.cfg.get("add_val_prompt", False),
                 add_mcq_prompt=self.cfg.get("add_mcq_prompt", None),
+                force_naturalness_prompt=self.cfg.get("force_naturalness_prompt", False) if self.cfg is not None else False,
             )
             source_audio, source_audio_lens = collate_audio(all_cuts_combined.resample(self.source_sample_rate))
             target_audio, target_audio_lens = collate_audio(
                 all_cuts_combined.resample(self.target_sample_rate), recording_field="target_audio"
             )
-            
+
             target_tokens, target_token_lens, ei_flags, mcq_delay_stats = collate_token_channel(
                 all_cuts_combined,
                 self.tokenizer,
@@ -635,6 +691,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 early_interruption_flag_from_cfg=self.early_interruption_prob > 0,
                 skip_eos=self.fix_eos_placements,
                 mcq_agent_text_delay=mcq_agent_text_delay,
+                naturalness_augmenter=naturalness_augmenter,
             )
 
             # Shift agent BOS forward by offset frames for ASR data
@@ -1115,6 +1172,7 @@ def collate_token_channel(
     agent_token_channel_lengths: torch.Tensor = None,
     agent_eos_id: int = None,
     mcq_agent_text_delay: int = 0,
+    naturalness_augmenter=None,
 ) -> tuple[torch.Tensor, torch.Tensor, list, dict]:
     tokens = []
     
@@ -1136,12 +1194,13 @@ def collate_token_channel(
             word_align_position=word_align_position,
             remove_timestamps=remove_timestamps,
             user_bos_id=user_bos_id,
-            agent_bos_id=agent_bos_id, 
+            agent_bos_id=agent_bos_id,
             use_numbers_norm=use_numbers_norm,
             skip_eos=skip_eos,
             cut_agent_token_channel=agent_token_channel[cut_idx] if agent_token_channel is not None else None,
             cut_agent_token_channel_length=agent_token_channel_lengths[cut_idx] if agent_token_channel_lengths is not None else None,
             agent_eos_id=agent_eos_id,
+            naturalness_augmenter=naturalness_augmenter,
         )
         
         # Apply MCQ agent text delay: shift tokens right by mcq_agent_text_delay frames
@@ -1213,6 +1272,7 @@ def collate_system_prompt(
     mcq_agent_text_delay: int = 0,  # Only add MCQ prompt if delay > 0
     add_val_prompt: bool = False,  # If True, add specific system prompt for validation
     add_mcq_prompt: int | None = None,  # If not None, add this prompt to all cuts
+    force_naturalness_prompt: bool = False,  # If True, add naturalness prompt to all cuts
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Collate system prompts from cuts.
@@ -1255,10 +1315,12 @@ def collate_system_prompt(
                     prompt_text = MCQ_SYSTEM_PROMPT_THINK
                 else:
                     no_prompt = True
+        elif force_naturalness_prompt or getattr(c, 'apply_naturalness_aug', False):
+            prompt_text = NATURALNESS_SYSTEM_PROMPT
         else:
             # No system prompt for this cut
             no_prompt = True
-        
+
         if no_prompt:
             tokens.append(torch.as_tensor([], dtype=torch.long))
         else:
@@ -1289,6 +1351,7 @@ def build_token_channel(
         cut_agent_token_channel_length: torch.Tensor = None,
         eos_offset_frames: int = 8,
         agent_eos_id: int = None,
+        naturalness_augmenter=None,
 ) -> torch.Tensor:
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
@@ -1317,6 +1380,11 @@ def build_token_channel(
             text = supervision.text
             if use_numbers_norm:
                 text = normalize_numbers(text)
+            if naturalness_augmenter is not None and getattr(cut, 'apply_naturalness_aug', False):
+                original_text = text
+                text = naturalness_augmenter.augment(text)
+                if text != original_text:
+                    logging.info(f"Naturalness aug: '{original_text}' -> '{text}'")
 
             # Use different bos_id for user and agent
             text_ids = torch.as_tensor([bos_id] + _text_to_ids(text, tokenizer, pad_id, available_frames_for_text=available_frames_for_text, word_align_position=word_align_position, remove_timestamps=remove_timestamps))
