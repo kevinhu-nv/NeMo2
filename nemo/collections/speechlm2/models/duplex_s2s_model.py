@@ -618,7 +618,8 @@ def replace_control_speech_codes(speech_codes: torch.Tensor, control_codes: torc
 
 
 def tokens_to_str(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer: AutoTokenizer, pad_id: int,
-                  user_bos_id: int = None, eval_text_turn_taking: bool = False, sil_id: int = None) -> list[str]:
+                  user_bos_id: int = None, eval_text_turn_taking: bool = False, sil_id: int = None,
+                  agent_fc_bos_id: int = None, agent_fc_eos_id: int = None) -> list[str]:
     """
     Convert token IDs to text strings, filtering out special tokens.
 
@@ -650,6 +651,11 @@ def tokens_to_str(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer: AutoTo
         # Filter out sil if provided
         if sil_id is not None:
             token_ids = token_ids[token_ids != sil_id]
+        # Filter out FC bos/eos if provided
+        if agent_fc_bos_id is not None:
+            token_ids = token_ids[token_ids != agent_fc_bos_id]
+        if agent_fc_eos_id is not None:
+            token_ids = token_ids[token_ids != agent_fc_eos_id]
         return token_ids
 
     for _, hyp_ids, hyp_len in zip(tokens.cpu(), tokens.cpu(), lengths.cpu()):
@@ -663,7 +669,15 @@ def tokens_to_str(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer: AutoTo
             user_bos_positions = []
             if user_bos_id is not None:
                 user_bos_positions = (hyp_ids == user_bos_id).nonzero(as_tuple=True)[0].tolist()
-            
+
+            # Find FC BOS/EOS positions
+            fc_bos_positions = []
+            fc_eos_positions = []
+            if agent_fc_bos_id is not None:
+                fc_bos_positions = (hyp_ids == agent_fc_bos_id).nonzero(as_tuple=True)[0].tolist()
+            if agent_fc_eos_id is not None:
+                fc_eos_positions = (hyp_ids == agent_fc_eos_id).nonzero(as_tuple=True)[0].tolist()
+
             # Detect end-of-text (EOT) positions: find first pad after each BOS
             agent_eot_positions = []
             for bos_pos in agent_bos_positions:
@@ -687,6 +701,10 @@ def tokens_to_str(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer: AutoTo
                 all_positions.append((pos, 'eos'))
             for pos in agent_eot_positions:
                 all_positions.append((pos, 'eot'))
+            for pos in fc_bos_positions:
+                all_positions.append((pos, 'fc_bos'))
+            for pos in fc_eos_positions:
+                all_positions.append((pos, 'fc_eos'))
 
             # Sort by position
             all_positions.sort(key=lambda x: x[0])
@@ -704,6 +722,10 @@ def tokens_to_str(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer: AutoTo
                     out_str.append(f"<|{timestamp}|>")
                 elif pos_type == 'eos':
                     out_str.append(f"<${timestamp}$>")
+                elif pos_type == 'fc_bos':
+                    out_str.append(f"<|FC:{timestamp}|>")
+                elif pos_type == 'fc_eos':
+                    out_str.append(f"<$FC:{timestamp}$>")
                 else:  # eot
                     out_str.append(f"<{timestamp}>")
             # Filter the remaining tokens after the last position

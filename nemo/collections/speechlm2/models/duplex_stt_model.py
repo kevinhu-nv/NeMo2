@@ -1029,17 +1029,18 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
     def _force_write_post_fc_response(self, results, dataset_batch):
         """Force-write ground truth post-FC response text into inference output.
 
-        1. Find agent_fc_eos positions in both GT (target_tokens) and predicted (tokens_text)
-        2. Match predicted to GT by nearest position within tolerance
-        3. For each matched pair: write [agent_bos, GT_text..., agent_eos]
-           at predicted_fc_eos_pos + post_fc_res_delay
+        1. Find agent_fc_bos positions in both GT and predicted (for matching tool calls)
+        2. Match predicted to GT fc_bos by nearest position within tolerance
+        3. For each matched pair: find the predicted fc_eos after the matched fc_bos,
+           then write [agent_bos, GT_text..., agent_eos] at pred_fc_eos + post_fc_res_delay
         """
         tokens_text = results["tokens_text"]         # [B, T]
         target_tokens = dataset_batch["target_tokens"]  # [B, T]
         fc_post_res_tokens = dataset_batch["fc_post_res_tokens"]  # [B, num_turns, max_len]
         fc_post_res_lens = dataset_batch["fc_post_res_lens"]      # [B, num_turns]
-        agent_fc_eos_id = dataset_batch["agent_fc_eos_id"]
-        agent_fc_bos_id = dataset_batch.get("agent_fc_bos_id", None)
+        # Use model's FC token IDs (resolved from pretrained_llm config) for both GT and pred
+        agent_fc_bos_id = self.agent_fc_bos_id
+        agent_fc_eos_id = self.agent_fc_eos_id
         post_fc_res_delay = dataset_batch["post_fc_res_delay"]
         bos_id = self.text_bos_id
         eos_id = self.text_eos_id
@@ -1050,54 +1051,64 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         T_gt = target_tokens.shape[1]
 
         for i in range(B):
-            # Find GT and predicted fc_bos positions
-            gt_fc_bos_positions = []
-            pred_fc_bos_positions = []
-            if agent_fc_bos_id is not None:
-                gt_fc_bos_positions = (target_tokens[i, :T_gt] == agent_fc_bos_id).nonzero(as_tuple=True)[0].tolist()
-                pred_fc_bos_positions = (tokens_text[i, :T] == agent_fc_bos_id).nonzero(as_tuple=True)[0].tolist()
+            # Find GT and predicted fc_bos positions (used for matching tool calls)
+            gt_fc_bos_positions = (target_tokens[i, :T_gt] == agent_fc_bos_id).nonzero(as_tuple=True)[0].tolist()
+            pred_fc_bos_positions = (tokens_text[i, :T] == agent_fc_bos_id).nonzero(as_tuple=True)[0].tolist()
 
-            # Find GT and predicted fc_eos positions
-            gt_fc_eos_positions = (target_tokens[i, :T_gt] == agent_fc_eos_id).nonzero(as_tuple=True)[0].tolist()
+            # Find predicted fc_eos positions (used to determine where to write post-FC text)
             pred_fc_eos_positions = (tokens_text[i, :T] == agent_fc_eos_id).nonzero(as_tuple=True)[0].tolist()
 
             logging.info(
                 f"[FC force-write] sample {i}: "
                 f"gt_fc_bos_positions={gt_fc_bos_positions}, "
                 f"pred_fc_bos_positions={pred_fc_bos_positions}, "
-                f"gt_fc_eos_positions={gt_fc_eos_positions}, "
                 f"pred_fc_eos_positions={pred_fc_eos_positions}"
             )
 
-            if not gt_fc_eos_positions or not pred_fc_eos_positions:
-                if not pred_fc_eos_positions and gt_fc_eos_positions:
-                    logging.info(f"[FC force-write] sample {i}: model missed all {len(gt_fc_eos_positions)} tool calls (no pred fc_eos)")
-                elif not gt_fc_eos_positions and pred_fc_eos_positions:
-                    logging.info(f"[FC force-write] sample {i}: no GT tool calls but model predicted {len(pred_fc_eos_positions)} fc_eos")
+            if not gt_fc_bos_positions or not pred_fc_bos_positions:
+                if not pred_fc_bos_positions and gt_fc_bos_positions:
+                    logging.info(f"[FC force-write] sample {i}: model missed all {len(gt_fc_bos_positions)} tool calls (no pred fc_bos)")
+                elif not gt_fc_bos_positions and pred_fc_bos_positions:
+                    logging.info(f"[FC force-write] sample {i}: no GT tool calls but model predicted {len(pred_fc_bos_positions)} fc_bos")
                 continue
 
-            # Match predicted -> GT (greedy nearest within tolerance)
+            # Match predicted fc_bos -> GT fc_bos (greedy nearest within tolerance)
             used_gt = set()
-            for pred_pos in pred_fc_eos_positions:
+            for pred_bos_pos in pred_fc_bos_positions:
                 best_gt_idx = None
                 best_dist = tolerance + 1
-                for gt_idx, gt_pos in enumerate(gt_fc_eos_positions):
+                for gt_idx, gt_bos_pos in enumerate(gt_fc_bos_positions):
                     if gt_idx not in used_gt:
-                        dist = abs(pred_pos - gt_pos)
+                        dist = abs(pred_bos_pos - gt_bos_pos)
                         if dist <= tolerance and dist < best_dist:
                             best_gt_idx = gt_idx
                             best_dist = dist
                 if best_gt_idx is None:
                     logging.info(
-                        f"[FC force-write] sample {i}: pred fc_eos at {pred_pos} has no GT match "
+                        f"[FC force-write] sample {i}: pred fc_bos at {pred_bos_pos} has no GT match "
                         f"within tolerance={tolerance} (false positive)"
                     )
-                    continue  # No matching GT for this prediction
+                    continue
                 used_gt.add(best_gt_idx)
 
+                # Find the first predicted fc_eos AFTER this pred fc_bos
+                pred_eos_pos = None
+                for eos_pos in pred_fc_eos_positions:
+                    if eos_pos > pred_bos_pos:
+                        pred_eos_pos = eos_pos
+                        break
+
+                if pred_eos_pos is None:
+                    logging.info(
+                        f"[FC force-write] sample {i}: pred fc_bos at {pred_bos_pos} matched GT idx={best_gt_idx}, "
+                        f"but no pred fc_eos found after it"
+                    )
+                    continue
+
                 logging.info(
-                    f"[FC force-write] sample {i}: matched pred_pos={pred_pos} -> "
-                    f"gt_pos={gt_fc_eos_positions[best_gt_idx]} (gt_idx={best_gt_idx}, dist={best_dist})"
+                    f"[FC force-write] sample {i}: matched pred_fc_bos={pred_bos_pos} -> "
+                    f"gt_fc_bos={gt_fc_bos_positions[best_gt_idx]} (gt_idx={best_gt_idx}, dist={best_dist}), "
+                    f"pred_fc_eos={pred_eos_pos}"
                 )
 
                 # Get GT response text for the matched GT turn
@@ -1110,7 +1121,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     continue
 
                 # Write at predicted_fc_eos_pos + delay
-                insert_pos = pred_pos + post_fc_res_delay
+                insert_pos = pred_eos_pos + post_fc_res_delay
                 if insert_pos >= T:
                     logging.info(f"[FC force-write] sample {i}: insert_pos={insert_pos} >= T={T}, skipping")
                     continue
@@ -1128,16 +1139,16 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 written_text = self.tokenizer.ids_to_text(turn_toks.tolist())
                 logging.info(
                     f"[FC force-write] sample {i}: WROTE {write_len} tokens at pos {insert_pos} "
-                    f"(pred_fc_eos={pred_pos} + delay={post_fc_res_delay}), "
+                    f"(pred_fc_eos={pred_eos_pos} + delay={post_fc_res_delay}), "
                     f"text='{written_text}'"
                 )
 
             # Log unmatched GT positions (model missed these tool calls)
-            unmatched_gt = [idx for idx in range(len(gt_fc_eos_positions)) if idx not in used_gt]
+            unmatched_gt = [idx for idx in range(len(gt_fc_bos_positions)) if idx not in used_gt]
             if unmatched_gt:
                 logging.info(
                     f"[FC force-write] sample {i}: {len(unmatched_gt)} unmatched GT tool calls "
-                    f"(missed by model): gt_fc_eos_positions={[gt_fc_eos_positions[idx] for idx in unmatched_gt]}"
+                    f"(missed by model): gt_fc_bos_positions={[gt_fc_bos_positions[idx] for idx in unmatched_gt]}"
                 )
 
         # Re-decode text
@@ -1147,6 +1158,8 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             user_bos_id=self.user_bos_id,
             eval_text_turn_taking=self.cfg.get("eval_text_turn_taking", True),
             sil_id=getattr(self, '_sil_id', None),
+            agent_fc_bos_id=self.agent_fc_bos_id,
+            agent_fc_eos_id=self.agent_fc_eos_id,
         )
 
     def validation_step(self, batch: dict, batch_idx: int):
@@ -1191,8 +1204,8 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             if "agent_fc_eos_id" in dataset_batch and "agent_fc_bos_id" in dataset_batch and results["tokens_text"] is not None:
                 if self.fc_acc is None:
                     self.fc_acc = FCAccMetrics(
-                        fc_bos_id=dataset_batch["agent_fc_bos_id"],
-                        fc_eos_id=dataset_batch["agent_fc_eos_id"],
+                        fc_bos_id=self.agent_fc_bos_id,
+                        fc_eos_id=self.agent_fc_eos_id,
                     ).reset()
                 self.fc_acc.update(
                     name=name,
@@ -1901,7 +1914,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
         if self.predict_user_text:
             gen_text_src = gen_asr
-            src_text_cleaned = tokens_to_str(gen_text_src, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, user_bos_id=self.user_bos_id, eval_text_turn_taking=self.cfg.get("eval_text_turn_taking", True), sil_id=inference_state["sil_id"])
+            src_text_cleaned = tokens_to_str(gen_text_src, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, user_bos_id=self.user_bos_id, eval_text_turn_taking=self.cfg.get("eval_text_turn_taking", True), sil_id=inference_state["sil_id"], agent_fc_bos_id=self.agent_fc_bos_id, agent_fc_eos_id=self.agent_fc_eos_id)
         else:
             gen_text_src = None
             src_text_cleaned = None
@@ -1931,7 +1944,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 lengths = lengths_trimmed
 
         ans = {
-            "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, user_bos_id=self.user_bos_id, eval_text_turn_taking=self.cfg.get("eval_text_turn_taking", True), sil_id=inference_state["sil_id"]),
+            "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, user_bos_id=self.user_bos_id, eval_text_turn_taking=self.cfg.get("eval_text_turn_taking", True), sil_id=inference_state["sil_id"], agent_fc_bos_id=self.agent_fc_bos_id, agent_fc_eos_id=self.agent_fc_eos_id),
             "src_text": src_text_cleaned,
             "tokens_text_src": gen_text_src,
             "tokens_text": gen_text,
