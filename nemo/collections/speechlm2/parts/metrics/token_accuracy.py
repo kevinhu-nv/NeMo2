@@ -13,6 +13,7 @@
 # limitations under the License.
 from collections import defaultdict
 import torch
+import numpy as np
 from nemo.utils import logging
 
 
@@ -154,6 +155,93 @@ class TurnTakingMetrics:
         # Clear stored values
         self.accuracies.clear()
         self.latencies.clear()
-        
+
         return corpus_metrics
+
+
+class FCAccMetrics:
+    """Precision/recall for tool call detection.
+
+    A predicted tool call is a match if BOTH:
+      - a predicted fc_bos is within tolerance of a GT fc_bos, AND
+      - a predicted fc_eos is within tolerance of the corresponding GT fc_eos.
+    This ensures the model produced the full BOS->EOS pair, not just a stray token.
+    """
+
+    def __init__(self, fc_bos_id: int, fc_eos_id: int, tolerance: int = 13):
+        self.fc_bos_id = fc_bos_id
+        self.fc_eos_id = fc_eos_id
+        self.tolerance = tolerance
+        self.precisions = defaultdict(list)
+        self.recalls = defaultdict(list)
+
+    def reset(self):
+        self.precisions.clear()
+        self.recalls.clear()
+        return self
+
+    def _find_pairs(self, tokens_np, bos_id, eos_id):
+        """Find (bos_pos, eos_pos) pairs: each bos matched to nearest following eos."""
+        bos_positions = np.where(tokens_np == bos_id)[0].tolist()
+        eos_positions = np.where(tokens_np == eos_id)[0].tolist()
+        pairs = []
+        used_eos = set()
+        for bos_pos in bos_positions:
+            # Find the nearest eos after this bos
+            best_eos = None
+            for eos_idx, eos_pos in enumerate(eos_positions):
+                if eos_idx not in used_eos and eos_pos > bos_pos:
+                    best_eos = (eos_idx, eos_pos)
+                    break  # First unused eos after bos
+            if best_eos is not None:
+                used_eos.add(best_eos[0])
+                pairs.append((bos_pos, best_eos[1]))
+        return pairs
+
+    def update(self, name, target_tokens, pred_tokens):
+        """Compare fc_bos/fc_eos pairs in target vs predicted tokens."""
+        target_np = target_tokens.cpu().numpy()
+        pred_np = pred_tokens.cpu().numpy()
+
+        for i in range(target_np.shape[0]):
+            gt_pairs = self._find_pairs(target_np[i], self.fc_bos_id, self.fc_eos_id)
+            pred_pairs = self._find_pairs(pred_np[i], self.fc_bos_id, self.fc_eos_id)
+
+            if not gt_pairs and not pred_pairs:
+                continue  # No FC in either -> skip
+
+            # Match predicted pairs to GT pairs:
+            # both bos and eos must be within tolerance
+            matched = 0
+            used_gt = set()
+            for pred_bos, pred_eos in pred_pairs:
+                for j, (gt_bos, gt_eos) in enumerate(gt_pairs):
+                    if j not in used_gt:
+                        if abs(pred_bos - gt_bos) <= self.tolerance and abs(pred_eos - gt_eos) <= self.tolerance:
+                            matched += 1
+                            used_gt.add(j)
+                            break
+
+            precision = matched / len(pred_pairs) if pred_pairs else 0.0
+            recall = matched / len(gt_pairs) if gt_pairs else 0.0
+            self.precisions[name].append(precision)
+            self.recalls[name].append(recall)
+
+    def compute(self):
+        metrics = {}
+        all_names = set(self.precisions.keys()) | set(self.recalls.keys())
+        for name in all_names:
+            if self.precisions[name]:
+                metrics[f"fc_acc_precision_{name}"] = torch.tensor(
+                    sum(self.precisions[name]) / len(self.precisions[name]))
+            else:
+                metrics[f"fc_acc_precision_{name}"] = torch.tensor(0.0)
+            if self.recalls[name]:
+                metrics[f"fc_acc_recall_{name}"] = torch.tensor(
+                    sum(self.recalls[name]) / len(self.recalls[name]))
+            else:
+                metrics[f"fc_acc_recall_{name}"] = torch.tensor(0.0)
+        self.precisions.clear()
+        self.recalls.clear()
+        return metrics
 

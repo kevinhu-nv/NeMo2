@@ -17,6 +17,7 @@ import random
 import torch
 import torch.utils.data
 import torchaudio
+from typing import Optional
 
 from lhotse import CutSet, MonoCut, Recording, Seconds, SupervisionSegment, compute_num_frames
 from lhotse.cut import Cut
@@ -28,8 +29,20 @@ from nemo.collections.speechlm2.data.utils import get_pad_id
 from nemo.collections.speechlm2.data.force_align import ForceAligner
 from nemo.utils import logging
 from nemo.collections.common.data.lhotse.text_adapters import Formattable
+from nemo.collections.speechlm2.data.function_call import (
+    DEFAULT_FC_FILLER_RESPONSES,
+    DEFAULT_FC_SYSTEM_PROMPT_TEMPLATE,
+    _is_function_calling_cut,
+    _is_assistant_after_tool_response,
+    _get_fc_prompt,
+    extract_fc_batch_data,
+    add_minimal_batch_fc_data,
+    get_fc_cut_total_prompt_tokens,
+    resolve_fc_tokens,
+    inject_fc_filler_responses,
+    log_fc_target_tokens,
+)
 import inflect
-import re
 
 _inflect = inflect.engine()
 
@@ -50,6 +63,8 @@ MCQ_SYSTEM_PROMPT_MCQ = "Answer the following multiple choice question."
 MCQ_SYSTEM_PROMPT_THINK = "Answer the following multiple choice question with an explanation for the answer."
 NATURALNESS_SYSTEM_PROMPT = "Respond naturally and conversationally."
 
+# Regex pattern for timestamp tokens (compiled once at module level for efficiency)
+_TIMESTAMP_PATTERN_COMPILED = re.compile(r"<\|\d+\|>")
 
 def _roman_to_int(s):
     total = 0
@@ -267,6 +282,14 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.cfg = cfg
         self.model_cfg = model_cfg
         self.use_numbers_norm = model_cfg.get("use_numbers_norm", False)
+        self.fc_log = model_cfg.get("fc_log", False) if model_cfg is not None else False
+
+        # FC text normalization (default True)
+        self.normalize_fc_toolcall_arguments = bool(cfg.get("normalize_fc_toolcall_arguments", True)) if cfg is not None else True
+        self.strip_fc_text_before_toolcall = bool(cfg.get("strip_fc_text_before_toolcall", True)) if cfg is not None else True
+        # Max FC token limit for filtering
+        self.max_fc_lens = (cfg or {}).get("max_fc_total_tokens")
+
         if augment_naturalness_prob is not None:
             self.augment_naturalness_prob = augment_naturalness_prob
         else:
@@ -290,6 +313,21 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.user_eos_id = self.tokenizer.text_to_ids(user_eos_token)[0]
         self.agent_bos_id = self.tokenizer.bos
         self.agent_eos_id = self.tokenizer.eos
+        # For FC: use different BOS/EOS tokens for tool calls
+        self.agent_fc_bos_id, self.agent_fc_eos_id = resolve_fc_tokens(
+            cfg, self.model_cfg, self.tokenizer, self.agent_bos_id, self.agent_eos_id
+        )
+
+        # FC filler responses: inject short filler text after agent_fc_bos before tool calls
+        self.add_fc_filler_response = (cfg or {}).get("add_fc_filler_response", False)
+        self.fc_filler_response_delay = (cfg or {}).get("fc_filler_response_delay", self.filler_response_delay)
+        self.fc_filler_responses = (cfg or {}).get("fc_filler_responses", None) or list(DEFAULT_FC_FILLER_RESPONSES)
+
+        # FC post-response: whether to include post-FC response text in validation
+        self.include_post_fc_res = (cfg or {}).get("include_post_fc_res", False)
+        post_fc_res_delay = (cfg or {}).get("post_fc_res_delay", None)
+        self.post_fc_res_delay = post_fc_res_delay if post_fc_res_delay is not None else round(1.0 / self.frame_length)
+
         self.pad_id = get_pad_id(self.tokenizer)
 
         # Initialize force aligner lazily (only when needed during training)
@@ -580,33 +618,76 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 duration_end = filler_end
             target_token_lens[i] = min(max(duration_end, filler_end), seq_len)
 
-    def _create_minimal_batch(self) -> dict:
-        """Create a minimal valid batch when all cuts are filtered out."""
-        # Create minimal tensors with batch size 1
-        device = torch.device('cpu')  # Default device
-        
-        return {
+    def _create_minimal_batch(
+        self,
+        minimal_batch_fc: bool = False,
+        fc_drop_info: dict | None = None,
+    ) -> dict:
+        """Create a minimal valid batch when all cuts are filtered out or FC sample is dropped.
+
+        Args:
+            minimal_batch_fc: If True, this minimal batch was created because the batch was dropped
+                due to FC (e.g. system+FC tokens > max_fc_lens). Used for logging and metrics.
+            fc_drop_info: Optional dict when minimal_batch_fc=True, e.g.:
+                {"cut_id": str, "total_prompt_tokens": int, "max_fc_total_tokens": int, "reason": str}.
+        """
+        duration_sec = 1.0
+        shared_audio_len = int(self.source_sample_rate * duration_sec)
+        token_seq_len = max(
+            2,
+            compute_num_frames(
+                duration=duration_sec,
+                frame_shift=self.frame_length,
+                sampling_rate=self.source_sample_rate,
+            )
+            + 1,
+        )
+
+        source_audio = torch.zeros((1, shared_audio_len), dtype=torch.float32)
+        target_audio = torch.zeros((1, shared_audio_len), dtype=torch.float32)
+        target_tokens = torch.full((1, token_seq_len), self.pad_id, dtype=torch.long)
+        source_tokens = torch.full((1, token_seq_len), self.pad_id, dtype=torch.long)
+
+        out = {
+            "is_minimal_batch": True,
+            "minimal_batch_fc": minimal_batch_fc,
+            "minimal_batch_non_fc": not minimal_batch_fc,
             "sample_id": ["empty_batch"],
-            "source_audio": torch.zeros((1, 1000), dtype=torch.float32),  # 1 second of silence at 16kHz
-            "source_audio_lens": torch.tensor([1000], dtype=torch.long),
+            "source_audio": source_audio,
+            "source_audio_lens": torch.tensor([shared_audio_len], dtype=torch.long),
             "agent_bos_vad": None,
-            "target_audio": torch.zeros((1, 22050), dtype=torch.float32),  # 1 second of silence at 22.05kHz
-            "target_audio_lens": torch.tensor([22050], dtype=torch.long),
-            "target_tokens": torch.full((1, 50), self.pad_id, dtype=torch.long),
-            "target_token_lens": torch.tensor([1], dtype=torch.long),
-            "source_tokens": torch.full((1, 50), self.pad_id, dtype=torch.long),
-            "source_token_lens": torch.tensor([1], dtype=torch.long),
+            "target_audio": target_audio,
+            "target_audio_lens": torch.tensor([shared_audio_len], dtype=torch.long),
+            "target_tokens": target_tokens,
+            "target_token_lens": torch.tensor([token_seq_len], dtype=torch.long),
+            "source_tokens": source_tokens,
+            "source_token_lens": torch.tensor([token_seq_len], dtype=torch.long),
             "source_texts": [""],
             "target_texts": [""],
             "all_texts": [""],
-            "target_first_turn_audio": torch.zeros((1, 22050), dtype=torch.float32),
-            "target_first_turn_audio_lens": torch.tensor([22050], dtype=torch.long),
+            "target_first_turn_audio": target_audio.clone(),
+            "target_first_turn_audio_lens": torch.tensor([shared_audio_len], dtype=torch.long),
             "formatter": ["s2s_duplex"],
+            "aug_by_noise": [True],
         }
+        if minimal_batch_fc:
+            add_minimal_batch_fc_data(
+                out,
+                self.tokenizer,
+                self.frame_length,
+                self.model_cfg,
+                fc_drop_info,
+            )
+        return out
+
 
     def __getitem__(self, all_cuts: CutSet) -> dict:
-        # audio mini-batch
+        # Check if this is a function calling batch
         cuts = all_cuts.filter(lambda c: isinstance(c, Cut))
+        is_function_calling_batch = len(cuts) > 0 and any(_is_function_calling_cut(c) for c in cuts)
+        if is_function_calling_batch:
+            logging.info(f"[FC detect] is_function_calling_batch=True, num_cuts={len(cuts)}, "
+                         f"cut_ids={[c.id for c in cuts][:3]}")
         audio_data = None
         early_interruption_stats = None
         mcq_delay_stats = None
@@ -634,7 +715,8 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         if cuts:
             swapped_cuts = []
 
-            if self.aug_by_swap_role:
+            # Skip role swapping for function calling batches
+            if self.aug_by_swap_role and not is_function_calling_batch:
                 for cut in cuts:
                     total_turns = cut.custom.get('total_turns', len(cut.supervisions))
 
@@ -653,7 +735,50 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             mcq_agent_text_delay_cfg = self.cfg.get("mcq_agent_text_delay", 0) if self.cfg is not None else 0
             delay_text_channel_by = self.model_cfg.get("delay_text_channel_by", 0) if self.model_cfg is not None else 0
             mcq_agent_text_delay = max(0, mcq_agent_text_delay_cfg - delay_text_channel_by)
-            
+
+            # For function calling: per-cut filtering by system+FC token length threshold.
+            if self.max_fc_lens is not None:
+                kept_cuts = []
+                dropped_cuts = []
+                for cut in all_cuts_combined:
+                    if not _is_function_calling_cut(cut):
+                        kept_cuts.append(cut)
+                    else:
+                        total_tokens = get_fc_cut_total_prompt_tokens(
+                            cut, self.tokenizer, DEFAULT_FC_SYSTEM_PROMPT_TEMPLATE
+                        )
+                        if total_tokens <= self.max_fc_lens:
+                            kept_cuts.append(cut)
+                        else:
+                            dropped_cuts.append((cut.id, total_tokens))
+
+                if dropped_cuts and self.fc_log:
+                    preview = ", ".join(
+                        f"{cut_id}({tok_cnt}>{self.max_fc_lens})" for cut_id, tok_cnt in dropped_cuts[:10]
+                    )
+                    logging.info(
+                        f"[FC] Filtered {len(dropped_cuts)} cuts over max_fc_total_tokens. Examples: {preview}"
+                    )
+
+                if len(kept_cuts) == 0:
+                    return {
+                        "audio_data": self._create_minimal_batch(
+                            minimal_batch_fc=True,
+                            fc_drop_info={
+                                "cut_id": dropped_cuts[0][0] if dropped_cuts else "unknown",
+                                "total_prompt_tokens": int(dropped_cuts[0][1]) if dropped_cuts else -1,
+                                "max_fc_total_tokens": self.max_fc_lens,
+                                "reason": "max_fc_total_tokens_all_filtered",
+                                "num_dropped_cuts": len(dropped_cuts),
+                            },
+                        ),
+                        "text_data": None,
+                        "early_interruption_stats": None,
+                    }
+
+                if len(kept_cuts) != len(all_cuts_combined):
+                    all_cuts_combined = CutSet.from_cuts(kept_cuts)
+
             # Pre-decide naturalness augmentation per cut
             # This must happen before collate_system_prompt so the prompt is consistent
             naturalness_augmenter = None
@@ -665,12 +790,12 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 for c in all_cuts_combined:
                     c.apply_naturalness_aug = random.random() < self.augment_naturalness_prob
 
-            prompt_tokens, prompt_token_lens = collate_system_prompt(
+            prompt_tokens, prompt_token_lens, prompt_texts = collate_system_prompt(
                 all_cuts_combined, self.tokenizer, self.pad_id,
                 force_add_prompt=force_add_prompt,
                 mcq_agent_text_delay=mcq_agent_text_delay,
-                add_val_prompt=self.cfg.get("add_val_prompt", False),
-                add_mcq_prompt=self.cfg.get("add_mcq_prompt", None),
+                add_val_prompt=self.cfg.get("add_val_prompt", False) if self.cfg is not None else False,
+                add_mcq_prompt=self.cfg.get("add_mcq_prompt", None) if self.cfg is not None else None,
                 force_naturalness_prompt=self.cfg.get("force_naturalness_prompt", False) if self.cfg is not None else False,
             )
             source_audio, source_audio_lens = collate_audio(all_cuts_combined.resample(self.source_sample_rate))
@@ -692,6 +817,9 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 skip_eos=self.fix_eos_placements,
                 mcq_agent_text_delay=mcq_agent_text_delay,
                 naturalness_augmenter=naturalness_augmenter,
+                skip_assistant_after_tool_response=is_function_calling_batch,
+                agent_fc_bos_id=self.agent_fc_bos_id if is_function_calling_batch else None,
+                agent_fc_eos_id=self.agent_fc_eos_id if is_function_calling_batch else None,
             )
 
             # Shift agent BOS forward by offset frames for ASR data
@@ -725,6 +853,22 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 #         logging.warning(f"[_inject_filler] sample {i}: decoded = '{self.tokenizer.ids_to_text(target_tokens[i, start_idx:end_idx].tolist())}'")
                 # breakpoint()
 
+            # Inject filler responses before tool calls in FC data
+            if self.add_fc_filler_response and is_function_calling_batch:
+                inject_fc_filler_responses(
+                    target_tokens, target_token_lens, self.tokenizer,
+                    self.agent_fc_bos_id, self.agent_fc_eos_id, self.pad_id,
+                    self.fc_filler_response_delay, self.fc_filler_responses,
+                )
+
+            # Debug: dump FC turn layout in target_tokens
+            if is_function_calling_batch:
+                log_fc_target_tokens(
+                    target_tokens, target_token_lens, all_cuts_combined, self.tokenizer,
+                    self.agent_fc_bos_id, self.agent_fc_eos_id,
+                    self.agent_bos_id, self.agent_eos_id, self.pad_id,
+                )
+
             # Run force alignment if enabled
             # NOTE: For validation, create a separate dataset instance with force_align_user_text=False
             if self.force_align_user_text:
@@ -754,11 +898,11 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 agent_token_channel_lengths=agent_lengths_for_source_collate if self.fix_eos_placements else None,
                 agent_eos_id=self.agent_eos_id if self.fix_eos_placements else None,
             )
-            # Early interruption augmentation
+            # Early interruption augmentation (skip for function calling batches to avoid position misalignment)
             batch_early_interruption_total = 0
             batch_early_interruption_attempted = 0
             batch_early_interruption_successful = 0
-            if self.early_interruption_prob > 0 and torch.is_grad_enabled():
+            if self.early_interruption_prob > 0 and torch.is_grad_enabled() and not is_function_calling_batch:
                 for batch_idx in range(target_tokens.shape[0]):
                     batch_early_interruption_total += 1
                     if ei_flags[batch_idx]:
@@ -776,6 +920,8 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                             )
                             if success:
                                 batch_early_interruption_successful += 1
+            elif is_function_calling_batch and self.early_interruption_prob > 0:
+                logging.debug(f"Skipping early interruption for function calling batch to avoid position misalignment")
             
             if self.cfg.get("fix_last_turn_eos", False) if self.cfg is not None else False:
                 fix_last_turn_eos(target_tokens, source_tokens, src_eos_id=self.user_eos_id, tgt_eos_id=self.agent_eos_id, pad_id=self.pad_id)
@@ -837,7 +983,9 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             if torch.sum(prompt_token_lens) > 0:
                 audio_data['prompt_tokens'] = prompt_tokens
                 audio_data['prompt_token_lens'] = prompt_token_lens
-            
+            # Raw prompt string used to build prompt_tokens (typically supervision[0] for FC cuts).
+            audio_data["system_prompt_supervision_0"] = prompt_texts
+
             # Optionally include detailed turn metadata for analysis
             if self.include_turn_metadata:
                 audio_data["target_turn_texts"] = [
@@ -867,7 +1015,21 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 audio_data["system_prompt"] = [
                     cut.custom.get('system_prompt', '') for cut in all_cuts_combined
                 ]
-                
+
+            # ===== Function Calling Metadata Extraction =====
+            if is_function_calling_batch:
+                fc_data = extract_fc_batch_data(
+                    all_cuts_combined, self.tokenizer, self.pad_id,
+                    self.frame_length, self.target_sample_rate, self.output_roles,
+                    False, self.normalize_fc_toolcall_arguments,
+                    self.strip_fc_text_before_toolcall,
+                )
+                audio_data.update(fc_data)
+                audio_data["include_post_fc_res"] = self.include_post_fc_res
+                audio_data["agent_fc_eos_id"] = self.agent_fc_eos_id
+                audio_data["agent_fc_bos_id"] = self.agent_fc_bos_id
+                audio_data["post_fc_res_delay"] = self.post_fc_res_delay
+
         text_cuts = all_cuts.filter(lambda c: isinstance(c, Formattable))
         text_data = None
         if text_cuts:
@@ -1173,6 +1335,9 @@ def collate_token_channel(
     agent_eos_id: int = None,
     mcq_agent_text_delay: int = 0,
     naturalness_augmenter=None,
+    skip_assistant_after_tool_response: bool = False,
+    agent_fc_bos_id: int = None,
+    agent_fc_eos_id: int = None,
 ) -> tuple[torch.Tensor, torch.Tensor, list, dict]:
     tokens = []
     
@@ -1201,6 +1366,9 @@ def collate_token_channel(
             cut_agent_token_channel_length=agent_token_channel_lengths[cut_idx] if agent_token_channel_lengths is not None else None,
             agent_eos_id=agent_eos_id,
             naturalness_augmenter=naturalness_augmenter,
+            skip_assistant_after_tool_response=skip_assistant_after_tool_response,
+            agent_fc_bos_id=agent_fc_bos_id,
+            agent_fc_eos_id=agent_fc_eos_id,
         )
         
         # Apply MCQ agent text delay: shift tokens right by mcq_agent_text_delay frames
@@ -1273,18 +1441,32 @@ def collate_system_prompt(
     add_val_prompt: bool = False,  # If True, add specific system prompt for validation
     add_mcq_prompt: int | None = None,  # If not None, add this prompt to all cuts
     force_naturalness_prompt: bool = False,  # If True, add naturalness prompt to all cuts
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
     """
     Collate system prompts from cuts.
     System prompts should be stored in cut.custom['system_prompt'].
     MCQ cuts automatically get the system prompt defined in MCQ_SYSTEM_PROMPT_DELAY
     (only when mcq_agent_text_delay > 0).
+    For function calling data: System prompt from cut.supervisions[0].text (speaker='system')
+    If the FC prompt is tools-only (e.g. only <AVAILABLE_TOOLS>...</AVAILABLE_TOOLS>),
+    it is wrapped with the full instruction template using DEFAULT_FC_SYSTEM_PROMPT_TEMPLATE.
     """
     tokens = []
-    for c in cuts:
+    prompt_texts = []
+    for idx, c in enumerate(cuts):
+        prompt_text = None
         no_prompt = False
+
+        # Check if this is a function calling cut with system supervision
+        is_fc_cut = _is_function_calling_cut(c)
+
         if c.custom and c.custom.get("system_prompt", None):
             prompt_text = c.custom["system_prompt"]
+        elif is_fc_cut and len(c.supervisions) > 0 and c.supervisions[0].speaker == 'system':
+            # Function calling: use system prompt from first supervision
+            prompt_content = c.supervisions[0].text
+            # Augment tools-only prompts with full TOOLCALL/TOOL_RESPONSE instructions
+            prompt_text = _get_fc_prompt(prompt_content, DEFAULT_FC_SYSTEM_PROMPT_TEMPLATE)
         # Check if MCQ cut with delay enabled - add MCQ system prompt
         elif mcq_agent_text_delay > 0 and _is_mcq_cut_train(c):
             prompt_text = MCQ_SYSTEM_PROMPT_DELAY
@@ -1321,16 +1503,20 @@ def collate_system_prompt(
             # No system prompt for this cut
             no_prompt = True
 
-        if no_prompt:
+        if no_prompt or prompt_text is None:
             tokens.append(torch.as_tensor([], dtype=torch.long))
+            prompt_texts.append("")
         else:
             tokens.append(torch.as_tensor(
                 [tokenizer.bos] + tokenizer.text_to_ids(prompt_text) + [tokenizer.eos],
                 dtype=torch.long
             ))
+            prompt_texts.append(prompt_text)
+
     token_lens = torch.tensor([len(tt) for tt in tokens])
     tokens = collate_vectors(tokens, padding_value=pad_id)
-    return tokens, token_lens
+
+    return tokens, token_lens, prompt_texts
 
 def build_token_channel(
         cut: Cut,
@@ -1352,6 +1538,9 @@ def build_token_channel(
         eos_offset_frames: int = 8,
         agent_eos_id: int = None,
         naturalness_augmenter=None,
+        skip_assistant_after_tool_response: bool = False,
+        agent_fc_bos_id: int = None,
+        agent_fc_eos_id: int = None,
 ) -> torch.Tensor:
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
@@ -1364,8 +1553,23 @@ def build_token_channel(
             assert cut_agent_token_channel_length.item() == total, "Mismatch between agent token and source token lengths"
         except:
             logging.error(f"Mismatch between agent token and source token lengths: {cut_agent_token_channel_length.item()} != {total}")
-    for supervision in cut.supervisions:
-        if supervision.speaker in roles:
+    
+    # Get list of all supervisions for checking if assistant comes after tool response
+    all_supervisions = list(cut.supervisions)
+    
+    for supervision_idx, supervision in enumerate(all_supervisions):
+        custom = getattr(supervision, 'custom', None)
+        function_content = (custom.get('function') or '').strip() if custom else ''
+        is_tool_call = function_content != '' and '<TOOLCALL>' in function_content
+        
+        # For FC data: skip assistant turns that come after tool responses
+        if skip_assistant_after_tool_response and _is_assistant_after_tool_response(
+            supervision, all_supervisions, supervision_idx, roles
+        ):
+            continue
+        
+        # Include assistant turns: regular text OR tool calls (but not tool responses)
+        if supervision.speaker in roles and (function_content == '' or is_tool_call):
 
             pos = compute_num_frames(supervision.start, frame_length, cut.sampling_rate)
             if pos >= len(tokens):  # Changed from > to >= for robustness
@@ -1377,27 +1581,41 @@ def build_token_channel(
             eospos = compute_num_frames(supervision.end, frame_length, cut.sampling_rate)
             available_frames_for_text = eospos - pos
 
-            text = supervision.text
-            if use_numbers_norm:
-                text = normalize_numbers(text)
-            if naturalness_augmenter is not None and getattr(cut, 'apply_naturalness_aug', False):
-                original_text = text
-                text = naturalness_augmenter.augment(text)
-                if text != original_text:
-                    logging.info(f"Naturalness aug: '{original_text}' -> '{text}'")
+            # For tool calls, only place the special BOS token (no content); for regular turns, use text
+            if is_tool_call:
+                # Tool call: only place agent_fc_bos_id, do NOT include tool call content
+                # The tool call content is in fc_req_tokens, not target_tokens
+                current_bos_id = agent_fc_bos_id if agent_fc_bos_id is not None else bos_id
+                # Only the BOS token, no actual content
+                text_ids = torch.as_tensor([current_bos_id], dtype=torch.long)
+                # For tool calls, endpos is right after BOS (no content to predict)
+                endpos = pos + 1
+            else:
+                # Regular agent turn: use text field
+                text = supervision.text
+                if use_numbers_norm:
+                    text = normalize_numbers(text)
+                if naturalness_augmenter is not None and getattr(cut, 'apply_naturalness_aug', False):
+                    original_text = text
+                    text = naturalness_augmenter.augment(text)
+                    if text != original_text:
+                        logging.info(f"Naturalness aug: '{original_text}' -> '{text}'")
+                # Use regular agent_bos_id for regular turns
+                current_bos_id = bos_id
+                # Tokenize the text content
+                text_ids = torch.as_tensor([current_bos_id] + _text_to_ids(text, tokenizer, pad_id, available_frames_for_text=available_frames_for_text, word_align_position=word_align_position, remove_timestamps=remove_timestamps))
 
-            # Use different bos_id for user and agent
-            text_ids = torch.as_tensor([bos_id] + _text_to_ids(text, tokenizer, pad_id, available_frames_for_text=available_frames_for_text, word_align_position=word_align_position, remove_timestamps=remove_timestamps))
+                if available_frames_for_text > 0 and len(text_ids) > available_frames_for_text:
+                    # Truncate text_ids to fit before the eos position.
+                    text_ids = text_ids[:available_frames_for_text]
+                elif available_frames_for_text <= 0:
+                    # If there's no space for text (e.g., start >= end), use an empty sequence.
+                    text_ids = torch.tensor([], dtype=torch.long)
 
-            if available_frames_for_text > 0 and len(text_ids) > available_frames_for_text:
-                # Truncate text_ids to fit before the eos position.
-                text_ids = text_ids[:available_frames_for_text]
-            elif available_frames_for_text <= 0:
-                # If there's no space for text (e.g., start >= end), use an empty sequence.
-                text_ids = torch.tensor([], dtype=torch.long)
-
-            endpos = pos + len(text_ids)
-            if endpos > len(tokens):
+                endpos = pos + len(text_ids)
+            
+            # Truncation check (only applies to regular turns, tool calls are already just 1 token)
+            if not is_tool_call and endpos > len(tokens):
                 trunc_len = len(tokens) - pos
                 logging.warning(
                     f"Truncating training example's text_ids of length {len(text_ids)} by {trunc_len} because {endpos=} > {len(tokens)=}. {diagnostic}"
@@ -1420,7 +1638,12 @@ def build_token_channel(
                     else:
                         logging.warning(f"Agent EOS position {agent_eospos} is out of bounds for agent token channel {cut_agent_token_channel.shape}")
                 # Place EOS token - critical for turn-taking behavior
-                if eospos < len(tokens) and eos_id is not None:
+                if is_tool_call:
+                    # For tool calls: place FC EOS right after BOS (since there's no content to predict)
+                    fc_eos = agent_fc_eos_id if agent_fc_eos_id is not None else eos_id
+                    if endpos < len(tokens) and fc_eos is not None:
+                        tokens[endpos] = fc_eos
+                elif eospos < len(tokens) and eos_id is not None:
                     # Normal case: place EOS at the intended position
                     tokens[eospos] = eos_id
                 elif add_eos_for_interruption:

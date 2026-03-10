@@ -50,7 +50,7 @@ from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.metrics.bleu import BLEU
 from nemo.collections.speechlm2.parts.metrics.text_wer import TextWER
 from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
-from nemo.collections.speechlm2.parts.metrics.token_accuracy import TurnTakingMetrics
+from nemo.collections.speechlm2.parts.metrics.token_accuracy import TurnTakingMetrics, FCAccMetrics
 from nemo.collections.speechlm2.parts.metrics.empty_text import EmptyTextMetric
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
 from nemo.collections.speechlm2.parts.pretrained import (
@@ -181,9 +181,26 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             self.user_bos_id = self.tokenizer.text_to_ids('^')[0]
             self.user_eos_id = self.tokenizer.text_to_ids('$')[0]
 
+        # Resolve FC token IDs (mirrors dataset logic in s2s_dataset.py)
+        if 'Nemotron' in self.cfg.pretrained_llm:
+            default_fc_bos_token, default_fc_eos_token = '<SPECIAL_13>', '<SPECIAL_14>'
+        elif 'Qwen2.5' in self.cfg.pretrained_llm:
+            default_fc_bos_token, default_fc_eos_token = '<tool_call>', '</tool_call>'
+        else:
+            default_fc_bos_token, default_fc_eos_token = None, None
+
+        fc_bos_token = self.cfg.get("agent_fc_bos_token", default_fc_bos_token)
+        fc_eos_token = self.cfg.get("agent_fc_eos_token", default_fc_eos_token)
+        self.agent_fc_bos_id = self.tokenizer.text_to_ids(fc_bos_token)[0] if fc_bos_token else self.text_bos_id
+        self.agent_fc_eos_id = self.tokenizer.text_to_ids(fc_eos_token)[0] if fc_eos_token else self.text_eos_id
+        logging.info(
+            f"[FC tokens] agent_fc_bos_id={self.agent_fc_bos_id} ('{fc_bos_token}'), "
+            f"agent_fc_eos_id={self.agent_fc_eos_id} ('{fc_eos_token}')"
+        )
+
         if self.predict_user_text:
             self.asr_head = copy.deepcopy(self.lm_head)
-            
+
             if self.tie_and_roll_embed:
                 # Tie ASR embedding to LLM embedding (will apply roll during forward)
                 self.embed_asr_tokens = self.embed_tokens
@@ -699,36 +716,60 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             eos_weight = token_weights.get("eos", 1.0)
             text_weight = token_weights.get("text", 1.0)
             sil_weight = token_weights.get("sil", 1.0)
+            fc_bos_weight = token_weights.get("fc_bos", None)
+            fc_eos_weight = token_weights.get("fc_eos", None)
 
+            # Build the innermost fallback (text_weight), then wrap with FC checks if configured
             if sil_id is not None:
-                loss_scale = torch.where(
-                    text_labels.unsqueeze(-1) == self.text_pad_id, pad_weight,
-                    torch.where(
-                        text_labels.unsqueeze(-1) == self.text_bos_id, bos_weight,
-                        torch.where(
-                            text_labels.unsqueeze(-1) == self.text_eos_id, eos_weight,
-                            torch.where(
-                                text_labels.unsqueeze(-1) == sil_id, sil_weight,
-                                text_weight
-                            )
-                        )
-                    )
+                base_weight = torch.where(
+                    text_labels.unsqueeze(-1) == sil_id, sil_weight, text_weight
                 )
             else:
-                loss_scale = torch.where(
-                    text_labels.unsqueeze(-1) == self.text_pad_id, pad_weight,
+                base_weight = torch.full_like(text_labels.unsqueeze(-1), text_weight, dtype=torch.float)
+
+            # Layer FC BOS/EOS weights on top of base
+            if fc_bos_weight is not None:
+                base_weight = torch.where(
+                    text_labels.unsqueeze(-1) == self.agent_fc_bos_id, fc_bos_weight, base_weight
+                )
+            if fc_eos_weight is not None:
+                base_weight = torch.where(
+                    text_labels.unsqueeze(-1) == self.agent_fc_eos_id, fc_eos_weight, base_weight
+                )
+
+            # Standard BOS/EOS/PAD layers (outermost = highest priority)
+            loss_scale = torch.where(
+                text_labels.unsqueeze(-1) == self.text_pad_id, pad_weight,
+                torch.where(
+                    text_labels.unsqueeze(-1) == self.text_bos_id, bos_weight,
                     torch.where(
-                        text_labels.unsqueeze(-1) == self.text_bos_id, bos_weight,
-                        torch.where(
-                            text_labels.unsqueeze(-1) == self.text_eos_id, eos_weight,
-                            text_weight
-                        )
+                        text_labels.unsqueeze(-1) == self.text_eos_id, eos_weight,
+                        base_weight
                     )
                 )
+            )
             loss_scale = self._maybe_zero_out_scale_for_asr(loss_scale, text_labels, batch)
             # Re-apply seq_mask to ensure positions beyond target_token_lens are zeroed
             # (token_loss_weight torch.where overwrites the original seq_mask zeroing)
             loss_scale = loss_scale * seq_mask.float()
+
+            # Debug: log FC token loss weights (once per 100 steps to avoid spam)
+            if fc_bos_weight is not None or fc_eos_weight is not None:
+                step = getattr(self, 'global_step', 0)
+                if step % 100 == 0:
+                    fc_bos_mask = (text_labels == self.agent_fc_bos_id)
+                    fc_eos_mask = (text_labels == self.agent_fc_eos_id)
+                    n_fc_bos = fc_bos_mask.sum().item()
+                    n_fc_eos = fc_eos_mask.sum().item()
+                    if n_fc_bos > 0 or n_fc_eos > 0:
+                        fc_bos_scales = loss_scale[fc_bos_mask.unsqueeze(-1).expand_as(loss_scale)].tolist() if n_fc_bos > 0 else []
+                        fc_eos_scales = loss_scale[fc_eos_mask.unsqueeze(-1).expand_as(loss_scale)].tolist() if n_fc_eos > 0 else []
+                        logging.info(
+                            f"[FC loss_scale] step={step}: "
+                            f"fc_bos(id={self.agent_fc_bos_id}): count={n_fc_bos}, weights={fc_bos_scales[:4]}, "
+                            f"fc_eos(id={self.agent_fc_eos_id}): count={n_fc_eos}, weights={fc_eos_scales[:4]}"
+                        )
+
             if compute_asr_for_batch:
                 asr_loss_scale = torch.where(
                     asr_labels.unsqueeze(-1) == self.text_pad_id, pad_weight,
@@ -943,6 +984,8 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             self.src_wer = TextWER().reset()
             self.empty_user_text = EmptyTextMetric().reset()
 
+        self.fc_acc = None  # Initialized lazily from first FC batch
+
     def on_validation_epoch_end(self, prefix="val") -> None:
         bleu = self.bleu.compute()
         for k, m in bleu.items():
@@ -974,8 +1017,137 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             for k, m in empty_user_text.items():
                 self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
 
+        if hasattr(self, 'fc_acc') and self.fc_acc is not None:
+            fc_metrics = self.fc_acc.compute()
+            for k, m in fc_metrics.items():
+                self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+            logging.info(f"[FC metrics] {', '.join(f'{prefix}_{k}={m.item():.4f}' for k, m in fc_metrics.items())}")
+
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def _force_write_post_fc_response(self, results, dataset_batch):
+        """Force-write ground truth post-FC response text into inference output.
+
+        1. Find agent_fc_eos positions in both GT (target_tokens) and predicted (tokens_text)
+        2. Match predicted to GT by nearest position within tolerance
+        3. For each matched pair: write [agent_bos, GT_text..., agent_eos]
+           at predicted_fc_eos_pos + post_fc_res_delay
+        """
+        tokens_text = results["tokens_text"]         # [B, T]
+        target_tokens = dataset_batch["target_tokens"]  # [B, T]
+        fc_post_res_tokens = dataset_batch["fc_post_res_tokens"]  # [B, num_turns, max_len]
+        fc_post_res_lens = dataset_batch["fc_post_res_lens"]      # [B, num_turns]
+        agent_fc_eos_id = dataset_batch["agent_fc_eos_id"]
+        agent_fc_bos_id = dataset_batch.get("agent_fc_bos_id", None)
+        post_fc_res_delay = dataset_batch["post_fc_res_delay"]
+        bos_id = self.text_bos_id
+        eos_id = self.text_eos_id
+        tolerance = 13  # frames tolerance for matching
+
+        B = tokens_text.shape[0]
+        T = tokens_text.shape[1]
+        T_gt = target_tokens.shape[1]
+
+        for i in range(B):
+            # Find GT and predicted fc_bos positions
+            gt_fc_bos_positions = []
+            pred_fc_bos_positions = []
+            if agent_fc_bos_id is not None:
+                gt_fc_bos_positions = (target_tokens[i, :T_gt] == agent_fc_bos_id).nonzero(as_tuple=True)[0].tolist()
+                pred_fc_bos_positions = (tokens_text[i, :T] == agent_fc_bos_id).nonzero(as_tuple=True)[0].tolist()
+
+            # Find GT and predicted fc_eos positions
+            gt_fc_eos_positions = (target_tokens[i, :T_gt] == agent_fc_eos_id).nonzero(as_tuple=True)[0].tolist()
+            pred_fc_eos_positions = (tokens_text[i, :T] == agent_fc_eos_id).nonzero(as_tuple=True)[0].tolist()
+
+            logging.info(
+                f"[FC force-write] sample {i}: "
+                f"gt_fc_bos_positions={gt_fc_bos_positions}, "
+                f"pred_fc_bos_positions={pred_fc_bos_positions}, "
+                f"gt_fc_eos_positions={gt_fc_eos_positions}, "
+                f"pred_fc_eos_positions={pred_fc_eos_positions}"
+            )
+
+            if not gt_fc_eos_positions or not pred_fc_eos_positions:
+                if not pred_fc_eos_positions and gt_fc_eos_positions:
+                    logging.info(f"[FC force-write] sample {i}: model missed all {len(gt_fc_eos_positions)} tool calls (no pred fc_eos)")
+                elif not gt_fc_eos_positions and pred_fc_eos_positions:
+                    logging.info(f"[FC force-write] sample {i}: no GT tool calls but model predicted {len(pred_fc_eos_positions)} fc_eos")
+                continue
+
+            # Match predicted -> GT (greedy nearest within tolerance)
+            used_gt = set()
+            for pred_pos in pred_fc_eos_positions:
+                best_gt_idx = None
+                best_dist = tolerance + 1
+                for gt_idx, gt_pos in enumerate(gt_fc_eos_positions):
+                    if gt_idx not in used_gt:
+                        dist = abs(pred_pos - gt_pos)
+                        if dist <= tolerance and dist < best_dist:
+                            best_gt_idx = gt_idx
+                            best_dist = dist
+                if best_gt_idx is None:
+                    logging.info(
+                        f"[FC force-write] sample {i}: pred fc_eos at {pred_pos} has no GT match "
+                        f"within tolerance={tolerance} (false positive)"
+                    )
+                    continue  # No matching GT for this prediction
+                used_gt.add(best_gt_idx)
+
+                logging.info(
+                    f"[FC force-write] sample {i}: matched pred_pos={pred_pos} -> "
+                    f"gt_pos={gt_fc_eos_positions[best_gt_idx]} (gt_idx={best_gt_idx}, dist={best_dist})"
+                )
+
+                # Get GT response text for the matched GT turn
+                if best_gt_idx >= fc_post_res_tokens.shape[1]:
+                    logging.info(f"[FC force-write] sample {i}: gt_idx={best_gt_idx} out of range for fc_post_res_tokens (shape={fc_post_res_tokens.shape})")
+                    continue
+                length = fc_post_res_lens[i, best_gt_idx].item()
+                if length == 0:
+                    logging.info(f"[FC force-write] sample {i}: gt_idx={best_gt_idx} has empty post-FC response, skipping")
+                    continue
+
+                # Write at predicted_fc_eos_pos + delay
+                insert_pos = pred_pos + post_fc_res_delay
+                if insert_pos >= T:
+                    logging.info(f"[FC force-write] sample {i}: insert_pos={insert_pos} >= T={T}, skipping")
+                    continue
+                turn_toks = fc_post_res_tokens[i, best_gt_idx, :length]
+                full_turn = torch.cat([
+                    torch.tensor([bos_id], device=tokens_text.device),
+                    turn_toks.to(tokens_text.device),
+                    torch.tensor([eos_id], device=tokens_text.device),
+                ])
+                available = T - insert_pos
+                write_len = min(len(full_turn), available)
+                tokens_text[i, insert_pos:insert_pos + write_len] = full_turn[:write_len]
+
+                # Decode the written text for logging
+                written_text = self.tokenizer.ids_to_text(turn_toks.tolist())
+                logging.info(
+                    f"[FC force-write] sample {i}: WROTE {write_len} tokens at pos {insert_pos} "
+                    f"(pred_fc_eos={pred_pos} + delay={post_fc_res_delay}), "
+                    f"text='{written_text}'"
+                )
+
+            # Log unmatched GT positions (model missed these tool calls)
+            unmatched_gt = [idx for idx in range(len(gt_fc_eos_positions)) if idx not in used_gt]
+            if unmatched_gt:
+                logging.info(
+                    f"[FC force-write] sample {i}: {len(unmatched_gt)} unmatched GT tool calls "
+                    f"(missed by model): gt_fc_eos_positions={[gt_fc_eos_positions[idx] for idx in unmatched_gt]}"
+                )
+
+        # Re-decode text
+        results["text"] = tokens_to_str(
+            tokens_text, results["tokens_len"],
+            tokenizer=self.tokenizer, pad_id=self.text_pad_id,
+            user_bos_id=self.user_bos_id,
+            eval_text_turn_taking=self.cfg.get("eval_text_turn_taking", True),
+            sil_id=getattr(self, '_sil_id', None),
+        )
 
     def validation_step(self, batch: dict, batch_idx: int):
         for name, dataset_batch in batch.items():
@@ -983,6 +1155,14 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 continue
 
             dataset_batch = dataset_batch["audio_data"]
+
+            # Debug: log whether FC metadata is present in this validation batch
+            has_fc_keys = "agent_fc_eos_id" in dataset_batch and "agent_fc_bos_id" in dataset_batch
+            logging.info(
+                f"[val_step] dataset={name}, batch_idx={batch_idx}, "
+                f"has_fc_keys={has_fc_keys}, "
+                f"keys={[k for k in dataset_batch.keys() if 'fc' in k.lower()]}"
+            )
 
             prompt_tokens = dataset_batch.get("prompt_tokens", None)
             prompt_token_lens = dataset_batch.get("prompt_token_lens", None)
@@ -1006,6 +1186,23 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     prompt_token_lens=prompt_token_lens,
                     sample_id=dataset_batch.get("sample_id", None),
                 )
+
+            # FC accuracy metrics BEFORE force-write (measures raw model predictions)
+            if "agent_fc_eos_id" in dataset_batch and "agent_fc_bos_id" in dataset_batch and results["tokens_text"] is not None:
+                if self.fc_acc is None:
+                    self.fc_acc = FCAccMetrics(
+                        fc_bos_id=dataset_batch["agent_fc_bos_id"],
+                        fc_eos_id=dataset_batch["agent_fc_eos_id"],
+                    ).reset()
+                self.fc_acc.update(
+                    name=name,
+                    target_tokens=dataset_batch["target_tokens"],
+                    pred_tokens=results["tokens_text"],
+                )
+
+            # Force-write post-FC response text into inference output for BLEU (modifies tokens_text)
+            if dataset_batch.get("include_post_fc_res", False) and dataset_batch.get("fc_post_res_tokens") is not None:
+                self._force_write_post_fc_response(results, dataset_batch)
 
             self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
 

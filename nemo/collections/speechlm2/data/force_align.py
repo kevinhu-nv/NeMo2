@@ -118,6 +118,10 @@ class ForceAligner:
         for cut in cuts:
             user_sups_in_cut = []
             for supervision in cut.supervisions:
+                # Skip FC supervisions (e.g. TOOL_RESPONSE) — they have no audio to align
+                custom = getattr(supervision, 'custom', None) or {}
+                if (custom.get('function') or '').strip():
+                    continue
                 if supervision.speaker.lower() == "user":
                     user_supervisions.append(supervision)
                     user_cuts.append(cut)
