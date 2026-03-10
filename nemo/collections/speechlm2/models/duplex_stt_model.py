@@ -1914,11 +1914,9 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
         if self.predict_user_text:
             gen_text_src = gen_asr
-            src_text_cleaned = tokens_to_str(gen_text_src, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, user_bos_id=self.user_bos_id, eval_text_turn_taking=self.cfg.get("eval_text_turn_taking", True), sil_id=inference_state["sil_id"], agent_fc_bos_id=self.agent_fc_bos_id, agent_fc_eos_id=self.agent_fc_eos_id)
         else:
             gen_text_src = None
-            src_text_cleaned = None
-        
+
         if prompt_token_lens is not None:
             max_prompt_len = prompt_token_lens.max().item()
             if max_prompt_len > 0:
@@ -1936,12 +1934,18 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                         if self.predict_user_text:
                             gen_asr_trimmed[i, :actual_len] = gen_asr[i, prompt_len_val:prompt_len_val + actual_len]
                     lengths_trimmed[i] = actual_len
-                
+
                 gen_text = gen_text_trimmed
                 if self.predict_user_text:
                     gen_asr = gen_asr_trimmed
                     gen_text_src = gen_asr
                 lengths = lengths_trimmed
+
+        # Compute src_text AFTER prompt trimming so timestamps are correct
+        if gen_text_src is not None:
+            src_text_cleaned = tokens_to_str(gen_text_src, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, user_bos_id=self.user_bos_id, eval_text_turn_taking=self.cfg.get("eval_text_turn_taking", True), sil_id=inference_state["sil_id"], agent_fc_bos_id=self.agent_fc_bos_id, agent_fc_eos_id=self.agent_fc_eos_id)
+        else:
+            src_text_cleaned = None
 
         ans = {
             "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, user_bos_id=self.user_bos_id, eval_text_turn_taking=self.cfg.get("eval_text_turn_taking", True), sil_id=inference_state["sil_id"], agent_fc_bos_id=self.agent_fc_bos_id, agent_fc_eos_id=self.agent_fc_eos_id),
