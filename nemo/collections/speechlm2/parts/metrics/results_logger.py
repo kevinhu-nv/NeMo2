@@ -74,10 +74,12 @@ class ResultsLogger:
             )
 
     def reset(self):
-        metadata_files = os.listdir(self.metadata_save_path)
-        # for f in metadata_files:
-        #     open(os.path.join(self.metadata_save_path, f), 'w').close()
         self.cached_results = defaultdict(list)
+        # Truncate per-rank JSONL files so incremental writes start fresh
+        rank = get_rank()
+        for f in os.listdir(self.metadata_save_path):
+            if f.endswith(f"_rank{rank}.json"):
+                open(os.path.join(self.metadata_save_path, f), 'w').close()
         return self
 
     @staticmethod
@@ -202,7 +204,10 @@ class ResultsLogger:
             
             self.cached_results[name].append(out_dict)
 
-
+            # Write incrementally to per-rank JSONL file
+            rank_json_path = os.path.join(self.metadata_save_path, f"{name}_rank{rank}.json")
+            with open(rank_json_path, 'a', encoding='utf-8') as fout:
+                fout.write(json.dumps(out_dict, ensure_ascii=False) + '\n')
 
     def _merge_rank_files(self, dataset_name: str) -> List[dict]:
         """
@@ -272,13 +277,11 @@ class ResultsLogger:
         world_size = get_world_size()
         metrics_results = {}
 
-        # Step 1: Each rank saves its own results with rank suffix
-        for name, results_list in self.cached_results.items():
+        # Step 1: Per-rank files are already written incrementally in update().
+        # Just log for visibility.
+        for name in self.cached_results.keys():
             rank_json_path = os.path.join(self.metadata_save_path, f"{name}_rank{rank}.json")
-            with open(rank_json_path, 'w', encoding='utf-8') as fout:
-                for item in results_list:
-                    fout.write(json.dumps(item, ensure_ascii=False) + '\n')
-            logging.info(f"Rank {rank} metadata file for {name} dataset saved at: {rank_json_path}")
+            logging.info(f"Rank {rank} metadata file for {name} dataset at: {rank_json_path} ({len(self.cached_results[name])} items)")
 
         # Step 2: Synchronize all ranks before merging
         if torch.distributed.is_available() and torch.distributed.is_initialized():
