@@ -154,6 +154,7 @@ class ResultsLogger:
             src_refs: list[str],
             src_hyps: list[str],
             system_prompt=None,
+            tool_call=None,
             source_turns: Optional[List[List[dict]]] = None,
             target_turns: Optional[List[List[dict]]] = None,
             pred_turns: Optional[List[List[dict]]] = None,
@@ -176,13 +177,17 @@ class ResultsLogger:
                 "pred_src_text": src_hyps[i] if src_hyps is not None and src_hyps[i] is not None else "",
             }
 
+            if system_prompt is not None:
+                out_dict["system_prompt"] = system_prompt[i]
+
+            if tool_call is not None:
+                out_dict["tool_call"] = tool_call[i]
+
             # Add conversation turns only if there are multiple user turns (multi-turn conversation)
             user_turns = source_turns[i] if source_turns is not None else None
             has_multi_turn_conversation = user_turns is not None and len(user_turns) > 1
-            
+
             if has_multi_turn_conversation and (target_turns is not None or pred_turns is not None):
-                if system_prompt is not None:
-                    out_dict["system_prompt"] = system_prompt[i]
                 
                 conversation_turns = {}
                 

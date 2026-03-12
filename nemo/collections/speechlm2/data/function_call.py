@@ -696,6 +696,7 @@ def extract_fc_batch_data(
         "fc_req_lens": fc_req_lens,
         "fc_req_times": fc_req_times,
         "fc_req_steps": fc_req_steps,
+        "fc_req_raw_text": function_call_raw_text,  # List[List[str]], raw TOOLCALL text per cut per turn
         "fc_res_tokens": fc_res_tokens,
         "fc_res_lens": fc_res_lens,
         "fc_res_times": fc_res_times,

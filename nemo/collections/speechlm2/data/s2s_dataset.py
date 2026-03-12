@@ -984,7 +984,9 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 audio_data['prompt_tokens'] = prompt_tokens
                 audio_data['prompt_token_lens'] = prompt_token_lens
             # Raw prompt string used to build prompt_tokens (typically supervision[0] for FC cuts).
+            # Also stored as "system_prompt" so that it always appears in inference JSON output.
             audio_data["system_prompt_supervision_0"] = prompt_texts
+            audio_data["system_prompt"] = prompt_texts
 
             # Optionally include detailed turn metadata for analysis
             if self.include_turn_metadata:
@@ -1012,9 +1014,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                     ]
                     for cut in all_cuts_combined
                 ]
-                audio_data["system_prompt"] = [
-                    cut.custom.get('system_prompt', '') for cut in all_cuts_combined
-                ]
+                # system_prompt is already set unconditionally above from prompt_texts
 
             # ===== Function Calling Metadata Extraction =====
             if is_function_calling_batch:

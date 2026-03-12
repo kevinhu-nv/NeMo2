@@ -1243,6 +1243,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 src_refs=dataset_batch["source_texts"],
                 src_hyps=results["src_text"],
                 system_prompt=dataset_batch.get("system_prompt", None),
+                tool_call=dataset_batch.get("fc_req_raw_text", None),
                 source_turns=dataset_batch.get("source_turn_texts"),
                 target_turns=dataset_batch.get("target_turn_texts"),
                 pred_turns=pred_turns_list,
