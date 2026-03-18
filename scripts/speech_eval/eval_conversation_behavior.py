@@ -7,10 +7,13 @@ import tarfile
 import gzip
 import json, os, re
 import argparse
+import traceback
+import tempfile
 from nemo.collections import asr as nemo_asr
 from openai import OpenAI
 from jiwer import wer
 from whisper_normalizer.english import EnglishTextNormalizer
+from lhotse import CutSet
 
 INF_LATENCY = 9999.0
 
@@ -1036,7 +1039,33 @@ def get_filtered_wav_keys(pred_audio_dir, validation_set_name):
         elif name_wo_prefix.startswith("-"):
             name_wo_prefix = name_wo_prefix[1:]
         filtered_wav_keys.add(name_wo_prefix)
-    return filtered_wav_keys    
+    return filtered_wav_keys
+
+
+def get_filtered_keys_from_shar(shar_input_dir, validation_set_name=None):
+    """
+    Returns a set of keys (cut IDs) from shar cuts files.
+    The validation_set_name parameter is kept for API compatibility but not used for filtering,
+    as shar cut IDs don't have validation set prefixes.
+    """
+    cuts_files = sorted([f for f in os.listdir(shar_input_dir) if f.startswith("cuts.") and f.endswith(".jsonl.gz")])
+    filtered_keys = set()
+    
+    for cuts_file in cuts_files:
+        cuts_path = os.path.join(shar_input_dir, cuts_file)
+        try:
+            # Load the CutSet from shar
+            cutset = CutSet.from_jsonl_lazy(cuts_path)
+            
+            for cut in cutset:
+                # Add the cut ID directly without filtering by validation_set_name
+                # since shar cut IDs don't have validation set prefixes
+                filtered_keys.add(cut.id)
+        except Exception as e:
+            print(f"Error reading cuts from {cuts_file}: {e}")
+            continue
+    
+    return filtered_keys    
 
 
 def mark(prompt, client, model="gpt-4o-mini"):
@@ -1494,16 +1523,73 @@ def main(args):
         all_metrics_dicts = []
 
         # Eval a specific validation set
-        filtered_wav_keys = get_filtered_wav_keys(pred_audio_dir, val_set_name)
+        # Get keys from shar input if provided, otherwise from pred_audio_dir
+        if args.shar_input_dir is not None:
+            filtered_wav_keys = get_filtered_keys_from_shar(args.shar_input_dir, val_set_name)
+            print(f"Found {len(filtered_wav_keys)} keys from shar input directory")
+        else:
+            filtered_wav_keys = get_filtered_wav_keys(pred_audio_dir, val_set_name)
+            print(f"Found {len(filtered_wav_keys)} keys from pred_audio_dir")
 
         for filtered_wav_key in filtered_wav_keys:
-            pred_audio_file = get_pred_audio_path(pred_audio_dir, filtered_wav_key, val_set_name)
-            if pred_audio_file is None or not os.path.exists(pred_audio_file):
-                print(f"File not found: {pred_audio_file}")
-                continue
 
             # Read user and agent audios
-            if getattr(args, "is_stereo", False):
+            if args.shar_input_dir is not None:
+                # Load user audio from lhotse shar format
+                print(f"Loading user audio from shar: {args.shar_input_dir}")
+                
+                user_audio = None
+                user_audio_sr = None
+                
+                try:
+                    # Load the entire CutSet from shar directory (this handles both cuts and tar files)
+                    cutset = CutSet.from_shar(
+                        in_dir=args.shar_input_dir,
+                        shuffle_shards=False
+                    )
+                    
+                    # Find the cut with matching ID
+                    # The filtered_wav_key might have suffixes like _rank0, so we need to match the base ID
+                    filtered_wav_key_id = filtered_wav_key.split('_rank')[0] if '_rank' in filtered_wav_key else filtered_wav_key
+                    
+                    matching_cut = None
+                    for cut in cutset:
+                        if cut.id == filtered_wav_key_id or filtered_wav_key_id in cut.id:
+                            matching_cut = cut
+                            break
+                    
+                    if matching_cut is not None:
+                        print(f"Found matching cut with ID: {matching_cut.id}")
+                        # Load audio from the cut
+                        audio_array = matching_cut.load_audio()
+                        user_audio = torch.from_numpy(audio_array).float()
+                        if user_audio.dim() == 1:
+                            user_audio = user_audio.unsqueeze(0)  # Add channel dimension
+                        user_audio_sr = matching_cut.sampling_rate
+                except Exception as e:
+                    print(f"Error loading from shar: {e}")
+                    print(f"Traceback: {traceback.format_exc()}")
+                
+                if user_audio is None:
+                    print(f"Could not find user audio for ID: {filtered_wav_key} in shar")
+                    continue
+                
+                # Write user_audio out to temp dir for VAD processing
+                debug_user_audio_dir = os.path.join(tempfile.gettempdir(), "shar_user_recordings")
+                os.makedirs(debug_user_audio_dir, exist_ok=True)
+                debug_user_audio_path = os.path.join(debug_user_audio_dir, f"{filtered_wav_key}.user.wav")
+                # Resample to 16kHz if needed before saving
+                if user_audio_sr != 16000:
+                    user_audio_to_save = torchaudio.functional.resample(user_audio, user_audio_sr, 16000)
+                    torchaudio.save(debug_user_audio_path, user_audio_to_save, 16000)
+                else:
+                    torchaudio.save(debug_user_audio_path, user_audio, 16000)
+                
+            elif getattr(args, "is_stereo", False):
+                pred_audio_file = get_pred_audio_path(pred_audio_dir, filtered_wav_key, val_set_name)
+                if pred_audio_file is None or not os.path.exists(pred_audio_file):
+                    print(f"File not found: {pred_audio_file}")
+                    continue
                 # Load stereo audio: first channel is user, second is agent
                 audio, audio_sr = torchaudio.load(pred_audio_file)
                 if audio.shape[0] < 2:
@@ -1526,7 +1612,7 @@ def main(args):
                         with gzip.open(cuts_path, 'rt', encoding='utf-8') as f:
                             # load from pred_audio_path
                             pred_audio_file = get_pred_audio_path(pred_audio_dir, filtered_wav_key, val_set_name)
-                            if not os.path.exists(pred_audio_file):
+                            if pred_audio_file is None or not os.path.exists(pred_audio_file):
                                 print(f"File not found: {pred_audio_file}")
                                 continue
 
@@ -1553,7 +1639,8 @@ def main(args):
             # Run VAD to get the speech segments
             # Here min_silence_duration_ms is a important metric to control the tolerance of silence duration "---" in xxxxx---xxxxx, where xxxxx is the speech segment
             user_audio = torchaudio.functional.resample(user_audio, user_audio_sr, 16000)
-            agent_audio = torchaudio.functional.resample(agent_audio, agent_audio_sr, 16000)
+            if args.shar_input_dir is None:
+                agent_audio = torchaudio.functional.resample(agent_audio, agent_audio_sr, 16000)
             
             # Use timestamped predictions for agent segments if available, otherwise use VAD or binary audio
             # Find the full key that contains filtered_wav_key as a substring
@@ -1614,9 +1701,10 @@ def main(args):
                 agent_segments = extract_segments_from_binary_audio(agent_audio, sample_rate=16000)
                 print(f"Extracted {len(agent_segments)} agent segments from binary audio")
             else:
+                continue
                 # Fallback to VAD-based segmentation
-                agent_vad_results = get_speech_timestamps(agent_audio.to('cuda'), vad_model, sampling_rate=16000, min_silence_duration_ms=args.vad_min_silence_duration_ms)
-                agent_segments = [{'start': s['start'] / 16000, 'end': s['end'] / 16000} for s in agent_vad_results]
+                # agent_vad_results = get_speech_timestamps(agent_audio.to('cuda'), vad_model, sampling_rate=16000, min_silence_duration_ms=args.vad_min_silence_duration_ms)
+                # agent_segments = [{'start': s['start'] / 16000, 'end': s['end'] / 16000} for s in agent_vad_results]
 
             #################
             # Compute eval Metrics 
@@ -1893,6 +1981,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pred_audio_dir", type=str, default="/lustre/fsw/portfolios/convai/users/cchen1/results/s2s_rl/uc_samples")
     parser.add_argument("--manifest_dir", type=str, default=None, nargs='?', help="Path to manifest directory. Optional.")
+    parser.add_argument("--shar_input_dir", type=str, default=None, help="Path to lhotse shar directory containing cuts.*.jsonl.gz and recording.*.tar files for user audio input. If provided, user audio will be loaded from this shar instead of stereo or manifest_dir.")
     parser.add_argument("--barge_in_threshold_sec", type=float, default=1.5, help="Buffering time for the agent to stop after user barges in.")
     parser.add_argument("--tt_latency_threshold_sec", type=float, default=0.64, help="Threshold in seconds for considering a turn-taking to be accurate.")
     parser.add_argument("--tt_precision_buffer_sec", type=float, default=0.5, help="Buffer time in seconds for precision calculation (agent segments).")
