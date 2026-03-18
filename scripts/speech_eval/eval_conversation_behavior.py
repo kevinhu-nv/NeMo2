@@ -1665,7 +1665,14 @@ def main(args):
                     print(f"Parsing predicted user segments from pred_src_text for {matching_key}")
                     predicted_user_segments = parse_user_timestamped_text(pred_src_text)
                     print(f"Parsed {len(predicted_user_segments)} predicted user segments")
-                    
+
+                    # Subtract streaming ASR delay from predicted timestamps to align with real-time VAD ground truth
+                    if args.streaming_asr_delay != 0.0:
+                        print(f"Subtracting streaming ASR delay of {args.streaming_asr_delay}s from predicted segment timestamps")
+                        for seg in predicted_user_segments:
+                            seg['start'] = seg['start'] - args.streaming_asr_delay
+                            seg['end'] = seg['end'] - args.streaming_asr_delay
+
                     # Store predicted user transcripts
                     for seg in predicted_user_segments:
                         seg_key = (seg['start'], seg['end'])
@@ -2023,6 +2030,7 @@ def parse_args():
     parser.add_argument("--estimate_sec_per_word", type=float, default=0.3, help="Estimated seconds per word for duration calculation when detecting cutoffs.")
     parser.add_argument("--compute_user_eou", action="store_true", default=False, help="Compute user EOU (End-of-Utterance) detection metrics by comparing predicted user segments from pred_src_text with ground truth VAD segments.")
     parser.add_argument("--user_eou_match_threshold_sec", type=float, default=2.0, help="Threshold in seconds for matching predicted and ground truth user segment start/end times when computing EOU metrics.")
+    parser.add_argument("--streaming_asr_delay", type=float, default=1.12, help="Streaming ASR delay in seconds to subtract from predicted segment timestamps before matching against ground truth VAD segments.")
     return parser.parse_args()
 
 if __name__ == "__main__":
