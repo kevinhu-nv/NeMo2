@@ -353,10 +353,15 @@ def _is_assistant_after_tool_response(supervision, all_supervisions, supervision
     for i in range(supervision_index - 1, -1, -1):
         prev_sup = all_supervisions[i]
         custom = getattr(prev_sup, "custom", None) or {}
-        text = (custom.get("function") or getattr(prev_sup, "text", None) or "").strip()
-        
+        # Only check the custom["function"] field for TOOL_RESPONSE tags.
+        # Do NOT fall back to sup.text — system prompts may contain example
+        # </TOOL_RESPONSE> tags that would cause false positives.
+        func_text = (custom.get("function") or "").strip()
+        if not func_text:
+            continue
+
         # Check if previous turn contains TOOL_RESPONSE closing tag
-        if any(tag in text for tag in _TOOLRESPONSE_CLOSING_TAGS):
+        if any(tag in func_text for tag in _TOOLRESPONSE_CLOSING_TAGS):
             # Found a TOOL_RESPONSE, check if there are any other assistant turns between it and current
             for j in range(i + 1, supervision_index):
                 intermediate_sup = all_supervisions[j]
@@ -963,6 +968,175 @@ def inject_fc_filler_responses(
             new_end = eos_pos + 1
             if new_end > target_token_lens[i].item():
                 target_token_lens[i] = min(new_end, seq_len)
+
+
+def inject_fc_post_response_prefill(
+    target_tokens: torch.Tensor,
+    target_token_lens: torch.Tensor,
+    fc_post_res_tokens: torch.Tensor,
+    fc_post_res_lens: torch.Tensor,
+    fc_eos_id: int,
+    agent_bos_id: int,
+    agent_eos_id: int,
+    pad_id: int,
+    post_fc_delay: int,
+    tokenizer,
+    prefill_start_id: int,
+    prefill_end_id: int,
+):
+    """Inject post-FC response prefill + repeat into target_tokens.
+
+    For each sample, finds all agent_fc_eos positions and, for the N-th fc_eos,
+    writes the following sequence starting at (fc_eos_pos + post_fc_delay):
+
+        <PREFILL_START>, text_tokens..., <PREFILL_END>, agent_bos, text_tokens..., agent_eos
+
+    The prefill portion tells the model what text to produce; the repeat portion
+    is the actual prediction target (with normal text loss).
+
+    Args:
+        target_tokens: [B, T] target token tensor (modified in-place).
+        target_token_lens: [B] lengths (modified in-place).
+        fc_post_res_tokens: [B, num_turns, max_len] tokenized post-FC response texts.
+        fc_post_res_lens: [B, num_turns] lengths of each response.
+        fc_eos_id: Token ID for agent_fc_eos.
+        agent_bos_id: Regular agent BOS token ID.
+        agent_eos_id: Regular agent EOS token ID.
+        pad_id: Pad token ID.
+        post_fc_delay: Number of frames to wait after fc_eos before inserting.
+        prefill_start_id: Token ID for <PREFILL_START>.
+        prefill_end_id: Token ID for <PREFILL_END>.
+    """
+    if fc_post_res_tokens is None or fc_post_res_lens is None:
+        return
+
+    seq_len = target_tokens.shape[1]
+    B = target_tokens.shape[0]
+
+    for i in range(B):
+        fc_eos_positions = (target_tokens[i] == fc_eos_id).nonzero(as_tuple=True)[0].tolist()
+        if not fc_eos_positions:
+            continue
+
+        num_turns = fc_post_res_lens.shape[1] if fc_post_res_lens.dim() > 1 else 0
+        # Track which turn to consume next. In multi-TOOLCALL scenarios,
+        # only the last TOOLCALL in a chain gets fc_eos in target_tokens,
+        # but fc_post_res_tokens has entries for all turns (earlier ones
+        # empty). So for each fc_eos, consume the next non-empty response.
+        next_turn = 0
+        for eos_pos in fc_eos_positions:
+            # Find the next non-empty post-FC response
+            length = 0
+            turn_idx = next_turn
+            while turn_idx < num_turns:
+                length = fc_post_res_lens[i, turn_idx].item()
+                if length > 0:
+                    break
+                logging.debug(
+                    f"[FC prefill] sample {i}, turn {turn_idx}: empty post-FC response, skipping to next"
+                )
+                turn_idx += 1
+            next_turn = turn_idx + 1
+
+            if length == 0:
+                logging.debug(
+                    f"[FC prefill] sample {i}: no non-empty post-FC response left for fc_eos at {eos_pos}"
+                )
+                continue
+
+            text_toks = fc_post_res_tokens[i, turn_idx, :length]
+
+            # Build: [PREFILL_START, text..., PREFILL_END, agent_bos, text..., agent_eos]
+            full_seq = torch.cat([
+                torch.tensor([prefill_start_id], dtype=torch.long),
+                text_toks,
+                torch.tensor([prefill_end_id, agent_bos_id], dtype=torch.long),
+                text_toks,
+                torch.tensor([agent_eos_id], dtype=torch.long),
+            ])
+
+            insert_pos = eos_pos + post_fc_delay
+            if insert_pos >= seq_len:
+                logging.warning(
+                    f"[FC prefill] sample {i}, turn {turn_idx}: "
+                    f"insert_pos={insert_pos} >= seq_len={seq_len}, skipping"
+                )
+                continue
+
+            available = seq_len - insert_pos
+            write_len = min(len(full_seq), available)
+            if write_len < len(full_seq):
+                logging.warning(
+                    f"[FC prefill] sample {i}, turn {turn_idx}: "
+                    f"truncating prefill+repeat from {len(full_seq)} to {write_len} tokens "
+                    f"(insert_pos={insert_pos}, seq_len={seq_len})"
+                )
+            target_tokens[i, insert_pos:insert_pos + write_len] = full_seq[:write_len]
+
+            new_end = insert_pos + write_len
+            if new_end > target_token_lens[i].item():
+                target_token_lens[i] = min(new_end, seq_len)
+
+            decoded_text = tokenizer.ids_to_text(text_toks.tolist()) if tokenizer is not None else "<no tokenizer>"
+            logging.info(
+                f"[FC prefill] sample {i}, turn {turn_idx}: wrote {write_len} tokens at pos {insert_pos} "
+                f"(fc_eos={eos_pos} + delay={post_fc_delay}), "
+                f"text_len={length}, total_seq_len={len(full_seq)}, "
+                f"prefill_text='{decoded_text}'"
+            )
+
+
+def _resolve_single_token(tokenizer, token_or_id, label: str) -> int:
+    """Resolve a token string or integer ID to a single token ID."""
+    if isinstance(token_or_id, int):
+        return token_or_id
+    token_ids = tokenizer.text_to_ids(token_or_id)
+    if len(token_ids) != 1:
+        raise ValueError(
+            f"{label} '{token_or_id}' must tokenize to exactly 1 token, "
+            f"but got {len(token_ids)} tokens: {token_ids}. "
+            f"You can set {label} to an integer token ID directly in the config."
+        )
+    return token_ids[0]
+
+
+def resolve_prefill_tokens(
+    cfg,
+    model_cfg,
+    tokenizer,
+) -> tuple:
+    """Resolve prefill_start_id and prefill_end_id from config.
+
+    Accepts either token strings (e.g. '<SPECIAL_15>') or integer token IDs
+    via config keys ``prefill_start_token`` / ``prefill_end_token``.
+
+    Returns (prefill_start_id, prefill_end_id).
+    """
+    if model_cfg is not None and 'Nemotron' in model_cfg.get('pretrained_llm', ''):
+        default_start = '<SPECIAL_15>'
+        default_end = '<SPECIAL_16>'
+    elif model_cfg is not None and 'Qwen2.5' in model_cfg.get('pretrained_llm', ''):
+        # Qwen2.5 extra tokens may not be registered as special tokens in all
+        # tokenizer builds.  Fall back to raw IDs (151659 / 151660) which sit
+        # right after <tool_call>/<\/tool_call> in the Qwen2.5 vocab.
+        default_start = 151659
+        default_end = 151660
+    else:
+        default_start = '<SPECIAL_15>'
+        default_end = '<SPECIAL_16>'
+
+    start = (cfg or {}).get("prefill_start_token", default_start)
+    end = (cfg or {}).get("prefill_end_token", default_end)
+
+    prefill_start_id = _resolve_single_token(tokenizer, start, "prefill_start_token")
+    prefill_end_id = _resolve_single_token(tokenizer, end, "prefill_end_token")
+
+    logging.info(
+        f"[FC prefill tokens] prefill_start_id={prefill_start_id} (from '{start}'), "
+        f"prefill_end_id={prefill_end_id} (from '{end}')"
+    )
+
+    return prefill_start_id, prefill_end_id
 
 
 def log_fc_target_tokens(

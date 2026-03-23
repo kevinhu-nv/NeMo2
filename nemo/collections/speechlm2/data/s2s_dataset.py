@@ -39,7 +39,9 @@ from nemo.collections.speechlm2.data.function_call import (
     add_minimal_batch_fc_data,
     get_fc_cut_total_prompt_tokens,
     resolve_fc_tokens,
+    resolve_prefill_tokens,
     inject_fc_filler_responses,
+    inject_fc_post_response_prefill,
     log_fc_target_tokens,
 )
 import inflect
@@ -327,6 +329,13 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.include_post_fc_res = (cfg or {}).get("include_post_fc_res", False)
         post_fc_res_delay = (cfg or {}).get("post_fc_res_delay", None)
         self.post_fc_res_delay = post_fc_res_delay if post_fc_res_delay is not None else round(1.0 / self.frame_length)
+
+        # FC post-response prefill: inject prefill + repeat of post-FC agent text during training
+        self.prefill_post_fc_response = (cfg or {}).get("prefill_post_fc_response", False)
+        if self.prefill_post_fc_response:
+            self.prefill_start_id, self.prefill_end_id = resolve_prefill_tokens(
+                cfg, self.model_cfg, self.tokenizer
+            )
 
         self.pad_id = get_pad_id(self.tokenizer)
 
@@ -688,6 +697,8 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         if is_function_calling_batch:
             logging.info(f"[FC detect] is_function_calling_batch=True, num_cuts={len(cuts)}, "
                          f"cut_ids={[c.id for c in cuts][:3]}")
+            from nemo.collections.speechlm2.models.debug import log_slyned_refusal_batch
+            log_slyned_refusal_batch(cuts)
         audio_data = None
         early_interruption_stats = None
         mcq_delay_stats = None
@@ -1029,6 +1040,45 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 audio_data["agent_fc_eos_id"] = self.agent_fc_eos_id
                 audio_data["agent_fc_bos_id"] = self.agent_fc_bos_id
                 audio_data["post_fc_res_delay"] = self.post_fc_res_delay
+                audio_data["prefill_post_fc_response"] = self.prefill_post_fc_response
+
+                # Inject post-FC response prefill + repeat into target_tokens during training
+                if self.prefill_post_fc_response and torch.is_grad_enabled():
+                    if not hasattr(self, '_prefill_log_count'):
+                        self._prefill_log_count = 0
+                    self._prefill_log_count += 1
+                    _should_log = (self._prefill_log_count % 100 == 1)
+
+                    if _should_log:
+                        from nemo.collections.speechlm2.data.debug import (
+                            log_target_tokens_before_prefill,
+                            log_target_tokens_after_prefill,
+                            log_build_token_channel_decisions,
+                        )
+                        for cut in all_cuts_combined:
+                            log_build_token_channel_decisions(cut, self.output_roles)
+                        log_target_tokens_before_prefill(
+                            target_tokens, target_token_lens, self.pad_id,
+                            self.tokenizer, self.agent_bos_id, self.agent_eos_id,
+                            self.agent_fc_bos_id, self.agent_fc_eos_id,
+                        )
+
+                    inject_fc_post_response_prefill(
+                        target_tokens, target_token_lens,
+                        fc_data.get("fc_post_res_tokens"), fc_data.get("fc_post_res_lens"),
+                        self.agent_fc_eos_id, self.agent_bos_id, self.agent_eos_id,
+                        self.pad_id, self.post_fc_res_delay,
+                        self.tokenizer,
+                        self.prefill_start_id, self.prefill_end_id,
+                    )
+
+                    if _should_log:
+                        log_target_tokens_after_prefill(
+                            target_tokens, target_token_lens, self.pad_id,
+                            self.tokenizer, self.agent_bos_id, self.agent_eos_id,
+                            self.agent_fc_bos_id, self.agent_fc_eos_id,
+                            self.prefill_start_id, self.prefill_end_id,
+                        )
 
         text_cuts = all_cuts.filter(lambda c: isinstance(c, Formattable))
         text_data = None

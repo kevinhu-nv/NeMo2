@@ -198,6 +198,15 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             f"agent_fc_eos_id={self.agent_fc_eos_id} ('{fc_eos_token}')"
         )
 
+        # Resolve prefill tokens for post-FC response prefill
+        # Import helper used by dataset side as well
+        from nemo.collections.speechlm2.data.function_call import resolve_prefill_tokens as _resolve_prefill
+        # Build a minimal model_cfg-like dict so the resolver picks the right defaults
+        _model_cfg = {"pretrained_llm": self.cfg.pretrained_llm}
+        self.prefill_start_id, self.prefill_end_id = _resolve_prefill(
+            self.cfg, _model_cfg, self.tokenizer
+        )
+
         if self.predict_user_text:
             self.asr_head = copy.deepcopy(self.lm_head)
 
@@ -770,6 +779,31 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                             f"fc_eos(id={self.agent_fc_eos_id}): count={n_fc_eos}, weights={fc_eos_scales[:4]}"
                         )
 
+            # Zero out loss for prefill region (PREFILL_START ... PREFILL_END inclusive)
+            if self.cfg.get("prefill_post_fc_response", False):
+                for i in range(text_labels.size(0)):
+                    pf_starts = (text_labels[i] == self.prefill_start_id).nonzero(as_tuple=True)[0].tolist()
+                    pf_ends = (text_labels[i] == self.prefill_end_id).nonzero(as_tuple=True)[0].tolist()
+                    for ps in pf_starts:
+                        pe = next((p for p in pf_ends if p > ps), None)
+                        if pe is not None:
+                            loss_scale[i, ps:pe + 1, :] = 0.0
+
+                step = getattr(self, 'global_step', 0)
+                if step % 100 == 0:
+                    from nemo.collections.speechlm2.models.debug import log_prefill_and_repeat_regions
+                    log_prefill_and_repeat_regions(
+                        text_labels=text_labels,
+                        loss_scale=loss_scale,
+                        tokenizer=self.tokenizer,
+                        prefill_start_id=self.prefill_start_id,
+                        prefill_end_id=self.prefill_end_id,
+                        text_bos_id=self.text_bos_id,
+                        text_eos_id=self.text_eos_id,
+                        text_pad_id=self.text_pad_id,
+                        text_weight=text_weight,
+                    )
+
             if compute_asr_for_batch:
                 asr_loss_scale = torch.where(
                     asr_labels.unsqueeze(-1) == self.text_pad_id, pad_weight,
@@ -1192,12 +1226,24 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     prompt_token_lens=prompt_token_lens,
                 )
             else:
+                # Build FC prefill data for inference if enabled
+                fc_prefill_data = None
+                if (self.cfg.get("prefill_post_fc_response", False)
+                        and dataset_batch.get("fc_post_res_tokens") is not None
+                        and dataset_batch.get("post_fc_res_delay") is not None):
+                    fc_prefill_data = {
+                        "fc_post_res_tokens": dataset_batch["fc_post_res_tokens"],
+                        "fc_post_res_lens": dataset_batch["fc_post_res_lens"],
+                        "post_fc_delay": dataset_batch["post_fc_res_delay"],
+                    }
+
                 results = self.offline_inference(
                     dataset_batch["source_audio"],
                     dataset_batch["source_audio_lens"],
                     prompt_tokens=prompt_tokens,
                     prompt_token_lens=prompt_token_lens,
                     sample_id=dataset_batch.get("sample_id", None),
+                    fc_prefill_data=fc_prefill_data,
                 )
 
             # FC accuracy metrics BEFORE force-write (measures raw model predictions)
@@ -1891,6 +1937,30 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 generated_tokens = ans["text_logits"][:, -1].argmax(dim=-1)
                 inference_state["gen_text"][:, t] = torch.where(is_prompt_position, inference_state["gen_text"][:, t], generated_tokens)
 
+        # Log when model predicts fc_bos or fc_eos, and force fc_eos if missing
+        gen_at_t = inference_state["gen_text"][:, t]
+        fc_eos_timeout = round(1.0 / 0.08)  # 1 sec = 13 frames
+        if "pending_fc_bos" not in inference_state:
+            inference_state["pending_fc_bos"] = {}  # batch_idx -> fc_bos step
+        for batch_idx in range(inference_state["B"]):
+            tok = gen_at_t[batch_idx].item()
+            if tok == self.agent_fc_bos_id:
+                logging.info(f"[FC infer] sample {batch_idx}: predicted fc_bos at step {t}")
+                inference_state["pending_fc_bos"][batch_idx] = t
+            elif tok == self.agent_fc_eos_id:
+                logging.info(f"[FC infer] sample {batch_idx}: predicted fc_eos at step {t}")
+                inference_state["pending_fc_bos"].pop(batch_idx, None)
+            elif batch_idx in inference_state["pending_fc_bos"]:
+                fc_bos_step = inference_state["pending_fc_bos"][batch_idx]
+                if t >= fc_bos_step + fc_eos_timeout:
+                    # Force fc_eos since model didn't produce one within timeout
+                    inference_state["gen_text"][batch_idx, t] = self.agent_fc_eos_id
+                    logging.info(
+                        f"[FC infer] sample {batch_idx}: forced fc_eos at step {t} "
+                        f"(fc_bos was at {fc_bos_step}, timeout={fc_eos_timeout} frames)"
+                    )
+                    inference_state["pending_fc_bos"].pop(batch_idx, None)
+
         if self.predict_user_text:
             if not is_prompt_position.all():
                 generated_asr = ans["asr_logits"][:, -1].argmax(dim=-1)
@@ -1961,6 +2031,97 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
         return ans
 
+    def _maybe_inject_fc_prefill(self, t, inference_state):
+        """Check if fc_eos was just generated and inject prefill tokens into gen_text.
+
+        When the model generates agent_fc_eos at step t, this writes the prefill
+        sequence into gen_text at future positions (t + post_fc_delay):
+
+            <PREFILL_START>, text_tokens..., <PREFILL_END>
+
+        Those positions are marked as prompt positions so the generation loop
+        feeds them back as-is instead of overwriting with model predictions.
+        Also zeros out audio_embeds and pads gen_asr at those positions since
+        no user speech occurs during this interval.
+        """
+        fc_prefill_data = inference_state.get("fc_prefill_data")
+        if fc_prefill_data is None:
+            return
+
+        fc_post_res_tokens = fc_prefill_data["fc_post_res_tokens"]
+        fc_post_res_lens = fc_prefill_data["fc_post_res_lens"]
+        post_fc_delay = fc_prefill_data["post_fc_delay"]
+        fc_eos_counts = fc_prefill_data["fc_eos_counts"]  # [B] tracks which fc_eos we're on per sample
+
+        B = inference_state["B"]
+        T = inference_state["T"]
+        gen_text = inference_state["gen_text"]
+
+        for batch_idx in range(B):
+            if gen_text[batch_idx, t] != self.agent_fc_eos_id:
+                continue
+
+            # Find the next non-empty post-FC response (skip empty turns
+            # from chained tool calls where only the last gets fc_eos)
+            next_turn = fc_eos_counts[batch_idx].item()
+            num_turns = fc_post_res_lens.shape[1] if fc_post_res_lens.dim() > 1 else 0
+            length = 0
+            turn_idx = next_turn
+            while turn_idx < num_turns:
+                length = fc_post_res_lens[batch_idx, turn_idx].item()
+                if length > 0:
+                    break
+                turn_idx += 1
+            fc_eos_counts[batch_idx] = turn_idx + 1
+
+            if length == 0 or turn_idx >= num_turns:
+                continue
+
+            text_toks = fc_post_res_tokens[batch_idx, turn_idx, :length].to(gen_text.device)
+
+            # Build: [PREFILL_START, text..., PREFILL_END]
+            prefill_seq = torch.cat([
+                torch.tensor([self.prefill_start_id], device=gen_text.device, dtype=torch.long),
+                text_toks,
+                torch.tensor([self.prefill_end_id], device=gen_text.device, dtype=torch.long),
+            ])
+
+            insert_pos = t + post_fc_delay
+            if insert_pos >= T:
+                logging.warning(
+                    f"[FC prefill infer] sample {batch_idx}, turn {turn_idx}: "
+                    f"insert_pos={insert_pos} >= T={T}, skipping"
+                )
+                continue
+
+            available = T - insert_pos
+            write_len = min(len(prefill_seq), available)
+            gen_text[batch_idx, insert_pos:insert_pos + write_len] = prefill_seq[:write_len]
+
+            # Mark these positions as prompt so they are not overwritten by generation
+            inference_state["is_prompt_position_mask"][batch_idx, insert_pos:insert_pos + write_len] = True
+
+            # Zero out audio embeddings at prefill positions (no user speech)
+            end_pos = insert_pos + write_len
+            if "audio_embeds" in inference_state:
+                ae_end = min(end_pos, inference_state["audio_embeds"].shape[1])
+                ae_start = min(insert_pos, ae_end)
+                if ae_start < ae_end:
+                    inference_state["audio_embeds"][batch_idx, ae_start:ae_end] = 0.0
+
+            # Pad ASR tokens at prefill positions (no user text)
+            if inference_state.get("gen_asr") is not None:
+                asr_end = min(end_pos, inference_state["gen_asr"].shape[1])
+                asr_start = min(insert_pos, asr_end)
+                if asr_start < asr_end:
+                    inference_state["gen_asr"][batch_idx, asr_start:asr_end] = self.text_pad_id
+
+            logging.info(
+                f"[FC prefill infer] sample {batch_idx}, turn {turn_idx}: "
+                f"injected {write_len} prefill tokens at pos {insert_pos} "
+                f"(fc_eos={t} + delay={post_fc_delay}), text_len={length}"
+            )
+
     @torch.no_grad()
     def offline_inference(
             self,
@@ -1972,6 +2133,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             prompt_tokens: torch.Tensor = None,
             prompt_token_lens: torch.Tensor = None,
             sample_id=None,
+            fc_prefill_data: dict = None,
     ) -> dict[str, torch.Tensor]:
         """
         Autoregressive prediction (text only).
@@ -1981,10 +2143,19 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             force_bos_positions, prompt_tokens, prompt_token_lens, sample_id
         )
 
+        # Attach FC prefill data to inference_state if provided
+        if fc_prefill_data is not None:
+            fc_prefill_data["fc_eos_counts"] = torch.zeros(
+                inference_state["B"], dtype=torch.long, device=self.device
+            )
+            inference_state["fc_prefill_data"] = fc_prefill_data
+
         ans, inference_state = self._step_zero(inference_state)
 
         for t in range(1, inference_state["T"]):
             ans = self._step_inference(t, inference_state, ans, force_bos_positions)
+            if fc_prefill_data is not None:
+                self._maybe_inject_fc_prefill(t, inference_state)
 
         return self._post_inference(inference_state, prompt_token_lens)
 
