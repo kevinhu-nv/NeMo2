@@ -808,6 +808,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 add_val_prompt=self.cfg.get("add_val_prompt", False) if self.cfg is not None else False,
                 add_mcq_prompt=self.cfg.get("add_mcq_prompt", None) if self.cfg is not None else None,
                 force_naturalness_prompt=self.cfg.get("force_naturalness_prompt", False) if self.cfg is not None else False,
+                fc_no_system_prompt=self.cfg.get("fc_no_system_prompt", False) if self.cfg is not None else False,
             )
             source_audio, source_audio_lens = collate_audio(all_cuts_combined.resample(self.source_sample_rate))
             target_audio, target_audio_lens = collate_audio(
@@ -1491,6 +1492,7 @@ def collate_system_prompt(
     add_val_prompt: bool = False,  # If True, add specific system prompt for validation
     add_mcq_prompt: int | None = None,  # If not None, add this prompt to all cuts
     force_naturalness_prompt: bool = False,  # If True, add naturalness prompt to all cuts
+    fc_no_system_prompt: bool = False,  # If True, skip system prompt for FC data
 ) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
     """
     Collate system prompts from cuts.
@@ -1513,10 +1515,14 @@ def collate_system_prompt(
         if c.custom and c.custom.get("system_prompt", None):
             prompt_text = c.custom["system_prompt"]
         elif is_fc_cut and len(c.supervisions) > 0 and c.supervisions[0].speaker == 'system':
-            # Function calling: use system prompt from first supervision
-            prompt_content = c.supervisions[0].text
-            # Augment tools-only prompts with full TOOLCALL/TOOL_RESPONSE instructions
-            prompt_text = _get_fc_prompt(prompt_content, DEFAULT_FC_SYSTEM_PROMPT_TEMPLATE)
+            if fc_no_system_prompt:
+                # Skip system prompt for FC data when fc_no_system_prompt is set
+                no_prompt = True
+            else:
+                # Function calling: use system prompt from first supervision
+                prompt_content = c.supervisions[0].text
+                # Augment tools-only prompts with full TOOLCALL/TOOL_RESPONSE instructions
+                prompt_text = _get_fc_prompt(prompt_content, DEFAULT_FC_SYSTEM_PROMPT_TEMPLATE)
         # Check if MCQ cut with delay enabled - add MCQ system prompt
         elif mcq_agent_text_delay > 0 and _is_mcq_cut_train(c):
             prompt_text = MCQ_SYSTEM_PROMPT_DELAY
