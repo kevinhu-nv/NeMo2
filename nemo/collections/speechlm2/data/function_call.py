@@ -50,16 +50,16 @@ The user will execute tool-calls and return responses from tool(s) in this forma
 Based on the tool responses, you can call additional tools if needed, correct tool calls if any errors are found, or just respond to the user."""
 
 DEFAULT_FC_FILLER_RESPONSES = [
-    "Let me check that for you.",
     "One moment, please.",
-    "Let me look into that.",
-    "Sure, let me find that out.",
     "Give me a moment.",
-    "Let me see what I can find.",
-    "Hang on, let me check.",
     "Sure, one second.",
     "Let me pull that up.",
-    "I'll look that up for you.",
+    "Just a moment.",
+    "One second, please.",
+    "Let me check.",
+    "Checking on that.",
+    "Hang on a sec.",
+    "Looking it up.",
 ]
 
 # Closing tags for TOOLRESPONSE (dataset uses <TOOL_RESPONSE>...</TOOL_RESPONSE> or <TOOLRESPONSE>...</TOOLRESPONSE>)
@@ -909,14 +909,17 @@ def inject_fc_filler_responses(
     pad_id: int,
     fc_filler_response_delay: int,
     fc_filler_responses: list,
+    fc_filler_eos_offset: int = 13,
 ):
     """Inject random filler responses before tool calls in FC data.
 
     For each sample, finds all agent_fc_bos positions and rewrites each
     tool-call turn with a filler response:
     - Clears the original [agent_fc_bos, agent_eos] at the found position
-    - Writes [agent_fc_bos, filler_tok1, ..., filler_tokN, agent_eos] at
+    - Writes [agent_fc_bos, filler_tok1, ..., filler_tokN] at
       (original_pos + fc_filler_response_delay)
+    - Places fc_eos at a fixed offset (fc_filler_eos_offset) after fc_bos,
+      corresponding to ~1 sec + 1 frame of speech at 12.5 Hz.
     """
     seq_len = target_tokens.shape[1]
 
@@ -940,6 +943,14 @@ def inject_fc_filler_responses(
                 )
                 continue
 
+            # fc_eos at fixed offset from fc_bos (1 sec + 1 frame ≈ 13 frames at 12.5 Hz)
+            eos_pos = insert_pos + fc_filler_eos_offset
+            if eos_pos >= seq_len:
+                logging.warning(
+                    f"[_inject_fc_filler] sample {i}: eos_pos={eos_pos} >= seq_len={seq_len}, skipping"
+                )
+                continue
+
             # Sample a random filler response and tokenize
             filler_text = random.choice(fc_filler_responses)
             filler_token_ids = tokenizer.text_to_ids(filler_text)
@@ -947,22 +958,15 @@ def inject_fc_filler_responses(
             turn_tokens = [fc_bos_id] + filler_token_ids
             turn_tensor = torch.tensor(turn_tokens, dtype=torch.long)
 
-            # Truncate if it extends beyond sequence length (leave room for EOS)
-            available = seq_len - insert_pos - 1  # -1 to reserve space for EOS
-            if available <= 0:
-                logging.warning(
-                    f"[_inject_fc_filler] sample {i}: no room for filler at insert_pos={insert_pos}, skipping"
-                )
-                continue
-            if len(turn_tensor) > available:
-                turn_tensor = turn_tensor[:available]
+            # Truncate text tokens to fit before eos_pos (reserve eos_pos for fc_eos)
+            max_turn_len = eos_pos - insert_pos
+            if len(turn_tensor) > max_turn_len:
+                turn_tensor = turn_tensor[:max_turn_len]
 
             # Write into target_tokens
             target_tokens[i, insert_pos:insert_pos + len(turn_tensor)] = turn_tensor
-            # Place EOS after the filler tokens
-            eos_pos = insert_pos + len(turn_tensor)
-            if eos_pos < seq_len:
-                target_tokens[i, eos_pos] = fc_eos_id
+            # Place fc_eos at fixed offset
+            target_tokens[i, eos_pos] = fc_eos_id
 
             # Update target_token_lens if needed
             new_end = eos_pos + 1
