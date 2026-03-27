@@ -99,11 +99,16 @@ def log_target_tokens_after_prefill(
             continue
         parts = []
         for ps in prefill_starts:
-            # Find the end: look for agent_eos after PREFILL_START
+            # Find the end: look for pad, agent_eos, or next prefill_start after agent_bos
+            # (agent_eos may not be present after repeat text)
             end = seq_len
+            found_agent_bos = False
             for j in range(ps + 1, seq_len):
-                if seq[j].item() == agent_eos_id:
-                    end = j + 1
+                tid = seq[j].item()
+                if tid == agent_bos_id:
+                    found_agent_bos = True
+                if found_agent_bos and tid in (pad_id, agent_eos_id, prefill_start_id):
+                    end = j
                     break
             toks = seq[ps:end].tolist()
             decoded_parts = []
@@ -112,7 +117,14 @@ def log_target_tokens_after_prefill(
                     decoded_parts.append(special_names[tid])
                 else:
                     decoded_parts.append(tokenizer.ids_to_text([tid]))
-            parts.append(f"  [{ps}-{end}] {''.join(decoded_parts)}")
+            # Show the next token after repeat to confirm it's pad, not agent_eos
+            if end < seq_len:
+                next_tid = seq[end].item()
+                next_name = special_names.get(next_tid, f"pad" if next_tid == pad_id else f"id={next_tid}")
+                next_str = f" | next_token[{end}]={next_name}"
+            else:
+                next_str = " | next_token=END_OF_SEQ"
+            parts.append(f"  [{ps}-{end}] {''.join(decoded_parts)}{next_str}")
         logging.info(
             f"[FC prefill debug AFTER] sample {i} (seq_len={seq_len}):\n"
             + "\n".join(parts)

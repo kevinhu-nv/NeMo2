@@ -1050,13 +1050,15 @@ def inject_fc_post_response_prefill(
 
             text_toks = fc_post_res_tokens[i, turn_idx, :length]
 
-            # Build: [PREFILL_START, text..., PREFILL_END, agent_bos, text..., agent_eos]
+            # Build: [PREFILL_START, text..., PREFILL_END, agent_bos, text...]
+            # No agent_eos after repeat — model will produce pad tokens,
+            # allowing TTS to finish speaking, and naturally emit agent_eos
+            # when the user starts talking (via fix_eos_placements).
             full_seq = torch.cat([
                 torch.tensor([prefill_start_id], dtype=torch.long),
                 text_toks,
                 torch.tensor([prefill_end_id, agent_bos_id], dtype=torch.long),
                 text_toks,
-                torch.tensor([agent_eos_id], dtype=torch.long),
             ])
 
             insert_pos = eos_pos + post_fc_delay

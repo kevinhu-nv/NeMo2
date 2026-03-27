@@ -108,24 +108,43 @@ def log_prefill_and_repeat_regions(
             )
 
             # --- Repeat region ---
-            if ab is not None and ae is not None:
-                rp_labels = text_labels[i, ab:ae + 1].tolist()
-                rp_weights = loss_scale[i, ab:ae + 1, 0].tolist()
+            # Find repeat end: scan from agent_bos until we hit pad or end of sequence
+            # (agent_eos is no longer placed after repeat text; model emits pad instead)
+            if ab is not None:
+                repeat_end = ab + 1
+                seq_len = text_labels.size(1)
+                while repeat_end < seq_len and text_labels[i, repeat_end].item() not in (text_pad_id, text_eos_id, prefill_start_id):
+                    repeat_end += 1
+                # repeat_end now points to the first pad/eos/pf_start after repeat text
+
+                rp_labels = text_labels[i, ab:repeat_end].tolist()
+                rp_weights = loss_scale[i, ab:repeat_end, 0].tolist()
                 rp_text_ids = [
                     t for t in rp_labels
                     if t not in (text_bos_id, text_eos_id, text_pad_id)
                 ]
                 rp_text = tokenizer.ids_to_text(rp_text_ids) if rp_text_ids else "(empty)"
+
+                # Show one extra token after repeat to confirm it's pad, not agent_eos
+                next_token_id = text_labels[i, repeat_end].item() if repeat_end < seq_len else -1
+                next_token_str = tokenizer.ids_to_text([next_token_id]) if next_token_id >= 0 else "OUT_OF_BOUNDS"
+                next_token_name = (
+                    "pad" if next_token_id == text_pad_id else
+                    "agent_eos" if next_token_id == text_eos_id else
+                    f"id={next_token_id}('{next_token_str}')"
+                )
+
                 logging.info(
                     f"{CYAN}[FC repeat loss debug]{RESET} sample {i}, "
-                    f"repeat region [{ab}-{ae}]: "
+                    f"repeat region [{ab}-{repeat_end - 1}]: "
                     f"text='{rp_text}', "
                     f"loss_weights={GREEN}[{', '.join(f'{w:.2f}' for w in rp_weights[:5])}"
                     f"{'...' if len(rp_weights) > 5 else ''}]{RESET} "
-                    f"(should be text_weight={text_weight})"
+                    f"(should be text_weight={text_weight}), "
+                    f"next_token[{repeat_end}]={next_token_name}"
                 )
             else:
                 logging.warning(
                     f"[FC repeat loss debug] sample {i}: "
-                    f"no agent_bos/agent_eos found after PREFILL_END at {pe}"
+                    f"no agent_bos found after PREFILL_END at {pe}"
                 )
