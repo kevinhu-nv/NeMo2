@@ -245,3 +245,51 @@ class FCAccMetrics:
         self.recalls.clear()
         return metrics
 
+
+class FCFalsePositiveMetric:
+    """Track FC false positive rate on datasets with no GT function calls.
+
+    For samples where GT has zero FC BOS/EOS pairs, counts how many predictions
+    falsely contain FC BOS/EOS pairs. Reports:
+      - fc_fp_rate_{name}: fraction of no-FC samples where model falsely predicted FC
+      - fc_fp_acc_{name}: 1 - fc_fp_rate (higher is better)
+    """
+
+    def __init__(self, fc_bos_id: int, fc_eos_id: int):
+        self.fc_bos_id = fc_bos_id
+        self.fc_eos_id = fc_eos_id
+        self.total = defaultdict(int)
+        self.false_positives = defaultdict(int)
+
+    def reset(self):
+        self.total.clear()
+        self.false_positives.clear()
+        return self
+
+    def _has_fc(self, tokens_np):
+        """Check if tokens contain at least one FC BOS token."""
+        return np.any(tokens_np == self.fc_bos_id)
+
+    def update(self, name, target_tokens, pred_tokens):
+        """Count false positives: pred has FC but GT does not."""
+        target_np = target_tokens.cpu().numpy()
+        pred_np = pred_tokens.cpu().numpy()
+
+        for i in range(target_np.shape[0]):
+            if self._has_fc(target_np[i]):
+                continue  # GT has FC — not a no-FC sample, skip
+            self.total[name] += 1
+            if self._has_fc(pred_np[i]):
+                self.false_positives[name] += 1
+
+    def compute(self):
+        metrics = {}
+        for name in self.total:
+            t = self.total[name]
+            fp = self.false_positives[name]
+            metrics[f"fc_fp_rate_{name}"] = torch.tensor(fp / t if t > 0 else 0.0)
+            metrics[f"fc_fp_acc_{name}"] = torch.tensor(1.0 - fp / t if t > 0 else 0.0)
+        self.total.clear()
+        self.false_positives.clear()
+        return metrics
+

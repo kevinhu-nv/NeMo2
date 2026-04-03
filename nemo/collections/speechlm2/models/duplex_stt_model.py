@@ -50,7 +50,7 @@ from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.metrics.bleu import BLEU
 from nemo.collections.speechlm2.parts.metrics.text_wer import TextWER
 from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
-from nemo.collections.speechlm2.parts.metrics.token_accuracy import TurnTakingMetrics, FCAccMetrics
+from nemo.collections.speechlm2.parts.metrics.token_accuracy import TurnTakingMetrics, FCAccMetrics, FCFalsePositiveMetric
 from nemo.collections.speechlm2.parts.metrics.empty_text import EmptyTextMetric
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
 from nemo.collections.speechlm2.parts.pretrained import (
@@ -1019,6 +1019,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             self.empty_user_text = EmptyTextMetric().reset()
 
         self.fc_acc = None  # Initialized lazily from first FC batch
+        self.fc_fp = None   # Initialized lazily from first FC batch
 
     def on_validation_epoch_end(self, prefix="val") -> None:
         bleu = self.bleu.compute()
@@ -1056,6 +1057,12 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             for k, m in fc_metrics.items():
                 self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
             logging.info(f"[FC metrics] {', '.join(f'{prefix}_{k}={m.item():.4f}' for k, m in fc_metrics.items())}")
+
+        if hasattr(self, 'fc_fp') and self.fc_fp is not None:
+            fc_fp_metrics = self.fc_fp.compute()
+            for k, m in fc_fp_metrics.items():
+                self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+            logging.info(f"[FC FP metrics] {', '.join(f'{prefix}_{k}={m.item():.4f}' for k, m in fc_fp_metrics.items())}")
 
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
@@ -1254,6 +1261,16 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                         fc_eos_id=self.agent_fc_eos_id,
                     ).reset()
                 self.fc_acc.update(
+                    name=name,
+                    target_tokens=dataset_batch["target_tokens"],
+                    pred_tokens=results["tokens_text"],
+                )
+                if self.fc_fp is None:
+                    self.fc_fp = FCFalsePositiveMetric(
+                        fc_bos_id=self.agent_fc_bos_id,
+                        fc_eos_id=self.agent_fc_eos_id,
+                    ).reset()
+                self.fc_fp.update(
                     name=name,
                     target_tokens=dataset_batch["target_tokens"],
                     pred_tokens=results["tokens_text"],
