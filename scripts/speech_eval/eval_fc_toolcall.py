@@ -398,6 +398,85 @@ def apply_itn_batch(
     return results
 
 
+# ---------------------------------------------------------------------------
+# LLM-based FC verification (reduce false positives)
+# ---------------------------------------------------------------------------
+
+# Phrases that indicate the LLM decided not to call a tool
+_NO_TOOL_PHRASES = [
+    "i don't have a tool",
+    "i don't have a direct tool",
+    "i will not call any tool",
+    "doesn't require a tool",
+    "does not require a tool",
+    "no tool call",
+    "no tools available",
+    "i cannot use",
+    "none of the available tools",
+    "not specifically designed for",
+    "i don't have access to a tool",
+    "our available tool",  # followed by "is not" / "is specifically for"
+]
+
+# Phrases that indicate the LLM is asking for clarification instead of calling
+_CLARIFICATION_PHRASES = [
+    "could you please provide",
+    "could you please specify",
+    "would you like me to",
+    "can you specify",
+    "please provide more",
+    "i would need more information",
+    "could you clarify",
+    "please let me know",
+    "do you want me to",
+]
+
+
+def should_revert_fc(pred_toolcall: list, raw_response: str, available_tools: list) -> tuple[bool, str]:
+    """Decide whether to revert an FC detection based on LLM output.
+
+    Args:
+        pred_toolcall: Parsed tool calls from LLM response (may be empty)
+        raw_response: Raw LLM response text
+        available_tools: List of tool dicts from system prompt
+
+    Returns:
+        (should_revert: bool, reason: str)
+    """
+    response_lower = raw_response.lower() if raw_response else ""
+
+    # 1. Empty tool call — LLM generated no function call syntax
+    if not pred_toolcall:
+        # Check if LLM explicitly refused
+        for phrase in _NO_TOOL_PHRASES:
+            if phrase in response_lower:
+                return True, f"empty_toolcall+explicit_refusal: '{phrase}'"
+
+        # Check if LLM asked for clarification
+        for phrase in _CLARIFICATION_PHRASES:
+            if phrase in response_lower:
+                return True, f"empty_toolcall+clarification: '{phrase}'"
+
+        # Even without explicit phrases, empty toolcall is a revert signal
+        return True, "empty_toolcall"
+
+    # 2. Tool name mismatch — generated tool name not in available tools
+    available_names = {t.get("name", "").lower() for t in available_tools}
+    for call in pred_toolcall:
+        pred_name = call.get("name", "").lower()
+        if pred_name and pred_name not in available_names:
+            return True, f"tool_name_mismatch: pred='{pred_name}' not in {available_names}"
+
+    # 3. LLM explicitly says no tool needed despite generating one
+    #    (some models hedge: generate a call but also say "this doesn't require a tool")
+    for phrase in _NO_TOOL_PHRASES:
+        if phrase in response_lower:
+            return True, f"explicit_refusal_with_toolcall: '{phrase}'"
+
+    # All checks passed — keep FC
+    return False, "valid"
+
+
 def load_inference_json(path: str) -> list[dict]:
     """Load inference JSONL files.
 
@@ -1288,6 +1367,25 @@ def run_eval_inference_json(model, tokenizer, is_nemotron: bool, args):
             result["raw_response"] = response
             result["pred_toolcall"] = pred_toolcall
 
+            # --verify_fc: check if FC should be reverted based on LLM output
+            if getattr(args, 'verify_fc', False):
+                revert, revert_reason = should_revert_fc(pred_toolcall, response, ex["tools"])
+                if revert:
+                    ex["fc_detected"] = False
+                    pred_has_fc = False
+                    fc_pred_positive -= 1  # undo the count
+                    is_tp = gt_has_fc and pred_has_fc
+                    result["fc_detected"] = False
+                    result["fc_reverted_by_llm"] = True
+                    result["fc_revert_reason"] = revert_reason
+                    print(f"    \033[93m[FC REVERTED]\033[0m [{idx}] id={ex['cut_id']}: {revert_reason}")
+                    print(f"      user: {ex.get('user_text_itn') or ex.get('user_text','')[:80]}")
+                    print(f"      tools: {[t.get('name','?') for t in ex.get('tools',[])]}")
+                    print(f"      LLM response: {response[:150]}")
+                else:
+                    result["fc_reverted_by_llm"] = False
+                    result["fc_revert_reason"] = "valid"
+
             if is_tp:
                 # Compute tool call accuracy on true-positive entries
                 metrics["total"] += 1
@@ -1710,6 +1808,8 @@ def main():
     parser.add_argument("--normalize", action="store_true",
                         help="Apply post-processing normalization to fix trivial formatting differences "
                              "(location suffixes, type coercion, list ordering, abbreviations, etc.)")
+    parser.add_argument("--verify_fc", action="store_true",
+                        help="Use LLM to verify FC detections — revert false positives where LLM says tool call is not appropriate")
     args = parser.parse_args()
 
     if args.bfcl_data and not args.bfcl_answer:

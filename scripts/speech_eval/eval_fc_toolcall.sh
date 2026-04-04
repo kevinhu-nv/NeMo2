@@ -8,6 +8,7 @@ export NEMO_CACHE_DIR="/lustre/fsw/portfolios/convai/users/kevinhu/results/HFCAC
 export HF_HOME="/lustre/fsw/portfolios/convai/users/kevinhu/results/HFCACHE"
 export HF_TOKEN=$(cat /lustre/fsw/portfolios/llmservice/users/kevinhu/tokens/huggingface_token)
 export PYTHONPATH="${CODE_DIR}/scripts/speech_eval:${CODE_DIR}:${PYTHONPATH}"
+export PYTHONUNBUFFERED=1
 
 MODEL="Qwen/Qwen2.5-7B-Instruct"
 # MODEL="Qwen/Qwen2.5-72B-Instruct"
@@ -17,24 +18,24 @@ MODEL="Qwen/Qwen2.5-7B-Instruct"
 # ---------------------------------------------------------------------------
 # Duplex STT inference output (from model validation)
 # ---------------------------------------------------------------------------
-# EXP_NAME=IAD_nano9b_parakeet600m_from_SFT_feb20_32gpu_5e-5_PT0.5_SFT0.15_QA0.02_TEXT0.1_loss0.5_MCQ0.03_prompt2_ASR0.01_fillerlong_offset2_sysp0.05_NoiseDefault_asr_dtc2_dst15_lossDefault_ei0.033_ot8_all_data_v3.2_fc0.5_fcnv30.5
-# STEP_NUM=2502
-# EXP_NAME=IAD_nano9b_parakeet600m_from_SFT_feb20_32gpu_5e-5_PT0.5_SFT0.15_QA0.02_TEXT0.1_loss0.5_MCQ0.03_prompt2_ASR0.01_fillerlong_offset2_sysp0.05_NoiseDefault_asr_dtc2_dst15_lossDefault_ei0.033_ot8_all_data_v3.2_fc0.05_fcnv30.05
-# STEP_NUM=4501
-EXP_NAME=IAD_nano9b_parakeet600m_from_SFT_feb20_32gpu_5e-5_PT0.5_SFT0.15_QA0.02_TEXT0.1_loss0.5_MCQ0.03_prompt2_ASR0.01_fillerlong_offset2_sysp0.05_NoiseDefault_asr_dtc2_dst15_lossDefault_ei0.033_ot8_all_data_v3.2_fc0.01_fcnv30.01
-STEP_NUM=9030
 
-RESULTS_DIR=/lustre/fsw/portfolios/llmservice/users/kevinhu/projects/nemo_s2s_merged_dec/exp_SFT_9b/${EXP_NAME}/results/inf_fc/infer_nano_9b_bfclv3_step_${STEP_NUM}/pad0_bos0_eos0
+# Accept args: eval_fc_toolcall.sh [EXP_NAME] [STEP_NUM] [INF_PREFIX]
+EXP_NAME=${1:-IAD_nano9b_parakeet600m_from_SFT_feb20_32gpu_5e-5_PT0.5_SFT0.15_QA0.02_TEXT0.1_loss0.5_MCQ0.03_prompt2_ASR0.01_fillerlong_offset2_sysp0.05_NoiseDefault_asr_dtc2_dst15_lossDefault_ei0.033_ot8_all_data_v3.2_fc0.1_fcnv30.1_pf}
+STEP_NUM=${2:-6504}
+INF_PREFIX=${3:-infer_nano_9b_bfclv3}
+
+RESULTS_DIR=/lustre/fsw/portfolios/llmservice/users/kevinhu/projects/nemo_s2s_merged_dec/exp_SFT_9b/${EXP_NAME}/results/inf_fc_pf/${INF_PREFIX}_step_${STEP_NUM}/pad0_bos0_eos0
 MODEL_NAME=$(echo $MODEL | tr '/' '-')
 OUTPUT_DIR=${RESULTS_DIR}/fc_eval/${MODEL_NAME}
 
-for SUBSET in bfcl_v3_simple bfcl_v3_multiple bfcl_v3_parallel bfcl_v3_parallel_multiple bfcl_v3_irrelevance; do
+for SUBSET in bfcl_v3_irrelevance bfcl_v3_simple bfcl_v3_multiple bfcl_v3_parallel bfcl_v3_parallel_multiple; do
     echo "=== Evaluating $SUBSET ==="
     INFERENCE_JSON="${RESULTS_DIR}/validation_logs/metadatas/${SUBSET}_rank*.json"
 
     USE_GT_USER_TEXT=false
     APPLY_ITN=true
-    NORMALIZE=true
+    NORMALIZE=false
+    VERIFY_FC=true
 
     SUFFIX=""
     EXTRA_FLAGS=""
@@ -50,6 +51,10 @@ for SUBSET in bfcl_v3_simple bfcl_v3_multiple bfcl_v3_parallel bfcl_v3_parallel_
         SUFFIX="${SUFFIX}_norm"
         EXTRA_FLAGS="${EXTRA_FLAGS} --normalize"
     fi
+    if [ "$VERIFY_FC" = true ]; then
+        SUFFIX="${SUFFIX}_verified"
+        EXTRA_FLAGS="${EXTRA_FLAGS} --verify_fc"
+    fi
     if [ -z "$SUFFIX" ]; then
         SUFFIX="_raw"
     fi
@@ -59,6 +64,34 @@ for SUBSET in bfcl_v3_simple bfcl_v3_multiple bfcl_v3_parallel bfcl_v3_parallel_
     python3 ${SCRIPT} --inference_json "${INFERENCE_JSON}" --model ${MODEL} --output_jsonl ${OUTPUT_JSONL} ${EXTRA_FLAGS}
     set +x
 done
+
+# Print summary of all BFCL subsets
+echo ""
+echo "=============== BFCL SUMMARY (${EXP_NAME} step ${STEP_NUM}) ==============="
+SUMMARY_FILE=${OUTPUT_DIR}/bfcl_summary.txt
+> ${SUMMARY_FILE}
+for SUBSET in bfcl_v3_irrelevance bfcl_v3_simple bfcl_v3_multiple bfcl_v3_parallel bfcl_v3_parallel_multiple; do
+    METRICS_FILE=${OUTPUT_DIR}/${SUBSET}_inference_eval${SUFFIX}_metrics.jsonl
+    if [ -f "${METRICS_FILE}" ]; then
+        LINE=$(python3 -c "
+import json
+with open('${METRICS_FILE}') as f:
+    m = json.load(f)
+tc = m.get('tool_call_accuracy', {})
+n = tc.get('total', 0)
+if n > 0:
+    print(f'[${SUBSET}] name_acc={tc[\"name_correct\"]}/{n}={tc[\"name_correct\"]/n:.1%}  exact_match={tc[\"exact_match\"]}/{n}={tc[\"exact_match\"]/n:.1%}  bfcl_ast={tc[\"bfcl_valid\"]}/{n}={tc[\"bfcl_valid\"]/n:.1%}')
+else:
+    print(f'[${SUBSET}] no TP entries')
+" 2>/dev/null)
+        echo "${LINE}"
+        echo "${LINE}" >> ${SUMMARY_FILE}
+    else
+        echo "[${SUBSET}] no metrics file found"
+    fi
+done
+echo "Summary saved to: ${SUMMARY_FILE}"
+echo "================================================================="
 
 # ---------------------------------------------------------------------------
 # BFCL v3 audio — all subsets (Lhotse shar, ground-truth text eval)
