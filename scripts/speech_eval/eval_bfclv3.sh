@@ -1,7 +1,7 @@
 #!/bin/bash
 
 CODE_DIR=/lustre/fsw/portfolios/llmservice/users/kevinhu/projects/nemo_s2s_merged_dec/NeMo_fc
-SCRIPT=$CODE_DIR/scripts/speech_eval/eval_fc_toolcall.py
+SCRIPT=$CODE_DIR/scripts/speech_eval/eval_bfclv3.py
 
 export TORCH_HOME="/lustre/fsw/portfolios/convai/users/kevinhu/results/HFCACHE"
 export NEMO_CACHE_DIR="/lustre/fsw/portfolios/convai/users/kevinhu/results/HFCACHE"
@@ -19,7 +19,7 @@ MODEL="Qwen/Qwen2.5-7B-Instruct"
 # Duplex STT inference output (from model validation)
 # ---------------------------------------------------------------------------
 
-# Accept args: eval_fc_toolcall.sh [EXP_NAME] [STEP_NUM] [INF_PREFIX]
+# Accept args: eval_bfclv3.sh [EXP_NAME] [STEP_NUM] [INF_PREFIX]
 EXP_NAME=${1:-IAD_nano9b_parakeet600m_from_SFT_feb20_32gpu_5e-5_PT0.5_SFT0.15_QA0.02_TEXT0.1_loss0.5_MCQ0.03_prompt2_ASR0.01_fillerlong_offset2_sysp0.05_NoiseDefault_asr_dtc2_dst15_lossDefault_ei0.033_ot8_all_data_v3.2_fc0.1_fcnv30.1_pf}
 STEP_NUM=${2:-6504}
 INF_PREFIX=${3:-infer_nano_9b_bfclv3}
