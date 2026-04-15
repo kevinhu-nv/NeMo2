@@ -1210,6 +1210,16 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
             dataset_batch = dataset_batch["audio_data"]
 
+            # For irrelevance datasets, enable early stopping on FC BOS detection
+            # TEMPORARILY DISABLED — causes OverflowError in tokens_to_str due to
+            # uninitialized tensor values after early stop
+            # is_irrelevance = "irrelevance" in name.lower()
+            # if is_irrelevance:
+            #     self._val_early_stop_on_fc_bos = True
+            # else:
+            #     self._val_early_stop_on_fc_bos = False
+            self._val_early_stop_on_fc_bos = False
+
             # Debug: log whether FC metadata is present in this validation batch
             has_fc_keys = "agent_fc_eos_id" in dataset_batch and "agent_fc_bos_id" in dataset_batch
             logging.info(
@@ -1244,6 +1254,12 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                         "post_fc_delay": dataset_batch["post_fc_res_delay"],
                     }
 
+                # Teacher-force agent text for multi_turn evaluation
+                tf_agent_text = None
+                if self.cfg.get("teacher_force_agent_text", False) and dataset_batch.get("target_tokens") is not None:
+                    tf_agent_text = dataset_batch["target_tokens"].to(self.device)
+                    logging.info(f"[teacher_force] Enabling agent text teacher forcing (target_tokens shape={tf_agent_text.shape})")
+
                 results = self.offline_inference(
                     dataset_batch["source_audio"],
                     dataset_batch["source_audio_lens"],
@@ -1251,6 +1267,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     prompt_token_lens=prompt_token_lens,
                     sample_id=dataset_batch.get("sample_id", None),
                     fc_prefill_data=fc_prefill_data,
+                    teacher_force_agent_text=tf_agent_text,
                 )
 
             # FC accuracy metrics BEFORE force-write (measures raw model predictions)
@@ -2151,9 +2168,17 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             prompt_token_lens: torch.Tensor = None,
             sample_id=None,
             fc_prefill_data: dict = None,
+            teacher_force_agent_text: torch.Tensor = None,
     ) -> dict[str, torch.Tensor]:
         """
         Autoregressive prediction (text only).
+
+        Args:
+            teacher_force_agent_text: Optional [B, T] tensor of GT agent text tokens.
+                When provided, at each step t, if the GT token is not pad_id,
+                the model's predicted token is overridden with the GT token.
+                This is used for multi_turn VAB evaluation where intermediate
+                agent turns need to be teacher-forced while FC detection is free.
         """
         inference_state = self._init_inference(
             input_signal, input_signal_lens, input_pad_len,
@@ -2167,12 +2192,102 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             )
             inference_state["fc_prefill_data"] = fc_prefill_data
 
+        # Teacher forcing: pre-load GT agent text tokens into gen_text
+        # so the model never predicts at agent turn positions.
+        # The mask covers ENTIRE agent turns (BOS to EOS inclusive), not just
+        # non-pad tokens.  This prevents the model from predicting FC BOS at
+        # trailing-pad positions within an agent turn.
+        #
+        # IMPORTANT: target_tokens positions are relative to the audio (no prompt
+        # prefix), but gen_text includes the prompt prefix.  We must offset the
+        # mask and the pre-loaded tokens by the prompt length so they land at the
+        # correct generation positions.
+        tf_mask = None
+        tf_offset = 0  # prompt offset into gen_text
+        if teacher_force_agent_text is not None:
+            B = inference_state["B"]
+            T_gen = inference_state["gen_text"].shape[1]
+            T_tf = teacher_force_agent_text.shape[1]
+
+            # Compute prompt offset: target_tokens are aligned to audio frames,
+            # but gen_text[:, :prompt_len] is occupied by the prompt prefix.
+            if prompt_token_lens is not None:
+                tf_offset = prompt_token_lens.max().item()
+
+            T_min = min(T_gen - tf_offset, T_tf)
+
+            # Build mask covering entire agent turn spans (text_bos → text_eos)
+            # in gen_text coordinates (i.e. already offset by prompt length).
+            # FC turns (agent_fc_bos) are deliberately excluded so FC detection
+            # remains free.
+            tf_mask = torch.zeros(B, T_gen, dtype=torch.bool, device=self.device)
+            for b in range(B):
+                in_turn = False
+                for t_idx in range(T_min):
+                    tok = teacher_force_agent_text[b, t_idx].item()
+                    if tok == self.text_bos_id:
+                        in_turn = True
+                    if in_turn:
+                        tf_mask[b, tf_offset + t_idx] = True
+                    if tok == self.text_eos_id and in_turn:
+                        in_turn = False
+
+            # Pre-load GT tokens into gen_text at offset agent turn positions
+            for b in range(B):
+                for t_idx in range(T_min):
+                    if tf_mask[b, tf_offset + t_idx]:
+                        inference_state["gen_text"][b, tf_offset + t_idx] = teacher_force_agent_text[b, t_idx]
+
+            # Log decoded teacher-forced agent text per sample
+            for b in range(B):
+                turn_positions = tf_mask[b].nonzero(as_tuple=True)[0]
+                if len(turn_positions) > 0:
+                    forced_ids = [inference_state["gen_text"][b, pos].item() for pos in turn_positions]
+                    non_special = [tid for tid in forced_ids if tid != self.text_bos_id and tid != self.text_eos_id and tid != self.text_pad_id]
+                    decoded_text = self.tokenizer.ids_to_text(non_special)
+                    logging.info(
+                        f"[teacher_force] sample {b}: forcing {len(turn_positions)} frames "
+                        f"(gen_text spans: {turn_positions[0].item()}–{turn_positions[-1].item()}, "
+                        f"prompt_offset={tf_offset}), "
+                        f"text='{decoded_text}'"
+                    )
+
+            logging.info(
+                f"[teacher_force] Pre-loaded {tf_mask.sum().item()} forced frames into gen_text "
+                f"(T_gen={T_gen}, T_tf={T_tf}, prompt_offset={tf_offset})"
+            )
+
         ans, inference_state = self._step_zero(inference_state)
 
         for t in range(1, inference_state["T"]):
             ans = self._step_inference(t, inference_state, ans, force_bos_positions)
             if fc_prefill_data is not None:
                 self._maybe_inject_fc_prefill(t, inference_state)
+
+            # Re-enforce teacher forcing after each step (in case _step_inference overwrote).
+            # tf_mask is in gen_text coordinates; teacher_force_agent_text is in
+            # target_tokens coordinates (offset by tf_offset).
+            if tf_mask is not None and t < tf_mask.shape[1] and tf_mask[:, t].any():
+                tf_t = t - tf_offset  # map gen_text position back to target_tokens position
+                if 0 <= tf_t < teacher_force_agent_text.shape[1]:
+                    inference_state["gen_text"][:, t] = torch.where(
+                        tf_mask[:, t], teacher_force_agent_text[:, tf_t], inference_state["gen_text"][:, t]
+                    )
+
+            # Early stop for irrelevance validation: once FC BOS is detected for all samples,
+            # no need to continue decoding — we already know it's a false positive.
+            if getattr(self, "_val_early_stop_on_fc_bos", False):
+                gen_at_t = inference_state["gen_text"][:, :t+1]
+                all_fc_detected = all(
+                    (gen_at_t[b] == self.agent_fc_bos_id).any().item()
+                    for b in range(inference_state["B"])
+                )
+                if all_fc_detected:
+                    logging.info(
+                        f"[val_early_stop] All {inference_state['B']} samples have FC BOS detected by step {t}, "
+                        f"stopping early (saved {inference_state['T'] - t - 1} steps)"
+                    )
+                    break
 
         return self._post_inference(inference_state, prompt_token_lens)
 
